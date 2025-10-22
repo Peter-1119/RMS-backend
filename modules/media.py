@@ -71,15 +71,18 @@ def upload_drawio_and_convert():
     token = (request.args.get("token") or "").strip()
 
     original = secure_filename(f.filename)
+    ext = ('.' + original.rsplit('.', 1)[1].lower()) if '.' in original else ''
     daydir = os.path.join(UPLOAD_ROOT_DIR, 'temp', datetime.now().strftime('%Y/%m/%d'))
     os.makedirs(daydir, exist_ok=True)
 
     # 1) save input .drawio
-    in_path = os.path.join(daydir, f"{uuid.uuid4().hex}.drawio")
+    fd, in_path = tempfile.mkstemp(dir=daydir, suffix=".drawio")
+    os.close(fd)
     f.save(in_path)
 
     # 2) choose an output name (DO NOT pre-create a file)
-    out_path = os.path.join(daydir, f"{uuid.uuid4().hex}.png")
+    fd, out_path = tempfile.mkstemp(dir=daydir, suffix=".png")
+    os.close(fd)
 
     try:
         no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)

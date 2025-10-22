@@ -21,12 +21,6 @@ def create_app():
     app.register_blueprint(media_bp, url_prefix="/uploads")   # serves under /uploads/*
     app.register_blueprint(mes_bp, url_prefix="/mes")
     app.register_blueprint(cond_bp, url_prefix="/conditions")
-    
-    # app.register_blueprint(auth_bp)
-    # app.register_blueprint(docs_bp)
-    # app.register_blueprint(media_bp)   # serves under /uploads/*
-    # app.register_blueprint(mes_bp)
-    # app.register_blueprint(cond_bp)
 
     # preload CSV caches
     load_all()
