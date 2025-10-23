@@ -213,7 +213,7 @@ def save_params():
                 jdump(param_arr),  # content_text
                 jdump(param_json), # content_json
                 jdump([]),         # files
-                jdump({"kind": "mcr-parameter"})
+                jdump({"kind": "mcr-parameter", **b.get("metadata", {})})
             ))
 
             # Condition table (sub 1)
@@ -254,11 +254,13 @@ def load_params(token):
             "arrayParameterData": [],
             "jsonConditionContent": None,
             "arrayConditionData": [],
+            "metadata": None
         })
         if sub == 0:
             out[t]["code"] = r["header_text"] or out[t]["code"]
             out[t]["arrayParameterData"] = jload(r["content_text"], []) or []
             out[t]["jsonParameterContent"] = jload(r["content_json"])
+            out[t]["metadata"] = jload(r["metadata"])
         elif sub == 1:
             out[t]["arrayConditionData"] = jload(r["content_text"], []) or []
             out[t]["jsonConditionContent"] = jload(r["content_json"])
@@ -273,6 +275,7 @@ def load_params(token):
             "arrayParameterData": b["arrayParameterData"],
             "jsonConditionContent": b["jsonConditionContent"],
             "arrayConditionData": b["arrayConditionData"],
+            "metadata": b["metadata"]
         })
 
     return jsonify({"success": True, "blocks": blocks})
