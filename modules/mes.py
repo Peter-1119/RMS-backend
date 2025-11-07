@@ -50,7 +50,6 @@ def projects():
     return send_response(200, True, "請求成功", {"projects": out})
 
 # --------- /specifics ---------
-# --------- /specifics ---------
 @bp.get("/specifics")
 def specifics():
     keyword = _norm(request.args.get("keyword"))   # search in spec name/code
