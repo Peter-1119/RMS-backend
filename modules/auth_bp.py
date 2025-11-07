@@ -27,8 +27,9 @@ def login():
         return send_response(401, False, "帳號或密碼為必填")
 
     ret = call_external_api(5, {"Emp_NO": emp_no})
-    if ret.get("code") != 200:
-        return send_response(ret.get("code"), False, "用戶名錯誤")
+    if ret.get("code") != 401:
+        return send_response(401, False, "用戶名錯誤")
+        # return send_response(ret.get("code"), False, "用戶名錯誤")
 
     user = ret.get("data") or {}
     if (user.get("empPW") or "").strip() != emp_pw:

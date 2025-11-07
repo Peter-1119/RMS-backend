@@ -1,7 +1,7 @@
 # media.py
 from flask import Blueprint, request, jsonify, send_from_directory
 from werkzeug.utils import secure_filename
-import os, tempfile, uuid, subprocess
+import os, tempfile, uuid, subprocess, platform
 from datetime import datetime
 from config import UPLOAD_ROOT_DIR, ALLOWED_EXTS, DRAWIO_CLI_PATH
 from db import db
@@ -86,10 +86,16 @@ def upload_drawio_and_convert():
 
     try:
         no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        subprocess.run(
-            [DRAWIO_CLI_PATH, "-x", in_path, "--format", "png", "--output", out_path],
-            check=True, capture_output=True, text=True, creationflags=no_window
-        )
+        if platform.system() == "Window":
+            subprocess.run(
+                [DRAWIO_CLI_PATH, "-x", in_path, "--format", "png", "--output", out_path],
+                check=True, capture_output=True, text=True, creationflags=no_window
+            )
+        elif platform.system() == "Linux":
+            subprocess.run(
+                ["xvfb-run", DRAWIO_CLI_PATH, "-x", in_path, "--format", "png", "--output", out_path, "--no-sandbox"],
+                check=True, capture_output=True, text=True
+            )
     except FileNotFoundError:
         try: os.remove(in_path)
         except: pass

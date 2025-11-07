@@ -1,8 +1,14 @@
 # modules/docs.py
-from flask import Blueprint, request, jsonify
+import json, datetime, os, uuid, re
+# Flask's send_file must be explicitly imported
+from flask import Blueprint, request, jsonify, send_file 
 from db import db
 from utils import send_response, jload, jdump, dver, none_if_blank, new_token
-from config import STEP
+from DocxDefinition import get_docx
+
+
+BASE_DIR = "docxTemp"
+os.makedirs(BASE_DIR, exist_ok=True)
 
 bp = Blueprint("docs", __name__)
 
@@ -64,7 +70,7 @@ def save_attributes():
               (document_type, EIP_id, status, document_token, previous_document_token,
                document_id, document_name, document_version, attribute, department,
                author_id, author, approver, confirmer, issue_date, change_reason, change_summary, purpose)
-              VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s,%s,%s)
+              VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s,%s,%s)
             """, (f["document_type"], None, 0, token, f["prev_token"],
                   f["doc_id"], f["doc_name"], f["doc_ver"], f["attr_json"], f["dept"],
                   f["author_id"], f["author"], f["approver"], f["confirmer"],
@@ -230,7 +236,6 @@ def save_params():
 
     return jsonify({"success": True, "count": len(blocks)})
 
-
 @bp.get("/<token>/params")
 def load_params(token):
     step_type = int(request.args.get("step_type", 2))  # default 2 for MCR
@@ -280,6 +285,130 @@ def load_params(token):
 
     return jsonify({"success": True, "blocks": blocks})
 
+@bp.get("/drafts")
+def list_drafts():
+    """
+    Query params:
+      - user_id      (required):  要查的作者/使用者 id -> 對應 DB 欄位 author_id
+      - status       (optional):  預設 0 當作草稿；如需查核/發佈可改值
+      - keyword      (optional):  針對 document_name、document_id 模糊查詢
+      - page         (optional):  預設 1
+      - page_size    (optional):  預設 20
+      - sort         (optional):  排序欄位，允許: issue_date, document_version, document_name
+      - order        (optional):  asc/desc，預設 desc
+    Response:
+      {
+        "success": true,
+        "items": [
+          {
+            "documentToken": "...",
+            "documentName": "...",
+            "documentVersion": 1.20,
+            "author": "...",
+            "authorId": "...",
+            "issueDate": "2025-11-04T18:00:00",
+            "documentId": "WMH250"          # 方便前端顯示（可拿掉）
+          }
+        ],
+        "total": 123,
+        "page": 1,
+        "pageSize": 20
+      }
+    """
+    user_id   = request.args.get("user_id")
+    if not user_id:
+        return jsonify({"success": False, "error": "user_id is required"}), 400
+
+    # defaults
+    try:
+        status    = int(request.args.get("status", 0))
+    except ValueError:
+        return jsonify({"success": False, "error": "status must be int"}), 400
+
+    keyword   = (request.args.get("keyword") or "").strip()
+    try:
+        page      = max(1, int(request.args.get("page", 1)))
+        page_size = min(100, max(1, int(request.args.get("page_size", 20))))
+    except ValueError:
+        return jsonify({"success": False, "error": "page/page_size must be int"}), 400
+
+    sort_map  = {
+        "issue_date": "issue_date",
+        "document_version": "document_version",
+        "document_name": "document_name",
+    }
+    sort_key  = request.args.get("sort", "issue_date").lower()
+    order     = request.args.get("order", "desc").lower()
+    sort_col  = sort_map.get(sort_key, "issue_date")
+    order_sql = "DESC" if order not in ("asc", "ASC") else "ASC"
+
+    offset = (page - 1) * page_size
+
+    base_where = ["author_id = %s", "status = %s"]
+    params = [user_id, status]
+
+    if keyword:
+        base_where.append("(document_name LIKE %s OR document_id LIKE %s)")
+        like_kw = f"%{keyword}%"
+        params.extend([like_kw, like_kw])
+
+    where_sql = " AND ".join(base_where)
+
+    count_sql = f"""
+      SELECT COUNT(*) AS cnt
+      FROM rms_document_attributes
+      WHERE {where_sql}
+    """
+
+    data_sql = f"""
+      SELECT
+        document_type, document_token, document_name, document_version, author, author_id, issue_date, document_id
+      FROM rms_document_attributes
+      WHERE {where_sql}
+      ORDER BY {sort_col} {order_sql}
+      LIMIT %s OFFSET %s
+    """
+
+    with db(dict_cursor=True) as (conn, cur):
+        # total count
+        cur.execute(count_sql, params)
+        total = int(cur.fetchone()["cnt"])
+
+        # page data
+        cur.execute(data_sql, params + [page_size, offset])
+        rows = cur.fetchall() or []
+
+    def to_item(row):
+        # issue_date 轉 ISO（沒有就 None）
+        iso_date = None
+        if row.get("issue_date"):
+            try:
+                iso_date = row["issue_date"].isoformat(timespec="seconds")
+            except Exception:
+                iso_date = str(row["issue_date"])
+
+        # 回傳前端需要的 camelCase
+        return {
+            "documentType": row["document_type"],
+            "documentToken": row["document_token"],
+            "documentName": row["document_name"],
+            "documentVersion": float(row["document_version"]) if row["document_version"] is not None else None,
+            "author": row["author"],
+            "authorId": row["author_id"],
+            "issueDate": iso_date,
+            "documentId": row.get("document_id"),
+        }
+
+    items = [to_item(r) for r in rows]
+
+    return jsonify({
+        "success": True,
+        "items": items,
+        "total": total,
+        "page": page,
+        "pageSize": page_size,
+    })
+
 # ---- References ----------------------------------------------
 @bp.post("/references/save")
 def save_references():
@@ -316,69 +445,39 @@ def load_references(token):
             forms.append({"formId": r["refer_document"], "formName": r["refer_document_name"]})
     return jsonify({"success": True, "documents": docs, "forms": forms})
 
-# ---- Process Flow (kept simple, still step 0) -----------------
-# @bp.post("/process-flow/save")
-# def save_process_flow():
-#     body = request.get_json(silent=True) or {}
-#     token = (body.get("token") or "").strip()
-#     if not token: return send_response(400, False, "Missing token")
+def _safe_docname(s: str, fallback: str = "document") -> str:
+    s = (s or "").strip()
+    if not s:
+        return fallback
+    # keep Han/letters/digits/space/-_()
+    s = "".join(ch for ch in s if ch.isalnum() or ch in " _-()[]【】（）")
+    s = re.sub(r"\s+", "_", s)
+    return s[:80] or fallback
 
-#     tier_no = int(body.get("tier_no") or 1)
-#     sub_no  = int(body.get("sub_no") or 0)
-#     pf      = body.get("processFlow") or {}
-#     mode    = (pf.get("mode") or "table").strip()
-#     cols    = int(pf.get("cols") or 9)
-#     header_json = pf.get("header_json")
-#     items   = pf.get("items") or []
-#     file    = pf.get("file")
+@bp.post("/generate/word")
+def generate_word():
+    """
+    Accept JSON body {attribute, content, reference}, save under a new payload_id,
+    generate a DOCX, and return the file.
+    """
+    if not request.is_json:
+        return jsonify({"ok": False, "error": "JSON body required"}), 400
 
-#     CT_PF_TABLE, CT_PF_IMAGE = 10, 11
-#     if mode not in ("table","image"):
-#         return send_response(400, False, "Invalid mode")
+    data = request.get_json(silent=True) or {}
+    data.setdefault("attribute", [])
+    data.setdefault("content", [])
+    data.setdefault("reference", [])
 
-#     if mode == "table":
-#         ctype, cjson, fjson = CT_PF_TABLE, jdump({"cols": cols, "items": items}), None
-#     else:
-#         if not (file and file.get("asset_id")): return send_response(400, False, "Missing file.asset_id")
-#         ctype, cjson, fjson = CT_PF_IMAGE, jdump({"file": file}), jdump([file])
+    payload_id = f"{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
 
-#     with db() as (conn, cur):
-#         cur.execute("""
-#           SELECT content_id FROM rms_block_content
-#           WHERE document_token=%s AND step_type=%s AND tier_no=%s AND sub_no=%s
-#           FOR UPDATE
-#         """, (token, STEP["PROCESS_FLOW"], tier_no, sub_no))
-#         row = cur.fetchone()
-#         if row:
-#             cid = row[0]
-#             cur.execute("""
-#               UPDATE rms_block_content
-#               SET content_type=%s, header_text=NULL, header_json=%s,
-#                   content_text=NULL, content_json=%s, files=%s,
-#                   metadata=%s, updated_at=NOW()
-#               WHERE content_id=%s
-#             """, (ctype, jdump(header_json), cjson, fjson, jdump({"kind":"process-flow"}), cid))
-#             # refresh asset link if image (optional: clear old links)
-#             cur.execute("""
-#               DELETE l FROM rms_asset_links l
-#               LEFT JOIN rms_block_content bc ON bc.content_id=l.content_id
-#               WHERE bc.document_token=%s AND bc.step_type=%s AND bc.tier_no=%s AND bc.sub_no=%s
-#             """, (token, STEP["PROCESS_FLOW"], tier_no, sub_no))
-#             if mode=="image":
-#                 cur.execute("INSERT INTO rms_asset_links (asset_id, document_token, content_id, created_at) VALUES (%s,%s,%s,NOW())",
-#                             (file["asset_id"], token, cid))
-#         else:
-#             cid = new_token()
-#             cur.execute("""
-#               INSERT INTO rms_block_content
-#               (content_id, document_token, step_type, tier_no, sub_no, content_type,
-#                header_text, header_json, content_text, content_json, files, metadata,
-#                created_at, updated_at)
-#               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NOW())
-#             """, (cid, token, STEP["PROCESS_FLOW"], tier_no, sub_no, ctype,
-#                   None, jdump(header_json), None, cjson, fjson, jdump({"kind":"process-flow"})))
-#             if mode=="image":
-#                 cur.execute("INSERT INTO rms_asset_links (asset_id, document_token, content_id, created_at) VALUES (%s,%s,%s,NOW())",
-#                             (file["asset_id"], token, cid))
-#     return jsonify({"success": True})
+    # filename
+    try:
+        attr_last = data["attribute"][-1]
+        doc_name  = _safe_docname(attr_last.get("documentName") or attr_last.get("documentID") or payload_id)
+    except Exception:
+        doc_name = payload_id
 
+    out_path = os.path.join(BASE_DIR, f"{doc_name}.docx")
+    get_docx(out_path, data)
+
+    return send_file(out_path, as_attachment=True, download_name=f"{doc_name}.docx", mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")

@@ -1,0 +1,660 @@
+import json, re
+from datetime import datetime
+from enum import Enum
+
+from docx import Document
+from docx.shared import Cm, Pt, RGBColor
+from docx.enum.text import WD_ALIGN_PARAGRAPH 
+from docx.enum.table import WD_ALIGN_VERTICAL
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+
+COLOR_DICT = {
+    "red": RGBColor(255, 0, 0),
+    "blue": RGBColor(0, 0, 255),
+    "#000": RGBColor(0, 0, 0),
+    "#000000": RGBColor(0, 0, 0),
+    "#ff0000": RGBColor(255, 0, 0),
+    "#0000ff": RGBColor(0, 0, 255),
+}
+
+class DOCUMENT_TYPE(Enum):
+    ManufacturingDocument = 0
+    SpecificationDocument = 1
+
+class DOCUMENT_STEP(Enum):
+    ManufacturingDocument = [
+        {"目的": {"parent": "attribute", "code": "documentPurpose"}},
+        {"製造流程": {"parent": "content", "code": 0}},
+        {"管理條件": {"parent": "content", "code": 1}},
+        {"製造條件參數一覽表": {"parent": "content", "code": 2}},
+        {"異常處置": {"parent": "content", "code": 3}},
+        {"相關文件": {"parent": "reference", "code": 0}},
+        {"使用表單": {"parent": "reference", "code": 1}}
+    ]
+    SpecificationDocument = [
+        {"目的": {"parent": "attribute", "code": "purpose"}},
+        {"製作條件規範": {"parent": "content", "code": 4}},
+        {"製造參數一覽表": {"parent": "content", "code": 5}},
+        {"適用品質與規格內容": {"parent": "content", "code": 6}},
+        {"使用表單": {"parent": "reference", "code": 1}},
+        {"其他": {"parent": "content", "code": 7}},
+    ]
+
+SPEC_HEADERS = ["規格上限", "操作上限", "中值", "操作下限", "規格下限"]
+COLOR_RED = RGBColor(255, 0, 0)
+
+SPEC_HDRS = ["規格上限", "操作上限", "中值", "操作下限", "規格下限"]
+COLOR_RED = RGBColor(255, 0, 0)
+
+# Extract plain text and "first seen" color from a cell JSON (your ProseMirror-ish structure).
+def _extract_text_and_color_from_cell_json(cell_json, COLOR_DICT):
+    txt_parts = []
+    first_color = None
+    for blk in cell_json.get("content", []):
+        if blk.get("type") == "paragraph":
+            for t in blk.get("content", []) or []:
+                if t.get("type") == "text":
+                    txt_parts.append(t.get("text", ""))
+                    marks = t.get("marks")
+                    if first_color is None and marks:
+                        ckey = marks[0].get("attrs", {}).get("color")
+                        if ckey in COLOR_DICT:
+                            first_color = COLOR_DICT[ckey]
+    return "".join(txt_parts).strip(), first_color
+
+# Extract header texts for row0 (works if headers are in tableHeader/tableCell/customTableCell)
+def _header_texts(row0_cells):
+    headers = []
+    for cell in row0_cells:
+        if cell.get("type") not in ["customTableCell", "tableCell", "tableHeader"]:
+            continue
+        htxt = []
+        for blk in cell.get("content", []):
+            if blk.get("type") == "paragraph":
+                for t in blk.get("content", []) or []:
+                    if t.get("type") == "text":
+                        htxt.append(t.get("text", ""))
+        headers.append("".join(htxt).strip())
+    return headers
+
+# Find indices of the 5 special headers among ALL headers. Returns dict if all present, else None.
+def _find_spec_header_indices(headers):
+    pos = {}
+    for name in SPEC_HDRS:
+        try:
+            pos[name] = headers.index(name)
+        except ValueError:
+            return None
+    return pos
+
+# Very tolerant float extractor (find first number in text like "12.3mm" or "±2.0")
+_num_pat = re.compile(r"[-+]?\d+(?:\.\d+)?")
+def _to_float_or_none(s):
+    if s is None: return None
+    m = _num_pat.search(str(s))
+    return float(m.group(0)) if m else None
+
+def _compose_value(upper_txt, lower_txt):
+    u = _to_float_or_none(upper_txt)
+    l = _to_float_or_none(lower_txt)
+    if u is None or l is None:
+        return ""  # cannot compute
+    center = (u + l) / 2
+    width  = abs(u - l) / 2
+    # tune formatting if you prefer fewer decimals
+    return f"{center:.2f} ± {width:.2f}"
+
+def set_style_fonts(style, latin="Arial", east_asia="標楷體"):
+    """
+    Apply Latin (ascii/hAnsi/cs) and East Asian (eastAsia) fonts to a Word style.
+    Works for paragraph and character styles.
+    """
+    # Set high-level python-docx font (affects ascii/hAnsi sometimes, but we set XML explicitly too)
+    if hasattr(style, "font"):
+        style.font.name = latin
+
+    # Ensure <w:rPr> exists
+    rPr = style._element.rPr
+    if rPr is None:
+        rPr = OxmlElement("w:rPr")
+        style._element.append(rPr)
+
+    # Ensure <w:rFonts> exists
+    rFonts = rPr.rFonts
+    if rFonts is None:
+        rFonts = OxmlElement("w:rFonts")
+        rPr.append(rFonts)
+
+    # Set Latin/complex + East Asian
+    rFonts.set(qn("w:ascii"), latin)          # Latin
+    rFonts.set(qn("w:hAnsi"), east_asia)          # Latin (alternate)
+    rFonts.set(qn("w:cs"), latin)             # Complex script (safe to mirror Latin)
+    rFonts.set(qn("w:eastAsia"), east_asia)   # East Asian (Chinese)
+
+def apply_default_fonts(doc, latin="Arial", east_asia="標楷體"):
+    # Normal
+    set_style_fonts(doc.styles["Normal"], latin, east_asia)
+
+    # Headings 1..9 (apply if present)
+    for i in range(1, 10):
+        name = f"Heading {i}"
+        if name in doc.styles:
+            set_style_fonts(doc.styles[name], latin, east_asia)
+
+    # Common extra styles (optional; add any you use)
+    for s in ["Title", "Subtitle", "Intense Quote", "Quote", "Strong", "Emphasis"]:
+        if s in doc.styles:
+            set_style_fonts(doc.styles[s], latin, east_asia)
+
+def update_p(p, mapping):
+    if len(p.runs) == 0:
+        return
+    
+    full_text = "".join([pr.text for pr in p.runs])
+
+    if mapping.get(full_text) == None:
+        return
+    
+    for r in p.runs:
+        r.text = ""
+
+    p.runs[0].text = str(mapping[full_text])
+
+def replace_in_footer(footer, title_mapping):
+    p = footer.paragraphs[0]
+    full_text = p.runs[0].text
+    if title_mapping.get(full_text) != None:
+        p.runs[0].text = title_mapping[full_text]
+
+def replace_in_header(header, title_mapping):
+    # tables in header
+    for row in header.tables[0].rows:
+        for cell in row.cells:
+            for p in cell.paragraphs:
+                update_p(p, title_mapping)
+
+def set_repeat_table_header(row):
+    """ set repeat table row on every new page"""
+    tr = row._tr
+    trPr = tr.get_or_add_trPr()
+    tblHeader = OxmlElement('w:tblHeader')
+    tblHeader.set(qn('w:val'), "true")
+    trPr.append(tblHeader)
+    return row
+
+# --- New Content Generation Helper Functions ---
+
+def create_docx_table(cell, json_table_data):
+    rows_data = [row for row in json_table_data.get("content", []) if row.get("type") == "tableRow"]
+    if not rows_data:
+        return
+
+    # Build list of header cells JSON (row 0)
+    row0_cells_json = [c for c in rows_data[0].get("content", []) if c.get("type") in ["customTableCell", "tableCell", "tableHeader"]]
+    if not row0_cells_json:
+        return
+
+    # Get header texts (full list, including extra headers like 項次/槽體/說明 etc.)
+    headers = _header_texts(row0_cells_json)
+    # Find positions of the 5 special headers; if not all present -> fall back to original rendering
+    pos = _find_spec_header_indices(headers)
+
+    # If NOT a spec table, render as-is (your original behavior)
+    if pos is None:
+        table = cell.add_table(rows=0, cols=len(row0_cells_json))
+        table.width = cell.width.cm - Cm(1)
+        table.style = 'Table Grid'
+        # write all rows/cells like your previous logic
+        for rowIndex, row_data in enumerate(rows_data):
+            cells_data = [c for c in row_data.get("content", []) if c.get("type") in ["customTableCell", "tableCell", "tableHeader"]]
+            row = table.add_row()
+            if rowIndex == 0:
+                set_repeat_table_header(row)
+            for i in range(len(cells_data)):
+                cell_data = cells_data[i]
+                docx_cell = row.cells[i]
+                width = docx_cell.width.cm
+                docx_cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+
+                attr = cell_data.get("attrs", {}) or {}
+                dropdownValue = attr.get("dropdownValue")
+                if dropdownValue:
+                    p = docx_cell.paragraphs[0]
+                    p.text = dropdownValue
+                    color_key = attr.get("dropdownColor")
+                    if color_key in COLOR_DICT:
+                        p.runs[0].font.color.rgb = COLOR_DICT[color_key]
+                    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    continue
+
+                # normal paragraphs/images
+                items = cell_data.get("content", []) or []
+                for idx, item in enumerate(items):
+                    if item.get("type") == "paragraph":
+                        p = docx_cell.paragraphs[0] if idx == 0 else docx_cell.add_paragraph()
+                        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                        for text_item in item.get("content", []) or []:
+                            if text_item.get("type") == "text":
+                                marks = text_item.get("marks")
+                                color = RGBColor(0,0,0) if not marks else COLOR_DICT[marks[0]["attrs"]["color"]]
+                                run = p.add_run(text_item.get("text",""))
+                                run.font.color.rgb = color
+                            elif text_item.get("type") == "image":
+                                src = text_item["attrs"]["src"].split("/", 3)[-1]
+                                run = p.add_run()
+                                run.add_picture(src, width=Cm(max(width - 0.5, 0.5)))
+        return
+
+    # ---------- SPEC TABLE TRANSFORMATION ----------
+    # Determine insertion position = the smallest index among the five headers
+    insert_at = min(pos.values())
+    # The set of indices to remove (the five spec headers)
+    spec_idx_set = set(pos[h] for h in SPEC_HDRS)
+
+    # Build new header sequence: copy original headers left->right, but when we hit insert_at,
+    # insert ["規格值","操作值"] once and skip all five spec columns.
+    new_header_titles = []
+    col_map = []  # For non-spec columns: holds original index; for inserted pair: ('SPECPAIR', None)
+    i = 0
+    while i < len(headers):
+        if i == insert_at:
+            # insert the two new columns
+            new_header_titles.extend(["規格值", "操作值"])
+            col_map.append(("SPECPAIR", None))
+            # skip over all five spec indices (wherever they are)
+            # but keep scanning; we will simply "not copy" any of the five columns
+        if i in spec_idx_set:
+            i += 1
+            continue
+        if i != insert_at:
+            new_header_titles.append(headers[i])
+            col_map.append(("COPY", i))
+        i += 1
+
+    # If insert_at > len(headers) (theoretically impossible), guard
+    if not new_header_titles:
+        # fallback to original render if something odd happened
+        return
+
+    # Create the new docx table with computed column count
+    table = cell.add_table(rows=0, cols=len(new_header_titles))
+    table.width = cell.width.cm - Cm(1)
+    table.style = 'Table Grid'
+
+    # Write new header row
+    hdr = table.add_row()
+    set_repeat_table_header(hdr)
+    for j, title in enumerate(new_header_titles):
+        hdr.cells[j].text = title
+        hdr.cells[j].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+        hdr.cells[j].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+
+    # Prepare a reverse map for quick lookup
+    idx_reg_upper = pos["規格上限"]
+    idx_reg_lower = pos["規格下限"]
+    idx_opr_upper = pos["操作上限"]
+    idx_opr_lower = pos["操作下限"]
+    # idx_mid = pos["中值"]   # we are *not* keeping 中值 now per your new requirement
+
+    # Now write each data row (skip row0 because it was header)
+    for row_data in rows_data[1:]:
+        row = table.add_row()
+        row_cells_json = [c for c in row_data.get("content", []) if c.get("type") in ["customTableCell", "tableCell", "tableHeader"]]
+
+        # Pre-extract text & color for all original columns (so we can reference easily)
+        texts = []
+        colors = []
+        for orig_idx, cjson in enumerate(row_cells_json):
+            t, col = _extract_text_and_color_from_cell_json(cjson, COLOR_DICT)
+            texts.append(t)
+            colors.append(col)
+
+        # Compose spec/oper values + color flags
+        spec_val = _compose_value(texts[idx_reg_upper] if idx_reg_upper < len(texts) else "",
+                                  texts[idx_reg_lower] if idx_reg_lower < len(texts) else "")
+        oper_val = _compose_value(texts[idx_opr_upper] if idx_opr_upper < len(texts) else "",
+                                  texts[idx_opr_lower] if idx_opr_lower < len(texts) else "")
+
+        spec_is_red = (colors[idx_reg_upper] == COLOR_RED if idx_reg_upper < len(colors) else False) or \
+                      (colors[idx_reg_lower] == COLOR_RED if idx_reg_lower < len(colors) else False)
+        oper_is_red = (colors[idx_opr_upper] == COLOR_RED if idx_opr_upper < len(colors) else False) or \
+                      (colors[idx_opr_lower] == COLOR_RED if idx_opr_lower < len(colors) else False)
+
+        # Fill the new row respecting col_map
+        out_col = 0
+        for tag, payload in col_map:
+            if tag == "SPECPAIR":
+                # 規格值
+                p = row.cells[out_col].paragraphs[0]
+                run = p.add_run(spec_val)
+                if spec_is_red:
+                    run.font.color.rgb = COLOR_RED
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                row.cells[out_col].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+                out_col += 1
+                # 操作值
+                p = row.cells[out_col].paragraphs[0]
+                run = p.add_run(oper_val)
+                if oper_is_red:
+                    run.font.color.rgb = COLOR_RED
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                row.cells[out_col].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+                out_col += 1
+            else:
+                orig_i = payload
+                # copy the original non-spec column value (with color) into the new col
+                val = texts[orig_i] if orig_i < len(texts) else ""
+                col = colors[orig_i] if orig_i < len(colors) else None
+                p = row.cells[out_col].paragraphs[0]
+                run = p.add_run(val)
+                if col is not None:
+                    run.font.color.rgb = col
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                row.cells[out_col].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+                out_col += 1
+
+    return
+
+
+def parse_json_content(parent_object, json_data, indent = None, header = False, no = None, tier=1):
+    """
+    Recursively parses the JSON content (jsonHeader/jsonContent) and adds elements 
+    (paragraphs, list items) to the parent object (docx.table._Cell).
+    Applies tier-based indentation.
+    """
+    if json_data is None or json_data.get("content") is None:
+        return
+
+    base_indent = Cm(0.7) 
+
+    for block in json_data["content"]:
+        block_type = block.get("type")
+        
+        # Use the 'tier' from the content object, or the current recursion tier.
+        content_tier = block.get("tier", tier) 
+
+        if block_type == "paragraph" or block_type == "listItem":
+            p = parent_object.add_paragraph()
+            p.style = 'List Paragraph' if block_type == "listItem" else 'Normal'
+
+            full_text = []
+            for item in block.get("content", []):
+                if item.get("type") == "text":
+                    full_text.append(item.get("text", ""))
+
+
+            p.text = no + "".join(full_text) if header else "".join(full_text)
+            
+            # Apply tier-based indent. tier=1 means 1 level of content under step title.
+            # Indent factor is tier - 1. (Tier 1 gets indent factor 0, Tier 2 gets 1, etc.)
+            indent_factor = max(0, content_tier - 1)
+            p.paragraph_format.left_indent = base_indent * indent_factor
+            
+            p.runs[0].font.size = Pt(12)
+        
+        elif block_type == "table":
+            # For tables nested inside content structure (less common but handled)
+            create_docx_table(parent_object, block)
+            
+        # Recursive call for nested content
+        if 'content' in block and block.get("type") not in ["table", "tableRow", "tableCell", "tableHeader"]:
+            # Pass the current tier + 1 for deeper nesting
+            parse_json_content(parent_object, block, content_tier + 1)
+
+
+def createHeader(cell, step_content_list):
+    """Adds header content (jsonHeader) for all items in the list to the cell."""
+    for content_obj in step_content_list:
+        no = f"{content_obj['step']}.{content_obj['tier']}" if content_obj['sub_no'] == 0 else f"{content_obj['step']}.{content_obj['tier']}.{content_obj['sub_no']}"
+        tier = 2 if content_obj.get("sub_no", 0) == 0 else 3
+        for item in content_obj.get("data", []):
+            if item.get("jsonHeader"):
+                # Headers are main headings, usually tier 1 (no base indent)
+                parse_json_content(cell, item["jsonHeader"], header = True, no = no, tier = tier) 
+
+def createContent(cell, step_content_list):
+    """Adds main content (jsonContent) for all items in the list to the cell, applying tier-based indent."""
+    for content_obj in step_content_list:
+        tier = 3 if content_obj.get("sub_no", 0) == 0 else 4
+        for item in content_obj.get("data", []):
+            if item.get("jsonContent"):
+                # Pass the content's tier to enable indentation
+                parse_json_content(cell, item["jsonContent"], tier=tier)
+
+def createPictures(cell, step_content_list):
+    """Adds picture placeholders/links (files) for all items in the list to the cell."""
+    width = cell.width.cm
+    base_indent = Cm(0.7)
+    for content_obj in step_content_list:
+        tier = content_obj.get("tier", 1)
+        indent_factor = max(0, tier - 1)
+        for item in content_obj.get("data", []):
+            if item.get("files"):
+                for file_info in item["files"]:
+                    # Cannot embed image, so use a placeholder text/link
+                    # p = cell.add_paragraph(f"圖片連結: {file_info.get('url', 'N/A')}")
+                    # p.runs[0].font.size = Pt(10)
+                    # p.paragraph_format.left_indent = base_indent * indent_factor
+                    if file_info.get("url") != None:
+                        p = cell.add_paragraph()
+                        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                        src = file_info["url"].split("/", 1)[-1]
+                        run = p.add_run()
+                        run.add_picture(src, width = Cm(width / 2 - 0.5))
+
+
+def createTable(cell, step_content_list):
+    """Adds tables (jsonContent containing a table) for all items in the list to the cell."""
+    for content_obj in step_content_list:
+        for item in content_obj.get("data", []):
+            if item.get("jsonContent"):
+                # The JSON for table content is expected to be a single 'table' block inside 'content'
+                table_blocks = [b for b in item["jsonContent"].get("content", []) if b.get("type") == "table"]
+                for table_block in table_blocks:
+                    # Table is created directly in the cell, as requested, to avoid left indent.
+                    create_docx_table(cell, table_block)
+
+        if content_obj.get("jsonConditionContent"):
+            table_blocks = [b for b in content_obj["jsonConditionContent"].get("content", []) if b.get("type") == "table"]
+            for table_block in table_blocks:
+                # Table is created directly in the cell, as requested, to avoid left indent.
+                create_docx_table(cell, table_block)
+        
+        if content_obj.get("jsonParameterContent"):
+            table_blocks = [b for b in content_obj["jsonParameterContent"].get("content", []) if b.get("type") == "table"]
+            for table_block in table_blocks:
+                # Table is created directly in the cell, as requested, to avoid left indent.
+                create_docx_table(cell, table_block)
+
+
+def draw_instruction_content(doc, data):
+    attribute = data["attribute"][-1]
+    contents = data["content"]
+    references = data["reference"]
+
+    documentType = attribute["documentType"]
+    cell = doc.tables[1].rows[0].cells[0]
+    
+    # Ensure a paragraph exists to start or continue content in the cell
+    if not cell.paragraphs or cell.paragraphs[0].text:
+         cell.add_paragraph()
+    cell.paragraphs[0].style = doc.styles["Normal"]
+
+    for (stepIndex, itemInfo) in enumerate(DOCUMENT_STEP[DOCUMENT_TYPE(documentType).name].value):
+        (step, stepInfo), = itemInfo.items()
+        
+        # 1. Set the step title
+        p_title = cell.paragraphs[0] if stepIndex == 0 else cell.add_paragraph()
+        p_title.text = f"{stepIndex + 1}.{step}"
+        p_title.runs[0].font.size = Pt(12)
+        # p_title.runs[0].font.bold = True
+        # p_title.paragraph_format.space_before = Pt(12) 
+        # p_title.paragraph_format.space_after = Pt(6) 
+        
+        # base_indent = Cm(0.7)
+
+        # 2. Get content for the current step
+        print(f"stepInfo: {stepInfo}")
+        if stepInfo["parent"] == "attribute":
+            stepContent = attribute.get(stepInfo["code"])
+            if isinstance(stepContent, str):
+                stepContent = "NA" if len(stepContent) == 0 else stepContent
+                p_attr = cell.add_paragraph(stepContent)
+                p_attr.runs[0].font.size = Pt(12)
+                p_attr.paragraph_format.left_indent = p_attr.runs[0].font.size * 2
+        
+        elif stepInfo["parent"] == "content":
+            # Filter content items for the current step_type
+            step_content_list = [content for content in contents if content["step_type"] == stepInfo["code"]]
+            if not step_content_list:
+                stepContent = "NA" if len(step_content_list) == 0 else stepContent
+                p_attr = cell.add_paragraph(stepContent)
+                p_attr.runs[0].font.size = Pt(12)
+                p_attr.paragraph_format.left_indent = p_attr.runs[0].font.size * 2
+                continue
+
+            # Process all data items across all matching step content objects
+            for content_obj in step_content_list:
+                if content_obj.get("code") != None:
+                    p = cell.add_paragraph()
+                    p.text = f"程式代碼：{content_obj['code']}"
+                    createTable(cell, [content_obj])
+
+                for index, item_data in enumerate(content_obj.get("data", [])):
+                    option = item_data.get("option")
+                    
+                    # Wrap the single data item for consistent access by helpers
+                    item_for_helper = {"data": [item_data], "step": stepIndex + 1, "tier": content_obj.get("tier", 1), "sub_no": index}
+                    
+                    if option == 2: # Header + Table
+                        createHeader(cell, [item_for_helper]) 
+                        createTable(cell, [item_for_helper]) 
+                    elif option == 1: # Header + Content + Pictures
+                        createHeader(cell, [item_for_helper]) 
+                        createContent(cell, [item_for_helper]) 
+                        createPictures(cell, [item_for_helper]) 
+                    elif option == 0: # Header only
+                        createHeader(cell, [item_for_helper])
+            
+        elif stepInfo["parent"] == "reference":
+            # Filter reference items for the current referenceType
+            stepContent = [reference for reference in references if reference["referenceType"] == stepInfo["code"]]
+            
+            if stepContent:
+                # Add a reference list with indentation
+                for index, ref in enumerate(stepContent):
+                    # For reference documents, use a simple numbered format
+                    ref_p = cell.add_paragraph(f"({index + 1}) {ref.get('referenceDocumentID', '')} - {ref.get('referenceDocumentName', '')}")
+                    ref_p.runs[0].font.size = Pt(12)
+                    ref_p.paragraph_format.left_indent = ref_p.runs[0].font.size * 2
+                    ref_p.paragraph_format.space_after = Pt(3)
+
+            else:
+                stepContent = "NA" if len(stepContent) == 0 else stepContent
+                p_attr = cell.add_paragraph(stepContent)
+                p_attr.runs[0].font.size = Pt(12)
+                p_attr.paragraph_format.left_indent = p_attr.runs[0].font.size * 2
+
+def fill_from_template(template_path, out_path, data, title_mapping, info_mapping):
+    """
+    Open template DOCX (with the exact header you want),
+    replace placeholders in the header, and save to a new file.
+    """
+    doc = Document(template_path)
+    apply_default_fonts(doc, latin="Arial", east_asia="標楷體")
+
+    # Different-first-page header? You can choose which to edit:
+    for section in doc.sections:
+        replace_in_header(section.header, title_mapping)
+        replace_in_footer(section.footer, title_mapping)
+
+    for row in doc.tables[0].rows:
+        for cell in row.cells:
+            for p in cell.paragraphs:
+                update_p(p, info_mapping)
+
+    draw_instruction_content(doc, data)
+
+    doc.save(out_path)
+    print("Saved:", out_path)
+
+def get_docx(outpath, data, template = "docx-template/example.docx"):
+    attribute = data["attribute"][-1]
+    Doc_id = attribute["documentID"]
+    Date = datetime.now().strftime("%Y/%m/%d")
+    Version = f"{int(attribute['documentVersion']):.1f}"
+    Title = "製造條件指示書" if attribute["documentType"] == 0 else "製造式樣書"
+    Doc_name = attribute["documentName"]
+
+    # Put placeholders like [DOC_NO], [REV], [DATE], [TOTAL_PAGES] in the header cells of your template.
+    # title_mapping = { "DOC_NO": "WMH250", "DATE": "2025/10/29", "REV": "1.0", "PAGE": "1", "TITLE": "製造條件指示書", "DOC_NAME": "", "PROJECT": "", "DOC_CODE": "FM-R-MF-AZ-052 Rev7.0"}
+    title_mapping = { "DOC_NO": Doc_id, "DATE": Date, "REV": Version, "PAGE": "1", "TITLE": Title, "DOC_NAME": Doc_name, "PROJECT": "", "DOC_CODE": "FM-R-MF-AZ-052 Rev7.0"}
+    info_mapping = {
+        "REV1": "", "DATE1": "", "REASON1": "", "POINT1": "", "DEPT1": "", "APPROVER1": "", "CONFIRMER1": "", "AUTHOR1": "",
+        "REV2": "", "DATE2": "", "REASON2": "", "POINT2": "", "DEPT2": "", "APPROVER2": "", "CONFIRMER2": "", "AUTHOR2": "",
+        "REV3": "", "DATE3": "", "REASON3": "", "POINT3": "", "DEPT3": "", "APPROVER3": "", "CONFIRMER3": "", "AUTHOR3": ""
+    }
+
+    for index, attribute in enumerate(data["attribute"]):
+        info_mapping[f"REV{index + 1}"] = f'{attribute["documentVersion"]:.1f}'
+        info_mapping[f"DATE{index + 1}"] = attribute.get("issueDate", datetime.now().strftime("%Y/%m/%d"))
+        info_mapping[f"REASON{index + 1}"] = attribute["reviseReason"]
+        info_mapping[f"POINT{index + 1}"] = attribute["revisePoint"]
+        info_mapping[f"DEPT{index + 1}"] = attribute["department"]
+        info_mapping[f"APPROVER{index + 1}"] = attribute["approver"]
+        info_mapping[f"CONFIRMER{index + 1}"] = attribute["confirmer"]
+        info_mapping[f"AUTHOR{index + 1}"] = attribute["author"]
+        info_mapping[f"REASON{index + 1}"] = f'變更理由\n{attribute["reviseReason"]}'
+        info_mapping[f"POINT{index + 1}"] = f'變更要點\n{attribute["revisePoint"]}'
+
+    # Assuming 'example__.docx' exists in the execution environment
+    fill_from_template(template, outpath, data, title_mapping, info_mapping) 
+
+# ----------------- Example usage -----------------
+if __name__ == "__main__":
+    # The file path has been changed to match the payload.json fetched content
+    # Note: Replace '_captures/docs/20251028-114010-2b096f8a/payload.json' 
+    # with the actual file path if running locally. 
+    # Since I have the content, I will use the dictionary directly for demonstration.
+    # with open("_captures/docs/20251030-161207-516a0cfa/payload.json", 'r', encoding = "utf-8") as f:
+    with open("_captures/docs/20251103-095207-27ee69e9/payload.json", 'r', encoding = "utf-8") as f:
+        data = json.load(f)
+
+    # template = r"./example__.docx"   # <- your example file (the “second” screenshot)
+    # output   = r"./header_table_fix.docx"
+    template = "docx-template/example.docx"
+    output = "docxTemp/temp.docx"
+
+    attribute = data["attribute"][-1]
+    Doc_id = attribute["documentID"]
+    Date = datetime.now().strftime("%Y/%m/%d")
+    Version = f"{int(attribute['documentVersion']):.1f}"
+    Title = "製造條件指示書" if attribute["documentType"] == 0 else "製造式樣書"
+    Doc_name = attribute["documentName"]
+
+    # Put placeholders like [DOC_NO], [REV], [DATE], [TOTAL_PAGES] in the header cells of your template.
+    # title_mapping = { "DOC_NO": "WMH250", "DATE": "2025/10/29", "REV": "1.0", "PAGE": "1", "TITLE": "製造條件指示書", "DOC_NAME": "", "PROJECT": "", "DOC_CODE": "FM-R-MF-AZ-052 Rev7.0"}
+    title_mapping = { "DOC_NO": Doc_id, "DATE": Date, "REV": Version, "PAGE": "1", "TITLE": Title, "DOC_NAME": Doc_name, "PROJECT": "", "DOC_CODE": "FM-R-MF-AZ-052 Rev7.0"}
+    info_mapping = {
+        "REV1": "", "DATE1": "", "REASON1": "", "POINT1": "", "DEPT1": "", "APPROVER1": "", "CONFIRMER1": "", "AUTHOR1": "",
+        "REV2": "", "DATE2": "", "REASON2": "", "POINT2": "", "DEPT2": "", "APPROVER2": "", "CONFIRMER2": "", "AUTHOR2": "",
+        "REV3": "", "DATE3": "", "REASON3": "", "POINT3": "", "DEPT3": "", "APPROVER3": "", "CONFIRMER3": "", "AUTHOR3": ""
+    }
+
+    for index, attribute in enumerate(data["attribute"]):
+        info_mapping[f"REV{index + 1}"] = f'{attribute["documentVersion"]:.1f}'
+        info_mapping[f"DATE{index + 1}"] = attribute.get("issueDate", datetime.now().strftime("%Y/%m/%d"))
+        info_mapping[f"REASON{index + 1}"] = attribute["reviseReason"]
+        info_mapping[f"POINT{index + 1}"] = attribute["revisePoint"]
+        info_mapping[f"DEPT{index + 1}"] = attribute["department"]
+        info_mapping[f"APPROVER{index + 1}"] = attribute["approver"]
+        info_mapping[f"CONFIRMER{index + 1}"] = attribute["confirmer"]
+        info_mapping[f"AUTHOR{index + 1}"] = attribute["author"]
+        info_mapping[f"REASON{index + 1}"] = f'變更理由\n{attribute["reviseReason"]}'
+        info_mapping[f"POINT{index + 1}"] = f'變更要點\n{attribute["revisePoint"]}'
+
+    # Assuming 'example__.docx' exists in the execution environment
+    fill_from_template(template, output, data, title_mapping, info_mapping) 
+    print("The script with the completed draw_instruction_content function is ready.")
+    print("Please ensure your local environment has 'example__.docx' and python-docx installed to run the full script.")

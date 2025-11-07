@@ -1,4 +1,5 @@
 import os
+import platform
 
 # secrets & environment
 SECRET_KEY = os.getenv("SECRET_KEY", "default_unsafe_key_change_this_in_production")
@@ -14,7 +15,7 @@ DB = {
 }
 
 # uploads
-DRAWIO_CLI_PATH = os.getenv("DRAWIO_CLI_PATH", r"..\drawio-windows\draw.io.exe")
+DRAWIO_CLI_PATH = os.getenv("DRAWIO_CLI_PATH", r"..\drawio-windows\draw.io.exe") if platform.system() == "Windows" else os.getenv("DRAWIO_CLI_PATH", "drawio") 
 UPLOAD_FOLDER_NAME = "uploads"
 BASE_DIR = os.getcwd()
 UPLOAD_ROOT_DIR = os.path.join(BASE_DIR, UPLOAD_FOLDER_NAME)

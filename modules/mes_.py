@@ -50,11 +50,13 @@ def projects():
     return send_response(200, True, "請求成功", {"projects": out})
 
 # --------- /specifics ---------
-# --------- /specifics ---------
 @bp.get("/specifics")
 def specifics():
     keyword = _norm(request.args.get("keyword"))   # search in spec name/code
     machine = _norm(request.args.get("machine"))   # search in machine name/code
+
+    if not keyword and not machine:
+        return send_response(401, True, "沒有搜尋條件", {"message": "沒有搜尋條件"})
 
     # 1) Start from the full set of spec codes (project-agnostic)
     sql = "SELECT DISTINCT spec_code FROM sfdb.rms_spec_flat"
@@ -62,35 +64,41 @@ def specifics():
         cur.execute(sql)
         all_spec_codes = [r["spec_code"] for r in cur.fetchall() if r.get("spec_code")]
 
-    # 2) Pull oracle rows once for name resolution (and possible machine filtering)
-    rows = fetch_mes_rows_for_specs(all_spec_codes, exclude_ti_to=True)
-
-    # Build a map spec_code -> clean spec_name
-    code_to_name = {}
-    for r in rows:
-        if r["spec_code"] not in code_to_name and r.get("spec_name"):
-            code_to_name[r["spec_code"]] = r["spec_name"]
-
-    # 3) If machine keyword exists, narrow specs to those having matching machine
+    # 2) If a machine keyword is given, narrow specs down to those that have
+    #    at least one matching machine (by code or name).
     candidate_spec_codes = set(all_spec_codes)
     if machine:
-        rows_by_machine = [
+        rows = fetch_mes_rows_for_specs(all_spec_codes, exclude_ti_to=True)
+        rows = [
             r for r in rows
             if _icontains(r["machine_name"], machine) or _icontains(r["machine_code"], machine)
         ]
-        candidate_spec_codes = {r["spec_code"] for r in rows_by_machine}
+        candidate_spec_codes = {r["spec_code"] for r in rows}
 
-    # 4) Apply optional spec keyword (on spec name OR code). If no keyword, list all candidates.
+        # Build a mapping spec_code -> clean spec_name from the same rows
+        code_to_name = {}
+        for r in rows:
+            if r["spec_code"] not in code_to_name and r.get("spec_name"):
+                code_to_name[r["spec_code"]] = r["spec_name"]
+    else:
+        # No machine filter: we still need spec names.
+        # Reuse the same helper (joins are OK), then dedup to a simple map.
+        rows = fetch_mes_rows_for_specs(all_spec_codes, exclude_ti_to=True)
+        code_to_name = {}
+        for r in rows:
+            if r["spec_code"] not in code_to_name and r.get("spec_name"):
+                code_to_name[r["spec_code"]] = r["spec_name"]
+
+    # 3) Apply the spec keyword (on spec name OR spec code)
     results = {}
     for sc in sorted(candidate_spec_codes):
-        sn = code_to_name.get(sc, "")
+        sn = code_to_name.get(sc, "")  # clean name if we saw one
         if keyword and not (_icontains(sn, keyword) or _icontains(sc, keyword)):
             continue
-        # payload shape: { "<spec name>": {"code": "<spec code>"} }
+        # Keep your original payload shape: { "<spec name>": {"code": "<spec code>"} }
         results[sn or sc] = {"code": sc}
 
     return send_response(200, True, "請求成功", {"specifics": results})
-
 
 # --------- /groups-machines ---------
 @bp.get("/groups-machines")
@@ -277,133 +285,206 @@ def machines_by_group():
 
 # -------------------------------------------------------------------------------------------------
 
-def _paginate(items, page, page_size):
-    total = len(items)
-    page = max(1, int(page or 1))
-    page_size = max(1, min(100, int(page_size or 20)))
-    i0 = (page - 1) * page_size
-    return {"items": items[i0:i0+page_size], "total": total, "page": page, "pageSize": page_size}
+def _extract_project_code(name: str) -> str:
+    # 依你的資料慣例「WMC露光工程」→ 取前綴英文當代碼，取不到就用全名
+    import re
+    if not name:
+        return ""
+    m = re.match(r"^([A-Za-z]+)", name)
+    return m.group(1) if m else name
 
+def _build_like_kw(keyword: str):
+    kw = (keyword or "").strip()
+    return f"%{kw}%" if kw else None
+
+# -- API: 工程清單（左表） -------------------------------------------
 @bp.get("/engineering")
 def list_engineering():
-    """List projects from MySQL (distinct project). Supports keyword + pagination."""
-    keyword = _norm(request.args.get("keyword"))
-    page     = request.args.get("page")
-    pageSize = request.args.get("pageSize")
-
-    projects = get_projects()  # ['WMC露光工程', ...]
-    if keyword:
-        projects = [p for p in projects if keyword in p]
-
-    # Build rows expected by your UI: id, projectCode, projectName
-    # Use the same string as both code/name unless you have a separate code.
-    rows = [{"id": p, "projectCode": p, "projectName": p} for p in projects]
-    return send_response(200, True, "OK", _paginate(rows, page, pageSize))
-
-@bp.get("/engineering/<project_id>/processes")
-def list_engineering_processes(project_id):
-    """List specs already assigned to this project (from MySQL)."""
-    project = _norm(project_id)
-    sql = """
-      SELECT DISTINCT spec_code, spec_name
-      FROM sfdb.rms_spec_flat
-      WHERE project=%s
-      ORDER BY spec_code
     """
-    with db(dict_cursor=True) as (_, cur):
-        cur.execute(sql, (project,))
-        rows = [{"id": r["spec_code"], "specCode": r["spec_code"], "specName": r["spec_name"]} for r in cur.fetchall()]
-    return send_response(200, True, "OK", rows)
-
-@bp.get("/engineering/<project_id>/unassigned-processes")
-def list_unassigned_processes(project_id):
+    Query params:
+      keyword: 搜尋工程名 或 底下製程名
+      page, pageSize: 分頁
+    Return:
+      { items: [{id, projectCode, projectName}], total }
+      其中 id 以 projectName 當唯一鍵（前端當成 key 使用）
     """
-    Specs that exist in Oracle but NOT in MySQL mapping for this project.
-    Filters by spec name/code keyword.
-    Pagination supported.
-    """
-    project  = _norm(project_id)
-    keyword  = _norm(request.args.get("keyword"))
-    page     = request.args.get("page")
-    pageSize = request.args.get("pageSize")
+    keyword = request.args.get("keyword", "").strip()
+    page = max(int(request.args.get("page", 1)), 1)
+    page_size = max(min(int(request.args.get("pageSize", 20)), 100), 1)
+    offset = (page - 1) * page_size
 
-    # Already assigned
-    assigned = set(get_spec_codes_by_project(project))
+    # 關鍵字同時匹配 工程名 or 底下的製程名（EXISTS 子查詢）
+    with db(dict_cursor=True) as (conn, cur):
+        where = ["project <> 'NA'"]  # 排除未分配
+        params = []
 
-    # Pull *all* spec codes we know (fast from MySQL)
-    with db(dict_cursor=True) as (_, cur):
-        cur.execute("SELECT DISTINCT spec_code FROM sfdb.rms_spec_flat")
-        all_codes = [r["spec_code"] for r in cur.fetchall() if r.get("spec_code")]
+        if keyword:
+            where.append("(project LIKE %s OR EXISTS (SELECT 1 FROM rms_spec_flat s2 WHERE s2.project = s.project AND (s2.spec_code LIKE %s OR s2.spec_name LIKE %s)))")
+            kw = f"%{keyword}%"
+            params += [kw, kw, kw]
 
-    # Resolve Oracle names for those spec codes
-    rows = fetch_mes_rows_for_specs(all_codes, exclude_ti_to=True)
-    # We only need one row per spec for name; build map
-    code_to_name = {}
+        where_sql = " AND ".join(where) if where else "1"
+        # 先拿 total
+        cur.execute(f"""
+            SELECT COUNT(*) AS cnt
+            FROM (
+              SELECT project
+              FROM rms_spec_flat s
+              WHERE {where_sql}
+              GROUP BY project
+            ) t
+        """, params)
+        total = cur.fetchone()["cnt"] if cur.rowcount else 0
+
+        # 取 items
+        cur.execute(f"""
+            SELECT project
+            FROM rms_spec_flat s
+            WHERE {where_sql}
+            GROUP BY project
+            ORDER BY project ASC
+            LIMIT %s OFFSET %s
+        """, params + [page_size, offset])
+        rows = cur.fetchall() or []
+
+    items = []
     for r in rows:
-        if r["spec_code"] not in code_to_name:
-            code_to_name[r["spec_code"]] = r["spec_name"]
+        pname = r["project"]
+        items.append({
+            "id": pname,  # 以 projectName 當 id（簡單穩定）
+            "projectCode": _extract_project_code(pname),
+            "projectName": pname
+        })
 
-    # Unassigned list
-    unassigned = []
-    for sc, sn in code_to_name.items():
-        if sc in assigned:
-            continue
-        if keyword and not (keyword in (sn or "") or keyword in sc):
-            continue
-        unassigned.append({"id": sc, "specCode": sc, "specName": sn or sc})
+    return jsonify({"items": items, "total": total})
 
-    # Stable sort
-    unassigned.sort(key=lambda x: (x["specCode"], x["specName"]))
-    return send_response(200, True, "OK", _paginate(unassigned, page, pageSize))
 
-@bp.post("/engineering/<project_id>/processes")
-def add_processes_to_engineering(project_id):
+# -- API: 工程底下的製程清單（右表） ---------------------------------
+@bp.get("/engineering/<project_name>/processes")
+def engineering_processes(project_name):
+    with db(dict_cursor=True) as (conn, cur):
+        cur.execute("""
+          SELECT id, spec_code AS specCode, spec_name AS specName
+          FROM rms_spec_flat
+          WHERE project=%s
+          ORDER BY spec_code ASC, spec_name ASC
+        """, (project_name,))
+        rows = cur.fetchall() or []
+    return jsonify(rows)
+
+
+# -- API: 未被新增的製程（給對話框右側清單） ----------------------------
+@bp.get("/unassigned")
+def list_unassigned():
     """
-    Add specs to a project by spec_code list. We DON'T write to Oracle.
-    We insert minimal rows into MySQL mapping table:
-      dept_code='NA', work_center_name='NA'
+    Query params: keyword, page, pageSize
+    Return: { items: [{id,specCode,specName}], total }
+    僅 project='NA' 視為未分配；忽略 spec_name 空白行。
     """
-    import json
-    project = _norm(project_id)
-    payload = request.get_json(force=True) or {}
-    process_ids = payload.get("processIds") or []  # list of spec_code
+    keyword = request.args.get("keyword", "").strip()
+    page = max(int(request.args.get("page", 1)), 1)
+    page_size = max(min(int(request.args.get("pageSize", 20)), 100), 1)
+    offset = (page - 1) * page_size
 
-    if not process_ids:
-        return send_response(400, False, "缺少 processIds", {"message": "請提供要加入的製程代碼陣列"})
-
-    # Resolve names from Oracle (spec_code -> spec_name)
-    rows = fetch_mes_rows_for_specs(list(process_ids), exclude_ti_to=True)
-    name_map = {}
-    for r in rows:
-        if r["spec_code"] not in name_map and r.get("spec_name"):
-            name_map[r["spec_code"]] = r["spec_name"]
-
-    # Bulk insert IGNORE
-    sql = """
-      INSERT IGNORE INTO sfdb.rms_spec_flat
-        (dept_code, work_center_name, spec_code, spec_name, project)
-      VALUES (%s, %s, %s, %s, %s)
-    """
-    vals = []
-    for sc in process_ids:
-        sn = name_map.get(sc, sc)
-        vals.append(("NA", "NA", sc, sn, project))
+    like_kw = _build_like_kw(keyword)
 
     with db(dict_cursor=True) as (conn, cur):
-        cur.executemany(sql, vals)
-        conn.commit()
+        if like_kw:
+            params = [like_kw, like_kw]
+            cur.execute("""
+              SELECT COUNT(*) AS cnt
+              FROM rms_spec_flat
+              WHERE project='NA' AND spec_name<>'' AND (spec_code LIKE %s OR spec_name LIKE %s)
+            """, params)
+            total = cur.fetchone()["cnt"] if cur.rowcount else 0
 
-    return send_response(200, True, "新增成功", {"added": len(vals)})
+            cur.execute("""
+              SELECT id, spec_code AS specCode, spec_name AS specName
+              FROM rms_spec_flat
+              WHERE project='NA' AND spec_name<>'' AND (spec_code LIKE %s OR spec_name LIKE %s)
+              ORDER BY spec_code ASC
+              LIMIT %s OFFSET %s
+            """, params + [page_size, offset])
+        else:
+            cur.execute("""
+              SELECT COUNT(*) AS cnt
+              FROM rms_spec_flat
+              WHERE project='NA' AND spec_name<>''
+            """)
+            total = cur.fetchone()["cnt"] if cur.rowcount else 0
 
-@bp.delete("/engineering/<project_id>/processes/<spec_code>")
-def delete_process_from_engineering(project_id, spec_code):
-    """Remove a mapping row(s) for this project/spec_code."""
-    project = _norm(project_id)
-    spec_code = _norm(spec_code)
-    with db(dict_cursor=True) as (conn, cur):
-        cur.execute(
-            "DELETE FROM sfdb.rms_spec_flat WHERE project=%s AND spec_code=%s",
-            (project, spec_code)
-        )
-        conn.commit()
-    return send_response(200, True, "移除成功", {"deletedSpec": spec_code})
+            cur.execute("""
+              SELECT id, spec_code AS specCode, spec_name AS specName
+              FROM rms_spec_flat
+              WHERE project='NA' AND spec_name<>''
+              ORDER BY spec_code ASC
+              LIMIT %s OFFSET %s
+            """, [page_size, offset])
+
+        rows = cur.fetchall() or []
+    return jsonify({"items": rows, "total": total})
+
+
+# -- API: 新增工程 & 指派製程 ----------------------------------------
+@bp.post("/engineering")
+def create_engineering_with_processes():
+    """
+    Body: { projectCode, projectName, processIds: [id,...] }
+    實作：把給定 id 列的 project 改為 projectName
+    """
+    data = request.get_json(force=True) or {}
+    project_code = (data.get("projectCode") or "").strip()
+    project_name = (data.get("projectName") or "").strip()
+    ids = data.get("processIds") or []
+
+    if not project_name or not ids:
+        return jsonify({"success": False, "message": "projectName 與 processIds 必填"}), 400
+
+    # 保守起見，過濾成整數
+    try:
+        id_list = [int(x) for x in ids if int(x) > 0]
+    except Exception:
+        return jsonify({"success": False, "message": "processIds 非法"}), 400
+    if not id_list:
+        return jsonify({"success": False, "message": "無有效 processIds"}), 400
+
+    with db() as (conn, cur):
+        # 僅更新目前仍未分配的列，避免意外覆蓋其他工程
+        fmt_ids = ",".join(["%s"] * len(id_list))
+        sql = f"""
+          UPDATE rms_spec_flat
+          SET project=%s
+          WHERE id IN ({fmt_ids}) AND project='NA'
+        """
+        cur.execute(sql, [project_name] + id_list)
+        updated = cur.rowcount
+
+    return jsonify({"success": True, "updated": updated})
+
+
+# -- API: 從工程移除某製程 -------------------------------------------
+@bp.delete("/engineering/<project_name>/processes/<int:proc_id>")
+def remove_process(project_name, proc_id):
+    with db() as (conn, cur):
+        cur.execute("""
+          UPDATE rms_spec_flat
+          SET project='NA'
+          WHERE id=%s AND project=%s
+          LIMIT 1
+        """, (proc_id, project_name))
+        changed = cur.rowcount
+    return jsonify({"success": True, "changed": changed})
+
+
+# -- API: 刪除工程（把該工程所有製程改回 NA） -------------------------
+@bp.delete("/engineering/<project_name>")
+def delete_engineering(project_name):
+    with db() as (conn, cur):
+        cur.execute("""
+          UPDATE rms_spec_flat
+          SET project='NA'
+          WHERE project=%s
+        """, (project_name,))
+        changed = cur.rowcount
+    return jsonify({"success": True, "changed": changed})
+

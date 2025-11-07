@@ -68,6 +68,7 @@ def get_condition_machines():
 
 @bp.get("/search-conditions-by-machines")
 def search_conditions_by_machines():
+    print("GET /search-conditions-by-machines")
     keyword = (request.args.get("keyword") or "").strip().lower()
     if not keyword:
         # reuse get-conditions when empty, for convenience

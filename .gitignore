@@ -8,6 +8,10 @@ __pycache__/
 dist/
 .eggs/
 *.log
+outdate/
+_captures/
+docxTemp
+
 
 # IDE / OS
 .vscode/

@@ -15,12 +15,14 @@ def create_app():
     from modules.media import bp as media_bp
     from modules.mes import bp as mes_bp
     from modules.conditions import bp as cond_bp
+    from modules.capture import bp_capture as capture_bp
 
     app.register_blueprint(auth_bp, url_prefix="/api")
     app.register_blueprint(docs_bp, url_prefix="/docs")
     app.register_blueprint(media_bp, url_prefix="/uploads")   # serves under /uploads/*
     app.register_blueprint(mes_bp, url_prefix="/mes")
     app.register_blueprint(cond_bp, url_prefix="/conditions")
+    app.register_blueprint(capture_bp, url_prefix="/capture")
 
     # preload CSV caches
     load_all()
