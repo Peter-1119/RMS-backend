@@ -409,6 +409,407 @@ def list_drafts():
         "pageSize": page_size,
     })
 
+@bp.delete("/<document_token>")
+def delete_draft(document_token):
+    """
+    Delete a draft by its document_token.
+    Only rows with status = 0 (draft) can be deleted.
+
+    Path:
+      DELETE /docs/<document_token>
+
+    Response:
+      200 { success: True, deleted: 1 }
+      404 { success: False, error: "not found" }              # no such token
+      409 { success: False, error: "not a draft" }            # exists but status != 0
+    """
+    token = (document_token or "").strip()
+    if not token:
+        return jsonify({"success": False, "error": "document_token is required"}), 400
+
+    with db(dict_cursor=True) as (conn, cur):
+        # Is there a record?
+        cur.execute("SELECT status FROM rms_document_attributes WHERE document_token=%s", (token,))
+        row = cur.fetchone()
+
+        if not row:
+            return jsonify({"success": False, "error": "not found"}), 404
+
+        # Only allow deleting drafts
+        if int(row.get("status", 1)) != 0:
+            return jsonify({"success": False, "error": "not a draft"}), 409
+
+        # Delete
+        cur.execute("DELETE FROM rms_document_attributes WHERE document_token=%s AND status=0", (token,))
+        conn.commit()
+        deleted = cur.rowcount or 0
+
+    # (Optional) clean temp files if you keep any by token under BASE_DIR
+    try:
+        # Example: remove /docxTemp/<token>.docx if you create such files.
+        # from pathlib import Path
+        # p = Path(BASE_DIR) / f"{token}.docx"
+        # if p.exists():
+        #     p.unlink()
+        pass
+    except Exception:
+        # Non-fatal: ignore file cleanup errors
+        pass
+
+    return jsonify({"success": True, "deleted": deleted}), 200
+
+def _parse_statuses(v):
+    """
+    Accepts either:
+      - single int string: "0"
+      - comma list: "1,3"
+    Returns a validated list of ints (subset of {0,1,2,3}), or raises ValueError.
+    """
+    if v is None:
+        raise ValueError("status is required")
+    try:
+        parts = [p.strip() for p in str(v).split(",")]
+        nums = [int(p) for p in parts if p != ""]
+    except Exception:
+        raise ValueError("status must be int or comma-separated ints")
+    allowed = {0, 1, 2, 3}
+    for n in nums:
+        if n not in allowed:
+            raise ValueError("status must be in {0,1,2,3}")
+    if not nums:
+        raise ValueError("status is required")
+    return nums
+
+# @bp.get("/documents")
+# def list_documents():
+#     """
+#     Generic document list for any statuses.
+#     Query params:
+#       - user_id   (required)
+#       - status    (required) e.g. "1" or "1,3"
+#       - keyword   (optional; matches document_name/document_id)
+#       - page      (default 1)
+#       - page_size (default 20, max 100)
+#       - sort      (issue_date | document_version | document_name; default issue_date)
+#       - order     (asc|desc; default desc)
+#     Always returns the same shape as /docs/drafts PLUS rejecter/rejectReason for convenience.
+#     """
+#     user_id = request.args.get("user_id")
+#     if not user_id:
+#         return jsonify({"success": False, "error": "user_id is required"}), 400
+
+#     # statuses
+#     try:
+#         statuses = _parse_statuses(request.args.get("status"))
+#     except ValueError as e:
+#         return jsonify({"success": False, "error": str(e)}), 400
+
+#     keyword = (request.args.get("keyword") or "").strip()
+#     try:
+#         page      = max(1, int(request.args.get("page", 1)))
+#         page_size = min(100, max(1, int(request.args.get("page_size", 20))))
+#     except ValueError:
+#         return jsonify({"success": False, "error": "page/page_size must be int"}), 400
+
+#     sort_map = {
+#         "issue_date": "issue_date",
+#         "document_version": "document_version",
+#         "document_name": "document_name",
+#     }
+#     sort_key = (request.args.get("sort") or "issue_date").lower()
+#     sort_col = sort_map.get(sort_key, "issue_date")
+#     order    = (request.args.get("order") or "desc").lower()
+#     order_sql = "DESC" if order not in ("asc", "ASC") else "ASC"
+
+#     # WHERE
+#     where = ["author_id = %s", f"status IN ({', '.join(['%s'] * len(statuses))})"]
+#     params = [user_id] + statuses
+
+#     if keyword:
+#         where.append("(document_name LIKE %s OR document_id LIKE %s)")
+#         like_kw = f"%{keyword}%"
+#         params.extend([like_kw, like_kw])
+
+#     where_sql = " AND ".join(where)
+#     offset = (page - 1) * page_size
+
+#     count_sql = f"""
+#       SELECT COUNT(*) AS cnt
+#       FROM rms_document_attributes
+#       WHERE {where_sql}
+#     """
+
+#     data_sql = f"""
+#       SELECT
+#         document_type,
+#         document_token,
+#         document_name,
+#         document_version,
+#         author,
+#         author_id,
+#         issue_date,
+#         document_id,
+#         status,
+#         rejecter,
+#         reject_reason
+#       FROM rms_document_attributes
+#       WHERE {where_sql}
+#       ORDER BY {sort_col} {order_sql}
+#       LIMIT %s OFFSET %s
+#     """
+
+#     with db(dict_cursor=True) as (_, cur):
+#         cur.execute(count_sql, params)
+#         total = int(cur.fetchone()["cnt"])
+
+#         cur.execute(data_sql, params + [page_size, offset])
+#         rows = cur.fetchall() or []
+
+#     def to_item(r):
+#         # ISO date
+#         iso_date = None
+#         if r.get("issue_date"):
+#             try:
+#                 iso_date = r["issue_date"].isoformat(timespec="seconds")
+#             except Exception:
+#                 iso_date = str(r["issue_date"])
+
+#         return {
+#             "documentType": r["document_type"],
+#             "documentToken": r["document_token"],
+#             "documentName": r["document_name"],
+#             "documentVersion": float(r["document_version"]) if r["document_version"] is not None else None,
+#             "author": r["author"],
+#             "authorId": r["author_id"],
+#             "issueDate": iso_date,
+#             "documentId": r.get("document_id"),
+#             "status": r.get("status"),
+#             "rejecter": r.get("rejecter"),
+#             "rejectReason": r.get("reject_reason"),
+#         }
+
+#     items = [to_item(r) for r in rows]
+
+#     return jsonify({
+#         "success": True,
+#         "items": items,
+#         "total": total,
+#         "page": page,
+#         "pageSize": page_size,
+#     })
+
+# # Optional thin wrappers to make your routes semantic and easy to call
+# @bp.get("/submitted")
+# def list_submitted():
+#     # status=1 (待簽核)
+#     args = request.args.to_dict(flat=True)
+#     args["status"] = 1
+#     with bp.test_request_context(query_string=args):
+#         return list_documents()
+
+# @bp.get("/rejected")
+# def list_rejected():
+#     # status=3 (退回)
+#     args = request.args.to_dict(flat=True)
+#     args["status"] = 3
+#     with bp.test_request_context(query_string=args):
+#         return list_documents()
+
+def _parse_statuses(s: str) -> list[int]:
+    if s is None or str(s).strip() == "":
+        raise ValueError("status is required")
+    out = []
+    for part in str(s).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(int(part))
+        except ValueError:
+            raise ValueError(f"invalid status: {part}")
+    if not out:
+        raise ValueError("status is required")
+    return out
+
+def _list_documents_impl(
+    *,
+    user_id: str,
+    statuses: list[int],
+    keyword: str = "",
+    page: int = 1,
+    page_size: int = 20,
+    sort_key: str = "issue_date",
+    order: str = "desc",
+):
+    sort_map = {
+        "issue_date": "issue_date",
+        "document_version": "document_version",
+        "document_name": "document_name",
+    }
+    sort_col = sort_map.get((sort_key or "issue_date").lower(), "issue_date")
+    order_sql = "DESC" if (order or "desc").lower() not in ("asc", "ASC") else "ASC"
+
+    where = ["author_id = %s", f"status IN ({', '.join(['%s'] * len(statuses))})"]
+    params = [user_id] + statuses
+
+    if keyword:
+        where.append("(document_name LIKE %s OR document_id LIKE %s)")
+        like_kw = f"%{keyword}%"
+        params.extend([like_kw, like_kw])
+
+    where_sql = " AND ".join(where)
+    offset = (page - 1) * page_size
+
+    count_sql = f"""
+      SELECT COUNT(*) AS cnt
+      FROM rms_document_attributes
+      WHERE {where_sql}
+    """
+    data_sql = f"""
+      SELECT
+        document_type,
+        document_token,
+        document_name,
+        document_version,
+        author,
+        author_id,
+        issue_date,
+        document_id,
+        status,
+        rejecter,
+        reject_reason
+      FROM rms_document_attributes
+      WHERE {where_sql}
+      ORDER BY {sort_col} {order_sql}
+      LIMIT %s OFFSET %s
+    """
+
+    with db(dict_cursor=True) as (_, cur):
+        cur.execute(count_sql, params)
+        total = int(cur.fetchone()["cnt"])
+
+        cur.execute(data_sql, params + [page_size, offset])
+        rows = cur.fetchall() or []
+
+    def to_item(r):
+        iso_date = None
+        if r.get("issue_date"):
+            try:
+                iso_date = r["issue_date"].isoformat(timespec="seconds")
+            except Exception:
+                iso_date = str(r["issue_date"])
+        return {
+            "documentType": r["document_type"],
+            "documentToken": r["document_token"],
+            "documentName": r["document_name"],
+            "documentVersion": float(r["document_version"]) if r["document_version"] is not None else None,
+            "author": r["author"],
+            "authorId": r["author_id"],
+            "issueDate": iso_date,
+            "documentId": r.get("document_id"),
+            "status": r.get("status"),
+            "rejecter": r.get("rejecter"),
+            "rejectReason": r.get("reject_reason"),
+        }
+
+    items = [to_item(r) for r in rows]
+    return {
+        "success": True,
+        "items": items,
+        "total": total,
+        "page": page,
+        "pageSize": page_size,
+    }
+
+@bp.get("/documents")
+def list_documents():
+    user_id = request.args.get("user_id")
+    if not user_id:
+        return jsonify({"success": False, "error": "user_id is required"}), 400
+
+    # statuses
+    try:
+        statuses = _parse_statuses(request.args.get("status"))
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+
+    keyword = (request.args.get("keyword") or "").strip()
+    try:
+        page      = max(1, int(request.args.get("page", 1)))
+        page_size = min(100, max(1, int(request.args.get("page_size", 20))))
+    except ValueError:
+        return jsonify({"success": False, "error": "page/page_size must be int"}), 400
+
+    sort_key = (request.args.get("sort") or "issue_date")
+    order    = (request.args.get("order") or "desc")
+
+    data = _list_documents_impl(
+        user_id=user_id,
+        statuses=statuses,
+        keyword=keyword,
+        page=page,
+        page_size=page_size,
+        sort_key=sort_key,
+        order=order,
+    )
+    return jsonify(data), 200
+
+@bp.get("/submitted")
+def list_submitted():
+    # 固定 status = 1
+    user_id = request.args.get("user_id")
+    if not user_id:
+        return jsonify({"success": False, "error": "user_id is required"}), 400
+
+    keyword = (request.args.get("keyword") or "").strip()
+    try:
+        page      = max(1, int(request.args.get("page", 1)))
+        page_size = min(100, max(1, int(request.args.get("page_size", 20))))
+    except ValueError:
+        return jsonify({"success": False, "error": "page/page_size must be int"}), 400
+
+    sort_key = (request.args.get("sort") or "issue_date")
+    order    = (request.args.get("order") or "desc")
+
+    data = _list_documents_impl(
+        user_id=user_id,
+        statuses=[1],
+        keyword=keyword,
+        page=page,
+        page_size=page_size,
+        sort_key=sort_key,
+        order=order,
+    )
+    return jsonify(data), 200
+
+@bp.get("/rejected")
+def list_rejected():
+    # 固定 status = 3
+    user_id = request.args.get("user_id")
+    if not user_id:
+        return jsonify({"success": False, "error": "user_id is required"}), 400
+
+    keyword = (request.args.get("keyword") or "").strip()
+    try:
+        page      = max(1, int(request.args.get("page", 1)))
+        page_size = min(100, max(1, int(request.args.get("page_size", 20))))
+    except ValueError:
+        return jsonify({"success": False, "error": "page/page_size must be int"}), 400
+
+    sort_key = (request.args.get("sort") or "issue_date")
+    order    = (request.args.get("order") or "desc")
+
+    data = _list_documents_impl(
+        user_id=user_id,
+        statuses=[3],
+        keyword=keyword,
+        page=page,
+        page_size=page_size,
+        sort_key=sort_key,
+        order=order,
+    )
+    return jsonify(data), 200
+
 # ---- References ----------------------------------------------
 @bp.post("/references/save")
 def save_references():
