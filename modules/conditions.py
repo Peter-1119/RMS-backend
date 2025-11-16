@@ -37,7 +37,6 @@ def get_conditions():
     except Exception as e:
         return send_response(500, True, "請求失敗", {"message": f"DB錯誤: {e}"})
 
-
 @bp.get("/get-condition-machines")
 def get_condition_machines():
     condition_id = (request.args.get("condition_id") or "").strip()
@@ -46,14 +45,10 @@ def get_condition_machines():
     try:
         with db() as (conn, cur):
             cur.execute("""
-                SELECT
-                    t1.group_id, t1.group_name,
-                    t2.machine_id, t2.machine_name
-                FROM rms_condition_groups t1
-                INNER JOIN rms_group_machines t2
-                    ON t1.group_id = t2.group_id
-                WHERE t1.condition_id = %s
-                ORDER BY t1.condition_id, t1.group_id, t2.machine_id
+                SELECT cg.group_id, cg.group_name, gm.machine_id, gm.machine_name FROM rms_condition_groups AS cg
+                INNER JOIN rms_group_machines AS gm ON  gm.condition_id = cg.condition_id AND gm.group_id     = cg.group_id
+                WHERE cg.condition_id = %s
+                ORDER BY cg.group_id, gm.machine_id
             """, (int(condition_id),))
             rows = cur.fetchall()
 
@@ -65,10 +60,8 @@ def get_condition_machines():
     except Exception as e:
         return send_response(500, True, "請求失敗", {"message": f"DB錯誤: {e}"})
 
-
 @bp.get("/search-conditions-by-machines")
 def search_conditions_by_machines():
-    print("GET /search-conditions-by-machines")
     keyword = (request.args.get("keyword") or "").strip().lower()
     if not keyword:
         # reuse get-conditions when empty, for convenience
@@ -100,7 +93,6 @@ def search_conditions_by_machines():
     except Exception as e:
         return send_response(500, True, "請求失敗", {"message": f"DB錯誤: {e}"})
 
-
 @bp.get("/delete-condition-by-id")
 def delete_condition_by_id():
     condition_id = (request.args.get("condition_id") or "").strip()
@@ -120,6 +112,43 @@ def delete_condition_by_id():
     except Exception as e:
         return send_response(500, True, "刪除失敗", {"message": f"資料庫錯誤: {e}"})
 
+# modules/conditions.py (only the parsing parts changed)
+def _normalize_machines_payload(obj: dict) -> dict:
+    """
+    Accept both NEW and OLD shapes and return NEW:
+      { gCode: { name: <group_name>, machines: { mCode: { name: <machine_name> } } } }
+    """
+    if not obj:
+        return {}
+    # Detect NEW: keys look like groupCodes and inner machines keyed by machineCodes
+    # Heuristics: if any value has "name" and "machines" dict keyed not by names
+    # We'll just support both explicitly:
+    out = {}
+    for gk, gv in (obj or {}).items():
+        if "name" in gv and "machines" in gv:
+            # NEW: gk is groupCode
+            gcode = (gk or "").strip()
+            gname = (gv.get("name") or gk or "").strip()
+            machines = {}
+            for mk, mv in (gv.get("machines") or {}).items():
+                mcode = (mk or "").strip()
+                mname = (mv.get("name") or mk or "").strip()
+                if mcode:
+                    machines[mcode] = {"name": mname}
+            if gcode:
+                out[gcode] = {"name": gname, "machines": machines}
+        else:
+            # OLD: gk is groupName, gv has { code, machines: { mName: { code } } }
+            gname = (gk or "").strip()
+            gcode = (gv.get("code") or "").strip()
+            machines = {}
+            for mname, minfo in (gv.get("machines") or {}).items():
+                mcode = (minfo.get("code") or "").strip()
+                if mcode:
+                    machines[mcode] = {"name": (mname or "").strip()}
+            if gcode:
+                out[gcode] = {"name": gname, "machines": machines}
+    return out
 
 @bp.post("/update-condition-data")
 def update_condition_data():
@@ -176,18 +205,20 @@ def update_condition_data():
             if condition_machines is not None:
                 cm = json.loads(condition_machines)
 
-                # add
-                add_spec = cm.get("machinesToAdd") or {}
+                # --- ADD ---
+                add_spec_raw = cm.get("machinesToAdd") or {}
+                add_spec = _normalize_machines_payload(add_spec_raw)   # NEW normalized
                 if add_spec:
+                    # ensure groups exist in rms_condition_groups
                     groups_to_add = []
-                    for gname, ginfo in add_spec.items():
-                        gid = ginfo.get("code")
+                    for gcode, ginfo in add_spec.items():
+                        gname = ginfo.get("name") or gcode
                         cur.execute(
                             "SELECT COUNT(*) FROM rms_condition_groups WHERE condition_id=%s AND group_id=%s",
-                            (cid, gid)
+                            (cid, gcode)
                         )
                         if cur.fetchone()[0] == 0:
-                            groups_to_add.append((cid, gid, gname))
+                            groups_to_add.append((cid, gcode, gname))
                     if groups_to_add:
                         cur.executemany(
                             "INSERT INTO rms_condition_groups (condition_id, group_id, group_name) VALUES (%s,%s,%s)",
@@ -196,11 +227,11 @@ def update_condition_data():
                         updated += cur.rowcount
 
                     machines_to_add = []
-                    for gname, ginfo in add_spec.items():
-                        gid = ginfo.get("code")
-                        for mname, minfo in ginfo.get("machines", {}).items():
-                            mid = minfo.get("code")
-                            machines_to_add.append((cid, gid, mid, mname))
+                    for gcode, ginfo in add_spec.items():
+                        gname = ginfo.get("name") or gcode
+                        for mcode, minfo in (ginfo.get("machines") or {}).items():
+                            mname = minfo.get("name") or mcode
+                            machines_to_add.append((cid, gcode, mcode, mname))
                     if machines_to_add:
                         cur.executemany("""
                             INSERT INTO rms_group_machines (condition_id, group_id, machine_id, machine_name)
@@ -208,39 +239,45 @@ def update_condition_data():
                         """, machines_to_add)
                         updated += cur.rowcount
 
-                # delete + cleanup
-                del_spec = cm.get("machinesToDelete") or {}
+                # --- DELETE ---
+                del_spec_raw = cm.get("machinesToDelete") or {}
+                del_spec = _normalize_machines_payload(del_spec_raw)   # 期望回傳 { gcode: { name, machines: { mcode: { name } } } }
+                print("[DEL] raw:", json.dumps(del_spec_raw, ensure_ascii=False))
+                print("[DEL] norm:", json.dumps(del_spec, ensure_ascii=False))
                 if del_spec:
-                    machine_ids = []
-                    for ginfo in del_spec.values():
-                        for minfo in ginfo.get("machines", {}).values():
-                            machine_ids.append(minfo.get("code"))
-                    if machine_ids:
-                        placeholders = ",".join(["%s"] * len(machine_ids))
-                        # which groups are affected
-                        cur.execute(
-                            f"SELECT DISTINCT group_id FROM rms_group_machines WHERE condition_id=%s AND machine_id IN ({placeholders})",
-                            (cid, *machine_ids)
-                        )
-                        affected_groups = [row[0] for row in cur.fetchall()]
+                    to_delete_rows = []   # list[tuple] -> (cid, gcode, mcode)
+                    affected_groups = set()
 
-                        # delete machines
-                        cur.execute(
-                            f"DELETE FROM rms_group_machines WHERE condition_id=%s AND machine_id IN ({placeholders})",
-                            (cid, *machine_ids)
+                    for gcode, ginfo in del_spec.items():
+                        gcode = (gcode or "").strip()
+                        for mcode in (ginfo.get("machines") or {}).keys():
+                            mcode = (mcode or "").strip()
+                            if not mcode:
+                                continue
+                            to_delete_rows.append((cid, gcode, mcode))
+                            affected_groups.add(gcode)
+
+                    print(f"to_delete_rows: {to_delete_rows}")
+                    if to_delete_rows:
+                        # ★ 精準刪除：帶 group_id 一起比對，避免“刪不到”或“多刪”的問題
+                        cur.executemany(
+                            "DELETE FROM rms_group_machines WHERE condition_id=%s AND group_id=%s AND machine_id=%s",
+                            to_delete_rows
                         )
                         updated += cur.rowcount
 
-                        # delete empty groups
+                        # ★ 清空群組：只刪剛才受影響的那幾個 group，效率更好
                         if affected_groups:
-                            gph = ",".join(["%s"] * len(affected_groups))
+                            g_list = list(affected_groups)
+                            gph = ",".join(["%s"] * len(g_list))
+                            # 若該 group 在此 condition 底下已無任何 machine，就把群組 row 清掉
                             cur.execute(f"""
                                 DELETE FROM rms_condition_groups
                                 WHERE condition_id=%s AND group_id IN ({gph})
-                                  AND group_id NOT IN (
-                                      SELECT group_id FROM rms_group_machines WHERE condition_id=%s
-                                  )
-                            """, (cid, *affected_groups, cid))
+                                AND group_id NOT IN (
+                                    SELECT group_id FROM rms_group_machines WHERE condition_id=%s
+                                )
+                            """, (cid, *g_list, cid))
                             updated += cur.rowcount
 
         if updated > 0:

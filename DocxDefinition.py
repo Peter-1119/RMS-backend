@@ -507,6 +507,8 @@ def draw_instruction_content(doc, data):
         elif stepInfo["parent"] == "content":
             # Filter content items for the current step_type
             step_content_list = [content for content in contents if content["step_type"] == stepInfo["code"]]
+            if stepInfo["code"] == 0:
+                print(f"type: {step_content_list}")
             if not step_content_list:
                 stepContent = "NA" if len(step_content_list) == 0 else stepContent
                 p_attr = cell.add_paragraph(stepContent)

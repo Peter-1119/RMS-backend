@@ -1,5 +1,9 @@
 # modules/docs.py
-import json, datetime, os, uuid, re
+from __future__ import annotations
+import json, datetime, os, uuid, re, subprocess, tempfile
+from pathlib import Path
+from io import BytesIO
+
 # Flask's send_file must be explicitly imported
 from flask import Blueprint, request, jsonify, send_file 
 from db import db
@@ -227,7 +231,7 @@ def save_params():
             cond_arr  = b.get("arrayConditionData") or []
             cur.execute(ins, (
                 new_token(), token, step_type, tier, 1, 2,
-                None, None,
+                code, None,
                 jdump(cond_arr),
                 jdump(cond_json),
                 jdump([]),
@@ -458,6 +462,78 @@ def delete_draft(document_token):
 
     return jsonify({"success": True, "deleted": deleted}), 200
 
+def _build_keyword_predicate(keyword: str):
+    """
+    Returns (sql_snippet, params) for robust keyword search.
+    - Matches: document_name, author, document_id (LIKE)
+    - Also matches document_version:
+        * if keyword is numeric (int/float), add exact equality on document_version
+        * always also add LIKE(cast(document_version as char)) for partial text matches
+    """
+    if not keyword:
+        return "", []
+
+    likes = []
+    params = []
+
+    # name / id / author LIKE
+    likes.append("document_name LIKE %s")
+    params.append(f"%{keyword}%")
+    likes.append("document_id LIKE %s")
+    params.append(f"%{keyword}%")
+    likes.append("author LIKE %s")
+    params.append(f"%{keyword}%")
+
+    # version: support numeric equality + textual LIKE
+    numeric = None
+    try:
+        numeric = float(keyword)
+    except Exception:
+        pass
+
+    # MySQL: CAST(document_version AS CHAR) for LIKE
+    likes.append("CAST(document_version AS CHAR) LIKE %s")
+    params.append(f"%{keyword}%")
+
+    eq = []
+    if numeric is not None:
+        eq.append("document_version = %s")
+        params.append(numeric)
+
+    # Combine
+    if eq:
+        where_piece = "(" + " OR ".join(likes + eq) + ")"
+    else:
+        where_piece = "(" + " OR ".join(likes) + ")"
+    return where_piece, params
+
+def _parse_doc_types(s: str | None) -> list[str] | None:
+    """
+    Accepts:
+      - None / ""  -> no filtering
+      - single or comma list: "Instruction", "Specification", or mix
+    Returns a normalized list using DB values: ["Instruction", "Specification"].
+    Raises ValueError if any entry is invalid.
+    """
+    if s is None or str(s).strip() == "":
+        return None
+
+    allowed = {
+        "instruction": "Instruction",
+        "specification": "Specification",
+    }
+    out = []
+    for part in str(s).split(","):
+        key = part.strip().lower()
+        if not key:
+            continue
+        if key not in allowed:
+            raise ValueError("document_type must be in {Instruction, Specification}")
+        out.append(allowed[key])
+    if not out:
+        return None
+    return out
+
 def _parse_statuses(v):
     """
     Accepts either:
@@ -480,141 +556,6 @@ def _parse_statuses(v):
         raise ValueError("status is required")
     return nums
 
-# @bp.get("/documents")
-# def list_documents():
-#     """
-#     Generic document list for any statuses.
-#     Query params:
-#       - user_id   (required)
-#       - status    (required) e.g. "1" or "1,3"
-#       - keyword   (optional; matches document_name/document_id)
-#       - page      (default 1)
-#       - page_size (default 20, max 100)
-#       - sort      (issue_date | document_version | document_name; default issue_date)
-#       - order     (asc|desc; default desc)
-#     Always returns the same shape as /docs/drafts PLUS rejecter/rejectReason for convenience.
-#     """
-#     user_id = request.args.get("user_id")
-#     if not user_id:
-#         return jsonify({"success": False, "error": "user_id is required"}), 400
-
-#     # statuses
-#     try:
-#         statuses = _parse_statuses(request.args.get("status"))
-#     except ValueError as e:
-#         return jsonify({"success": False, "error": str(e)}), 400
-
-#     keyword = (request.args.get("keyword") or "").strip()
-#     try:
-#         page      = max(1, int(request.args.get("page", 1)))
-#         page_size = min(100, max(1, int(request.args.get("page_size", 20))))
-#     except ValueError:
-#         return jsonify({"success": False, "error": "page/page_size must be int"}), 400
-
-#     sort_map = {
-#         "issue_date": "issue_date",
-#         "document_version": "document_version",
-#         "document_name": "document_name",
-#     }
-#     sort_key = (request.args.get("sort") or "issue_date").lower()
-#     sort_col = sort_map.get(sort_key, "issue_date")
-#     order    = (request.args.get("order") or "desc").lower()
-#     order_sql = "DESC" if order not in ("asc", "ASC") else "ASC"
-
-#     # WHERE
-#     where = ["author_id = %s", f"status IN ({', '.join(['%s'] * len(statuses))})"]
-#     params = [user_id] + statuses
-
-#     if keyword:
-#         where.append("(document_name LIKE %s OR document_id LIKE %s)")
-#         like_kw = f"%{keyword}%"
-#         params.extend([like_kw, like_kw])
-
-#     where_sql = " AND ".join(where)
-#     offset = (page - 1) * page_size
-
-#     count_sql = f"""
-#       SELECT COUNT(*) AS cnt
-#       FROM rms_document_attributes
-#       WHERE {where_sql}
-#     """
-
-#     data_sql = f"""
-#       SELECT
-#         document_type,
-#         document_token,
-#         document_name,
-#         document_version,
-#         author,
-#         author_id,
-#         issue_date,
-#         document_id,
-#         status,
-#         rejecter,
-#         reject_reason
-#       FROM rms_document_attributes
-#       WHERE {where_sql}
-#       ORDER BY {sort_col} {order_sql}
-#       LIMIT %s OFFSET %s
-#     """
-
-#     with db(dict_cursor=True) as (_, cur):
-#         cur.execute(count_sql, params)
-#         total = int(cur.fetchone()["cnt"])
-
-#         cur.execute(data_sql, params + [page_size, offset])
-#         rows = cur.fetchall() or []
-
-#     def to_item(r):
-#         # ISO date
-#         iso_date = None
-#         if r.get("issue_date"):
-#             try:
-#                 iso_date = r["issue_date"].isoformat(timespec="seconds")
-#             except Exception:
-#                 iso_date = str(r["issue_date"])
-
-#         return {
-#             "documentType": r["document_type"],
-#             "documentToken": r["document_token"],
-#             "documentName": r["document_name"],
-#             "documentVersion": float(r["document_version"]) if r["document_version"] is not None else None,
-#             "author": r["author"],
-#             "authorId": r["author_id"],
-#             "issueDate": iso_date,
-#             "documentId": r.get("document_id"),
-#             "status": r.get("status"),
-#             "rejecter": r.get("rejecter"),
-#             "rejectReason": r.get("reject_reason"),
-#         }
-
-#     items = [to_item(r) for r in rows]
-
-#     return jsonify({
-#         "success": True,
-#         "items": items,
-#         "total": total,
-#         "page": page,
-#         "pageSize": page_size,
-#     })
-
-# # Optional thin wrappers to make your routes semantic and easy to call
-# @bp.get("/submitted")
-# def list_submitted():
-#     # status=1 (待簽核)
-#     args = request.args.to_dict(flat=True)
-#     args["status"] = 1
-#     with bp.test_request_context(query_string=args):
-#         return list_documents()
-
-# @bp.get("/rejected")
-# def list_rejected():
-#     # status=3 (退回)
-#     args = request.args.to_dict(flat=True)
-#     args["status"] = 3
-#     with bp.test_request_context(query_string=args):
-#         return list_documents()
-
 def _parse_statuses(s: str) -> list[int]:
     if s is None or str(s).strip() == "":
         raise ValueError("status is required")
@@ -633,13 +574,15 @@ def _parse_statuses(s: str) -> list[int]:
 
 def _list_documents_impl(
     *,
-    user_id: str,
+    user_id: str | None,         # allow None for "all" search
     statuses: list[int],
     keyword: str = "",
     page: int = 1,
     page_size: int = 20,
     sort_key: str = "issue_date",
     order: str = "desc",
+    doc_types: list[str] | None = None,
+    scope: str = "mine",         # "mine" | "all"
 ):
     sort_map = {
         "issue_date": "issue_date",
@@ -649,15 +592,32 @@ def _list_documents_impl(
     sort_col = sort_map.get((sort_key or "issue_date").lower(), "issue_date")
     order_sql = "DESC" if (order or "desc").lower() not in ("asc", "ASC") else "ASC"
 
-    where = ["author_id = %s", f"status IN ({', '.join(['%s'] * len(statuses))})"]
-    params = [user_id] + statuses
+    where = []
+    params = []
 
-    if keyword:
-        where.append("(document_name LIKE %s OR document_id LIKE %s)")
-        like_kw = f"%{keyword}%"
-        params.extend([like_kw, like_kw])
+    # scope
+    if scope == "mine":
+        if not user_id:
+            raise ValueError("user_id is required for scope=mine")
+        where.append("author_id = %s")
+        params.append(user_id)
 
-    where_sql = " AND ".join(where)
+    # statuses (required)
+    where.append(f"status IN ({', '.join(['%s'] * len(statuses))})")
+    params.extend(statuses)
+
+    # doc types (optional)
+    if doc_types:
+        where.append(f"document_type IN ({', '.join(['%s'] * len(doc_types))})")
+        params.extend(doc_types)
+
+    # robust keyword
+    kw_sql, kw_params = _build_keyword_predicate(keyword)
+    if kw_sql:
+        where.append(kw_sql)
+        params.extend(kw_params)
+
+    where_sql = " AND ".join(where) if where else "1=1"
     offset = (page - 1) * page_size
 
     count_sql = f"""
@@ -712,14 +672,79 @@ def _list_documents_impl(
             "rejectReason": r.get("reject_reason"),
         }
 
-    items = [to_item(r) for r in rows]
     return {
         "success": True,
-        "items": items,
+        "items": [to_item(r) for r in rows],
         "total": total,
         "page": page,
         "pageSize": page_size,
     }
+
+@bp.get("/all")
+def list_all_documents():
+    # statuses required (same as /documents)
+    try:
+        statuses = _parse_statuses(request.args.get("status"))
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+
+    keyword = (request.args.get("keyword") or "").strip()
+    try:
+        page      = max(1, int(request.args.get("page", 1)))
+        page_size = min(100, max(1, int(request.args.get("page_size", 20))))
+    except ValueError:
+        return jsonify({"success": False, "error": "page/page_size must be int"}), 400
+
+    sort_key = (request.args.get("sort") or "issue_date")
+    order    = (request.args.get("order") or "desc")
+
+    data = _list_documents_impl(
+        user_id=None,           # no author filter → all authors
+        statuses=statuses,
+        keyword=keyword,        # strong search: name/author/version/id
+        page=page,
+        page_size=page_size,
+        sort_key=sort_key,
+        order=order,
+        doc_types=None,         # <— IMPORTANT: do not filter by type
+        scope="all",
+    )
+    return jsonify(data), 200
+
+@bp.get("/passed")
+def list_passed():
+    # 固定 status = 2 (通過/已簽核)
+    user_id = request.args.get("user_id")
+    if not user_id:
+        return jsonify({"success": False, "error": "user_id is required"}), 400
+
+    # document_type: optional ("Instruction", "Specification"), comma-separated ok
+    try:
+        doc_types = _parse_doc_types(request.args.get("document_type"))
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+
+    keyword = (request.args.get("keyword") or "").strip()
+    try:
+        page      = max(1, int(request.args.get("page", 1)))
+        page_size = min(100, max(1, int(request.args.get("page_size", 20))))
+    except ValueError:
+        return jsonify({"success": False, "error": "page/page_size must be int"}), 400
+
+    sort_key = (request.args.get("sort") or "issue_date")
+    order    = (request.args.get("order") or "desc")
+
+    data = _list_documents_impl(
+        user_id=user_id,
+        statuses=[2],              # <— PASSED
+        keyword=keyword,
+        page=page,
+        page_size=page_size,
+        sort_key=sort_key,
+        order=order,
+        doc_types=doc_types,       # <— filter if provided
+    )
+    return jsonify(data), 200
 
 @bp.get("/documents")
 def list_documents():
@@ -727,7 +752,6 @@ def list_documents():
     if not user_id:
         return jsonify({"success": False, "error": "user_id is required"}), 400
 
-    # statuses
     try:
         statuses = _parse_statuses(request.args.get("status"))
     except ValueError as e:
@@ -751,6 +775,7 @@ def list_documents():
         page_size=page_size,
         sort_key=sort_key,
         order=order,
+        scope="mine",
     )
     return jsonify(data), 200
 
@@ -882,3 +907,118 @@ def generate_word():
     get_docx(out_path, data)
 
     return send_file(out_path, as_attachment=True, download_name=f"{doc_name}.docx", mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+
+def get_soffice_cmd() -> str:
+    """
+    回傳 LibreOffice soffice 執行檔路徑：
+    - Linux: 直接用 'soffice'（在 PATH 裡）
+    - Windows: 先看環境變數 SOFFICE_PATH，沒有就用預設路徑
+    """
+    if os.name != "nt":  # posix (Linux)
+        return "soffice"
+
+    # Windows
+    env_path = os.getenv("SOFFICE_PATH")
+    if env_path and Path(env_path).is_file():
+        return env_path
+
+    default = Path(r"C:\Program Files\LibreOffice\program\soffice.exe")
+    if default.is_file():
+        return str(default)
+
+    # 最後交給 PATH
+    return "soffice"
+
+def docx_to_pdf_bytes(docx_bytes: bytes, filename_stem: str) -> bytes:
+    """
+    給一份 DOCX 的 bytes，丟到暫存資料夾，用 LibreOffice 轉成 PDF，
+    回傳 PDF 的 bytes。暫存檔案會在函式結束後自動刪除。
+    """
+    soffice = get_soffice_cmd()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        docx_path = tmpdir_path / f"{filename_stem}.docx"
+        pdf_path = tmpdir_path / f"{filename_stem}.pdf"
+
+        # 1) 把 DOCX bytes 寫到暫存檔
+        with open(docx_path, "wb") as f:
+            f.write(docx_bytes)
+
+        # 2) 呼叫 LibreOffice 轉檔
+        cmd = [
+            soffice,
+            "--headless",
+            "--convert-to", "pdf",
+            "--outdir", str(tmpdir_path),
+            str(docx_path),
+        ]
+        subprocess.run(cmd, check=True)
+
+        if not pdf_path.is_file():
+            raise RuntimeError(f"PDF not generated: {pdf_path}")
+
+        # 3) 讀回 PDF bytes
+        with open(pdf_path, "rb") as f:
+            pdf_bytes = f.read()
+
+        # 離開 with TemporaryDirectory，所有檔案自動刪除
+        return pdf_bytes
+
+@bp.post("/preview/pdf")
+def preview_pdf():
+    """
+    接 JSON {attribute, content, reference}，
+    用 get_docx 產生 DOCX（在記憶體），再用 LibreOffice 轉 PDF 回傳。
+    全程只使用 TemporaryDirectory，不會留下檔案。
+    """
+    if not request.is_json:
+        return jsonify({"success": False, "error": "JSON body required"}), 400
+
+    data = request.get_json(silent=True) or {}
+    data.setdefault("attribute", [])
+    data.setdefault("content", [])
+    data.setdefault("reference", [])
+
+    payload_id = f"{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+
+    try:
+        attr_last = data["attribute"][-1]
+        doc_name = _safe_docname(
+            attr_last.get("documentName") or
+            attr_last.get("documentID") or
+            payload_id
+        )
+    except Exception:
+        doc_name = payload_id
+
+    # 1) 先用 get_docx 產 DOCX 到記憶體
+    docx_buffer = BytesIO()
+    # 假設你的 get_docx 可以接 file-like object，如果現在只能接 path，
+    # 就改成先寫到 TemporaryDirectory 裡的檔案再讀，邏輯一樣。
+    get_docx(docx_buffer, data)
+    docx_bytes = docx_buffer.getvalue()
+
+    # 2) 轉成 PDF bytes（用 TemporaryDirectory，不留檔）
+    try:
+        pdf_bytes = docx_to_pdf_bytes(docx_bytes, filename_stem=doc_name)
+    except Exception as e:
+        return jsonify({"success": False, "error": f"convert failed: {e}"}), 500
+
+    # 3) 用 BytesIO 包裝後送出去（不當附件，給前端 iframe/blob 預覽用）
+    pdf_io = BytesIO(pdf_bytes)
+    pdf_io.seek(0)
+
+    headers = {
+        "Cache-Control": "no-store",
+        "Content-Disposition": f'inline; filename="{doc_name}.pdf"',
+        "X-Content-Type-Options": "nosniff",
+    }
+    return send_file(
+        pdf_io,
+        mimetype="application/pdf",
+        as_attachment=False,
+        download_name=f"{doc_name}.pdf",
+        headers=headers,
+    )
+

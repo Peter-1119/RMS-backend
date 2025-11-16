@@ -151,7 +151,7 @@ def fetch_mes_rows_for_specs(
             spec_name = clean_process_name(proc_name)
 
             # Group code (prefer MACHINE_GROUP; fall back to TYPE_NAME)
-            machine_group_code = _norm(mgroup_code_from_machine) or _norm(mtype_name_code)
+            machine_group_code = _norm(mtype_name_code) or _norm(mgroup_code_from_machine)
 
             code_from_desc, group_name_clean = split_code_from_desc(mtype_desc_raw or "")
             machine_group_name = group_name_clean or _norm(mtype_desc_raw)

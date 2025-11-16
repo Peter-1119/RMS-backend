@@ -11,6 +11,7 @@ dist/
 outdate/
 _captures/
 docxTemp
+data_store.py
 
 
 # IDE / OS
