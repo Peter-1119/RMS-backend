@@ -125,13 +125,13 @@ def fetch_mes_rows_for_specs(
             mt.MACHINE_TYPE_NAME,         -- code on TYPE (should match MACHINE_GROUP)
             mt.MACHINE_TYPE_DESC,         -- human display (contains '(CODE)' prefix)
             m.MACHINE_CODE,
-            m.MACHINE_DESC
+            m.MACHINE_DESC,
+            m.BUILDING
         FROM IDBUSER.RMS_SYS_PROCESS   p
         JOIN IDBUSER.RMS_SYS_TERMINAL  t ON t.PROCESS_ID = p.PROCESS_ID
         JOIN IDBUSER.RMS_SYS_MACHINE   m ON m.PDLINE_ID  = t.PDLINE_ID
-        LEFT JOIN IDBUSER.RMS_SYS_MACHINE_TYPE mt
-               ON mt.MACHINE_TYPE_NAME = m.MACHINE_GROUP
-        WHERE p.PROCESS_DESC IN ({bind_names})
+        LEFT JOIN IDBUSER.RMS_SYS_MACHINE_TYPE mt ON mt.MACHINE_TYPE_NAME = m.MACHINE_GROUP
+        WHERE p.PROCESS_DESC IN ({bind_names}) AND m.EQM_ID <> 'NA' AND m.ENABLED = 'Y'
           {where_suffix}
     """
 
@@ -141,11 +141,7 @@ def fetch_mes_rows_for_specs(
         cur.prefetchrows = 5000
         binds = {f"b{i}": spec_codes[i] for i in range(len(spec_codes))}
         cur.execute(sql, binds)
-        for (proc_desc, proc_name,
-             mgroup_code_from_machine,
-             mtype_name_code,
-             mtype_desc_raw,
-             mcode_col, mdesc) in cur:
+        for (proc_desc, proc_name, mgroup_code_from_machine, mtype_name_code, mtype_desc_raw, mcode_col, mdesc, mbuilding) in cur:
 
             spec_code = _norm(proc_desc)
             spec_name = clean_process_name(proc_name)
@@ -174,6 +170,7 @@ def fetch_mes_rows_for_specs(
 
                 "machine_code": machine_code,
                 "machine_name": machine_name,
+                "machine_building": _norm(mbuilding or "")
             })
     return rows
 
@@ -429,10 +426,9 @@ def list_all_machine_groups() -> List[Dict[str, Any]]:
             mt.MACHINE_TYPE_DESC   AS group_desc,
             COUNT(DISTINCT m.MACHINE_CODE) AS cnt
         FROM IDBUSER.RMS_SYS_MACHINE_TYPE mt
-        LEFT JOIN IDBUSER.RMS_SYS_MACHINE m
-               ON m.MACHINE_GROUP = mt.MACHINE_TYPE_NAME
-        GROUP BY mt.MACHINE_TYPE_NAME, mt.MACHINE_TYPE_DESC
-        ORDER BY mt.MACHINE_TYPE_NAME
+        LEFT JOIN IDBUSER.RMS_SYS_MACHINE m ON m.MACHINE_GROUP = mt.MACHINE_TYPE_NAME
+        WHERE m.EQM_ID <> 'NA' AND m.ENABLED = 'Y'
+        GROUP BY mt.MACHINE_TYPE_NAME, mt.MACHINE_TYPE_DESC ORDER BY mt.MACHINE_TYPE_NAME
     """
     out: List[Dict[str, Any]] = []
     with ora_cursor() as cur:
@@ -468,7 +464,7 @@ def fetch_machines_by_group_all(
     sql = """
         SELECT m.MACHINE_CODE, m.MACHINE_DESC
         FROM IDBUSER.RMS_SYS_MACHINE m
-        WHERE m.MACHINE_GROUP = :g
+        WHERE m.MACHINE_GROUP = :g AND m.EQM_ID <> 'NA' AND m.ENABLED = 'Y'
     """
     rows: List[Dict[str, Any]] = []
     with ora_cursor() as cur:

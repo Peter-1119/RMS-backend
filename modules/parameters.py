@@ -233,14 +233,25 @@ def search_parameters():
             where = ["d.status = %s"]
             params = [doc_status]
 
-            # 1) specific_code → 透過 rms_spec_flat 對應 project = applyProject
+            # 1) specific_code：Instruction / Specification 分別用不同欄位過濾
             if specific_code:
                 where.append("""
-                    JSON_UNQUOTE(JSON_EXTRACT(d.attribute, '$.applyProject')) IN (
-                      SELECT project FROM rms_spec_flat WHERE spec_code = %s
+                    (
+                    -- Instruction：attribute.applyProject 對 rms_spec_flat.project
+                    (d.document_type = 0
+                    AND JSON_UNQUOTE(JSON_EXTRACT(d.attribute, '$.applyProject')) IN (
+                            SELECT project FROM rms_spec_flat WHERE spec_code = %s
+                    )
+                    )
+                    OR
+                    -- Specification：attribute.specification[*].code 直接對 specific_code
+                    (d.document_type = 1
+                    AND JSON_SEARCH(d.attribute, 'one', %s, NULL, '$.specification[*].code') IS NOT NULL
+                    )
                     )
                 """)
-                params.append(specific_code)
+                params.extend([specific_code, specific_code])
+
 
             # 2) apply_project：額外再縮小
             if apply_project:
@@ -327,6 +338,7 @@ def search_parameters():
                   d.document_type,
                   JSON_UNQUOTE(JSON_EXTRACT(d.attribute, '$.applyProject')) AS apply_project,
                   JSON_UNQUOTE(JSON_EXTRACT(d.attribute, '$.itemType'))     AS item_code,
+                  d.attribute                                               AS attribute_json,
                   (
                     SELECT bc.header_text
                     FROM rms_block_content bc
@@ -347,15 +359,60 @@ def search_parameters():
             items = []
 
             # ------------------ 組 response items ------------------
-            for (document_token, doc_type, apply_proj_val, item_code_val, prog_code_val) in rows:
+            items = []
+
+            # ------------------ 組 response items ------------------
+            for (document_token, doc_type, apply_proj_val, item_code_val, attribute_json_str, prog_code_val) in rows:
+                # 先轉成 int，避免 None / Decimal 之類的狀況
+                doc_type_int = int(doc_type) if doc_type is not None else None
+
+                # 預設先用 applyProject（Instruction 會用到）
+                specific_name = apply_proj_val
+
+                # 解析 attribute JSON（為了拿 specification list）
+                attr = {}
+                if attribute_json_str:
+                    try:
+                        attr = json.loads(attribute_json_str)
+                    except Exception:
+                        attr = {}
+
+                # === A. Specification document (document_type = 1) ===
+                if doc_type_int == 1:
+                    # 從 attribute.specification list 裡抓製程名稱
+                    spec_name = None
+                    spec_list = attr.get("specification") or []
+                    for sp in spec_list:
+                        # sp: {"code": "R221-01", "name": "(R221-01)RTR 乾膜前處理"}
+                        n = (sp.get("name") or "").strip()
+                        if n:
+                            spec_name = n
+                            break
+
+                    # 如果沒有抓到，就保持 None；前端會看到空欄位
+                    specific_name = spec_name
+
+                    items.append({
+                        "document_token": document_token,
+                        "document_type": doc_type_int,
+                        "specific_name": specific_name,           # ★ spec 的「適用工程」＝製程名稱
+                        "machine_code": machine_code or None,     # 用前端傳進來的 machine_code 顯示
+                        "item_code": item_code_val,
+                        "program_code": prog_code_val,
+                        "conditions": {}                          # spec 沒有條件
+                    })
+                    continue  # ✅ 不要跑 Instruction 的條件邏輯
+
+                # === B. Instruction document (document_type = 0) ===
+                # 下面保留你原本的邏輯，只把 specific_name 改成共用變數
 
                 # 取出這份文件所有 content_json
                 cur.execute("""
                     SELECT content_json
                     FROM rms_block_content
                     WHERE document_token = %s
-                      AND step_type IN (2,5)
-                      AND content_json IS NOT NULL
+                    AND step_type IN (2,5)
+                    AND content_json IS NOT NULL
                 """, (document_token,))
                 cond_rows = cur.fetchall()
 
@@ -371,16 +428,11 @@ def search_parameters():
                         all_condition_rows = rows_from_this_block
                         break  # 找到一張有對到欄位的 table 就停
 
-                # debug：看抓到什麼
                 print("doc:", document_token, "all_condition_rows:", all_condition_rows)
 
-                # 若 table 根本找不到，就不要硬塞空資料列，直接當作這份文件沒有條件表
                 if not all_condition_rows:
-                    # 沒條件表時，若你希望仍顯示一列「只有工程、程式代碼」，可以在這裡 append
-                    # 目前先略過，避免前端看到一堆空白列
                     continue
 
-                # 若有帶條件參數（例如銅電式樣 = 全鍍），就只保留符合的那幾列
                 if cond_has_any:
                     filtered_rows = []
                     for row_dict in all_condition_rows:
@@ -397,21 +449,15 @@ def search_parameters():
                             filtered_rows.append(row_dict)
 
                     all_condition_rows = filtered_rows
-
-                    # ★ 若這份文件沒有任何一列符合條件 → 直接跳過這份文件
                     if not all_condition_rows:
                         continue
 
-                # 一列條件 => 一筆結果
                 for cond_row_dict in all_condition_rows:
-
-                    # ★ 只有在「真的有 machine_condition_headers」時，才檢查全空列
                     if machine_condition_headers:
                         if not any((cond_row_dict.get(h) or "").strip() for h in machine_condition_headers):
                             continue
 
                     full_cond_map = {}
-                    # 若 headers 是空的，就直接用 row_dict 的 key 當 header
                     if machine_condition_headers:
                         for h in machine_condition_headers:
                             full_cond_map[h] = (cond_row_dict.get(h) or "").strip()
@@ -421,13 +467,14 @@ def search_parameters():
 
                     items.append({
                         "document_token": document_token,
-                        "document_type": int(doc_type) if doc_type is not None else None,
-                        "specific_name": apply_proj_val,
-                        "machine_code": machine_code or None,   # 顯示用 form.machine
+                        "document_type": doc_type_int,
+                        "specific_name": specific_name,       # Instruction 繼續用 applyProject
+                        "machine_code": machine_code or None,
                         "item_code": item_code_val,
                         "program_code": prog_code_val,
                         "conditions": full_cond_map
                     })
+
 
         return send_response(200, False, "查詢成功", {
             "total": total,

@@ -1,11 +1,10 @@
 # modules/docs.py
 from __future__ import annotations
-import json, datetime, os, uuid, re, subprocess, tempfile
-from pathlib import Path
+import json, datetime, os, uuid, re
 from io import BytesIO
 
 # Flask's send_file must be explicitly imported
-from flask import Blueprint, request, jsonify, send_file 
+from flask import Blueprint, request, jsonify, send_file, after_this_request
 from db import db
 from utils import send_response, jload, jdump, dver, none_if_blank, new_token
 from DocxDefinition import get_docx
@@ -519,8 +518,8 @@ def _parse_doc_types(s: str | None) -> list[str] | None:
         return None
 
     allowed = {
-        "instruction": "Instruction",
-        "specification": "Specification",
+        "instruction": 0,
+        "specification": 1,
     }
     out = []
     for part in str(s).split(","):
@@ -880,6 +879,196 @@ def _safe_docname(s: str, fallback: str = "document") -> str:
     s = re.sub(r"\s+", "_", s)
     return s[:80] or fallback
 
+def _build_doc_payload_from_token(token: str) -> dict:
+    """
+    給定 document_token：
+      - 組出 data["attribute"]：目前版本 + 最多 2 個前版本（只需要 attribute / 基本欄位）
+      - 組出 data["content"]：只有「目前這一份文件」的內容 blocks + 參數 blocks
+      - 組出 data["reference"]：目前這一份文件的 reference 列表
+    這個結構會直接丟給 get_docx 使用。
+    """
+    with db(dict_cursor=True) as (conn, cur):
+        # ---------- 1) attributes：沿 previous_document_token 往回追 ----------
+        attrs = []
+        hops = 0
+        seen = set()
+        current_token = token
+
+        while current_token and current_token not in seen and hops < 3:  # 目前 + 最多 2 份舊版 = 3
+            seen.add(current_token)
+            cur.execute(
+                "SELECT * FROM rms_document_attributes WHERE document_token=%s",
+                (current_token,),
+            )
+            r = cur.fetchone()
+            if not r:
+                break
+
+            attr_json = jload(r.get("attribute"), {}) or {}
+
+            # 這裡我們組成一個「form」長相的 dict，對齊你前端送進 generate/word 的結構
+            attrs.append({
+                "documentType":     r["document_type"],
+                "documentID":       r["document_id"] or "",
+                "documentName":     r["document_name"] or "",
+                "documentVersion":  float(r["document_version"] or 1.0),
+                "attribute":        attr_json,                     # 品目 / 工程 / 式樣等等
+                "department":       r["department"] or "",
+                "author_id":        r["author_id"] or "",
+                "author":           r["author"] or "",
+                "approver":         r["approver"] or "",
+                "confirmer":        r["confirmer"] or "",
+                "issueDate":        r["issue_date"].strftime("%Y/%m/%d") if r["issue_date"] else "",
+                "reviseReason":     r["change_reason"] or "",
+                "revisePoint":      r["change_summary"] or "",
+                "documentPurpose":  r["purpose"] or "",
+            })
+
+            current_token = r.get("previous_document_token")
+            hops += 1
+
+        # attrs 目前是 [最新, 前一版, 前前版...]，為了讓 REV1/2/3 比較像「由舊到新」，
+        # 我們可以 reverse 一下，最後一個就是 get_docx 看到的「最新」。
+        attrs.reverse()
+        if not attrs:
+            raise ValueError("document not found")
+
+        # ---------- 2) content：只有「目前這份」的 blocks + 參數 ----------
+        cur.execute("""
+            SELECT step_type, tier_no, sub_no, content_type,
+                   header_text, header_json,
+                   content_text, content_json,
+                   files, metadata
+            FROM rms_block_content
+            WHERE document_token=%s
+            ORDER BY step_type ASC, tier_no ASC, sub_no ASC
+        """, (token,))
+        rows = cur.fetchall() or []
+
+        # 一般 blocks（製造流程 / 管理條件 / 品質內容 / 其他 等）
+        block_groups = {}      # key = (step_type, tier_no)
+        # 參數 blocks（step_type 2: 製造條件參數一覽表 / 5: 製造參數一覽表）
+        param_groups = {}      # key = tier_no
+
+        for r in rows:
+            st  = int(r["step_type"])
+            t   = int(r["tier_no"])
+            sub = int(r["sub_no"])
+
+            # 參數類：跟 load_params 的邏輯一樣，把 sub 0/1 縫回去
+            if st in (2, 5):
+                g = param_groups.setdefault(t, {
+                    "step_type":            st,
+                    "tier_no":              t,
+                    "code":                 f"XXXX{t}",
+                    "jsonParameterContent": None,
+                    "arrayParameterData":   [],
+                    "jsonConditionContent": None,
+                    "arrayConditionData":   [],
+                    "metadata":             None,
+                })
+                if sub == 0:
+                    g["code"]                 = r["header_text"] or g["code"]
+                    g["arrayParameterData"]   = jload(r["content_text"], []) or []
+                    g["jsonParameterContent"] = jload(r["content_json"])
+                    g["metadata"]             = jload(r["metadata"])
+                elif sub == 1:
+                    g["arrayConditionData"]   = jload(r["content_text"], []) or []
+                    g["jsonConditionContent"] = jload(r["content_json"])
+                continue
+
+            # 一般內容類：跟 /<token>/blocks 的 grouped 結構一樣
+            g = block_groups.setdefault((st, t), {
+                "step_type": st,
+                "tier":      t,
+                "data":      [],
+            })
+            g["data"].append({
+                "option":      int(r["content_type"]),
+                "jsonHeader":  jload(r["header_json"]),
+                "jsonContent": jload(r["content_json"]),
+                "files":       jload(r["files"], []) or [],
+            })
+
+        contents = []
+        # blocks 按 step_type, tier_no 排序
+        for (st, t) in sorted(block_groups.keys()):
+            contents.append(block_groups[(st, t)])
+        # 參數 blocks 按 tier 排序
+        for t in sorted(param_groups.keys()):
+            contents.append(param_groups[t])
+
+        # ---------- 3) references ----------
+        cur.execute("""
+            SELECT refer_type, refer_document, refer_document_name
+            FROM rms_references
+            WHERE document_token=%s
+            ORDER BY refer_type ASC, id ASC
+        """, (token,))
+        ref_rows = cur.fetchall() or []
+        references = [
+            {
+                "referenceType":        int(r["refer_type"]),
+                "referenceDocumentID":  r["refer_document"],
+                "referenceDocumentName": r["refer_document_name"],
+            }
+            for r in ref_rows
+        ]
+
+    return {
+        "attribute": attrs,     # list[form-like dict]
+        "content":   contents,  # list[blocks + params]
+        "reference": references,
+    }
+
+@bp.get("/view/<token>/docx")
+def view_docx_from_token(token):
+    """
+    依 document_token 從 DB 撈出 attribute/content/reference，
+    串成 payload 丟給 get_docx，產生一份暫存 DOCX，
+    回傳給前端做「全頁預覽」（前端直接 window.open 這個 URL）。
+    """
+    try:
+        data = _build_doc_payload_from_token(token)
+    except Exception as e:
+        print("[view_docx_from_token] error:", e)
+        return jsonify({"ok": False, "error": "document not found"}), 404
+
+    # 檔名：優先用文件名稱 / 編號
+    try:
+        attr_last = data["attribute"][-1]
+        raw_name  = attr_last.get("documentName") or attr_last.get("documentID") or token
+        doc_name  = _safe_docname(raw_name)
+    except Exception:
+        doc_name = token
+
+    # 暫存目錄
+    view_dir = os.path.join(BASE_DIR, "_view")
+    os.makedirs(view_dir, exist_ok=True)
+
+    fname    = f"{doc_name}-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}.docx"
+    out_path = os.path.join(view_dir, fname)
+
+    # 產生 Word
+    get_docx(out_path, data)
+
+    # 回傳後刪掉暫存檔
+    @after_this_request
+    def remove_file(response):
+        try:
+            if os.path.exists(out_path):
+                os.remove(out_path)
+        except Exception as e:
+            print("[view_docx_from_token] remove temp file error:", e)
+        return response
+
+    return send_file(
+        out_path,
+        as_attachment=False,  # 🔑 不強制下載，讓瀏覽器／系統自己決定用什麼開
+        download_name=f"{doc_name}.docx",
+        mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+
 @bp.post("/generate/word")
 def generate_word():
     """
@@ -908,69 +1097,73 @@ def generate_word():
 
     return send_file(out_path, as_attachment=True, download_name=f"{doc_name}.docx", mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
-def get_soffice_cmd() -> str:
+@bp.post("/preview/docx")
+def preview_docx():
     """
-    回傳 LibreOffice soffice 執行檔路徑：
-    - Linux: 直接用 'soffice'（在 PATH 裡）
-    - Windows: 先看環境變數 SOFFICE_PATH，沒有就用預設路徑
+    接收 {attribute, content, reference} JSON，產生一份暫存 DOCX，
+    給前端 blob 預覽使用（不強制下載）。
     """
-    if os.name != "nt":  # posix (Linux)
-        return "soffice"
+    if not request.is_json:
+        return jsonify({"ok": False, "error": "JSON body required"}), 400
 
-    # Windows
-    env_path = os.getenv("SOFFICE_PATH")
-    if env_path and Path(env_path).is_file():
-        return env_path
+    data = request.get_json(silent=True) or {}
+    data.setdefault("attribute", [])
+    data.setdefault("content", [])
+    data.setdefault("reference", [])
 
-    default = Path(r"C:\Program Files\LibreOffice\program\soffice.exe")
-    if default.is_file():
-        return str(default)
+    # 產生一個 payload_id，當檔名/暫存檔用
+    payload_id = f"{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
 
-    # 最後交給 PATH
-    return "soffice"
+    # 取文件名稱（跟 generate_word 一樣邏輯）
+    try:
+        attr_last = data["attribute"][-1]
+        raw_name  = attr_last.get("documentName") or attr_last.get("documentID") or payload_id
+        doc_name  = _safe_docname(raw_name)
+    except Exception:
+        doc_name = payload_id
 
-def docx_to_pdf_bytes(docx_bytes: bytes, filename_stem: str) -> bytes:
+    # 放暫存的資料夾：BASE_DIR/_preview
+    preview_dir = os.path.join(BASE_DIR, "_preview")
+    os.makedirs(preview_dir, exist_ok=True)
+
+    out_path = os.path.join(preview_dir, f"{doc_name}-{payload_id}.docx")
+
+    # 用你現有的 get_docx 產生 Word
+    get_docx(out_path, data)
+
+    # 回傳後把暫存檔刪掉
+    @after_this_request
+    def remove_file(response):
+        try:
+            if os.path.exists(out_path):
+                os.remove(out_path)
+        except Exception as e:
+            # 這裡不要影響回應，只記 log 即可
+            print("[preview_docx] remove temp file error:", e)
+        return response
+
+    return send_file(
+        out_path,
+        as_attachment=False,  # 🔑 不強制下載，前端用 fetch+blob 來處理
+        download_name=f"{doc_name}.docx",
+        mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+
+def _safe_docname(name: str) -> str:
     """
-    給一份 DOCX 的 bytes，丟到暫存資料夾，用 LibreOffice 轉成 PDF，
-    回傳 PDF 的 bytes。暫存檔案會在函式結束後自動刪除。
+    簡單版 safe name，可用你原本的實作。
     """
-    soffice = get_soffice_cmd()
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmpdir_path = Path(tmpdir)
-        docx_path = tmpdir_path / f"{filename_stem}.docx"
-        pdf_path = tmpdir_path / f"{filename_stem}.pdf"
-
-        # 1) 把 DOCX bytes 寫到暫存檔
-        with open(docx_path, "wb") as f:
-            f.write(docx_bytes)
-
-        # 2) 呼叫 LibreOffice 轉檔
-        cmd = [
-            soffice,
-            "--headless",
-            "--convert-to", "pdf",
-            "--outdir", str(tmpdir_path),
-            str(docx_path),
-        ]
-        subprocess.run(cmd, check=True)
-
-        if not pdf_path.is_file():
-            raise RuntimeError(f"PDF not generated: {pdf_path}")
-
-        # 3) 讀回 PDF bytes
-        with open(pdf_path, "rb") as f:
-            pdf_bytes = f.read()
-
-        # 離開 with TemporaryDirectory，所有檔案自動刪除
-        return pdf_bytes
+    import re
+    name = name or "document"
+    name = re.sub(r"[^\w\-一-龥]", "_", name)
+    return name[:64]
 
 @bp.post("/preview/pdf")
 def preview_pdf():
     """
-    接 JSON {attribute, content, reference}，
-    用 get_docx 產生 DOCX（在記憶體），再用 LibreOffice 轉 PDF 回傳。
-    全程只使用 TemporaryDirectory，不會留下檔案。
+    接收 JSON {attribute, content, reference}，
+    用 get_docx 產 DOCX，再用 LibreOffice 轉 PDF，
+    回傳 inline PDF（不存檔，暫存資料夾用完就自動刪掉）。
     """
     if not request.is_json:
         return jsonify({"success": False, "error": "JSON body required"}), 400
@@ -983,42 +1176,42 @@ def preview_pdf():
     payload_id = f"{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
 
     try:
-        attr_last = data["attribute"][-1]
-        doc_name = _safe_docname(
-            attr_last.get("documentName") or
-            attr_last.get("documentID") or
-            payload_id
-        )
-    except Exception:
-        doc_name = payload_id
+        attr_list = data.get("attribute") or []
+        if attr_list:
+            attr_last = attr_list[-1]
+            doc_name = _safe_docname(
+                attr_last.get("documentName")
+                or attr_last.get("documentID")
+                or payload_id
+            )
+        else:
+            doc_name = payload_id
 
-    # 1) 先用 get_docx 產 DOCX 到記憶體
-    docx_buffer = BytesIO()
-    # 假設你的 get_docx 可以接 file-like object，如果現在只能接 path，
-    # 就改成先寫到 TemporaryDirectory 裡的檔案再讀，邏輯一樣。
-    get_docx(docx_buffer, data)
-    docx_bytes = docx_buffer.getvalue()
+        # 產 PDF bytes（全程在 TemporaryDirectory 裡）
+        pdf_bytes = docx_file_to_pdf_bytes(get_docx, data, filename_stem=doc_name)
 
-    # 2) 轉成 PDF bytes（用 TemporaryDirectory，不留檔）
-    try:
-        pdf_bytes = docx_to_pdf_bytes(docx_bytes, filename_stem=doc_name)
+        debug_path = f"/tmp/preview-debug-{payload_id}.pdf"
+        with open(debug_path, "wb") as f:
+            f.write(pdf_bytes)
+        print("DEBUG preview pdf saved:", debug_path)
+
     except Exception as e:
-        return jsonify({"success": False, "error": f"convert failed: {e}"}), 500
+        return jsonify({"success": False, "error": str(e)}), 500
 
-    # 3) 用 BytesIO 包裝後送出去（不當附件，給前端 iframe/blob 預覽用）
     pdf_io = BytesIO(pdf_bytes)
     pdf_io.seek(0)
 
-    headers = {
-        "Cache-Control": "no-store",
-        "Content-Disposition": f'inline; filename="{doc_name}.pdf"',
-        "X-Content-Type-Options": "nosniff",
-    }
-    return send_file(
+    # 先用 send_file 建立 response
+    resp = send_file(
         pdf_io,
         mimetype="application/pdf",
         as_attachment=False,
         download_name=f"{doc_name}.pdf",
-        headers=headers,
     )
 
+    # 再補你要的 header
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Content-Disposition"] = f'inline; filename="{doc_name}.pdf"'
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+
+    return resp

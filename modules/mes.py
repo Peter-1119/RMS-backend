@@ -188,7 +188,7 @@ def _allowed_codes_window(*, project, specific, keyword):
 
     # keyword narrowing (only if a keyword given OR we already have a window)
     with odb() as cur:
-        sql = "SELECT DISTINCT sm.MACHINE_CODE FROM IDBUSER.RMS_SYS_MACHINE sm WHERE 1=1"
+        sql = "SELECT DISTINCT sm.MACHINE_CODE FROM IDBUSER.RMS_SYS_MACHINE sm WHERE 1=1 AND sm.EQM_ID <> 'NA' AND sm.ENABLED = 'Y'"
         binds = {}
         if kw:
             sql += " AND (LOWER(sm.MACHINE_CODE) LIKE :k OR LOWER(NVL(sm.MACHINE_DESC, sm.MACHINE_CODE)) LIKE :k)"
@@ -205,6 +205,50 @@ def _allowed_codes_window(*, project, specific, keyword):
 
     return narrowed
 
+# 依 project / specific 找到所有相關的 spec，建立 machine_code -> (spec_code, spec_name) 對照
+def _spec_map_for_project_specific(project: str, specific: str) -> dict[str, dict]:
+    """
+    回傳:
+      {
+        "M001": {"code": "R221-01", "name": "蝕刻前處理"},
+        "M002": {"code": "R221-01", "name": "蝕刻前處理"},
+        ...
+      }
+    """
+    project = (project or "").strip()
+    specific = (specific or "").strip()
+
+    spec_codes: set[str] = set()
+
+    # 1) from project → spec_codes
+    if project:
+        proj_specs = get_spec_codes_by_project(project) or []
+        spec_codes.update([s for s in proj_specs if s])
+
+    # 2) from specific (單一或多個) → spec_codes
+    if specific:
+        scodes = _resolve_spec_codes(specific) or []
+        spec_codes.update([s for s in scodes if s])
+
+    if not spec_codes:
+        return {}
+
+    # ★ 注意：這裡 rows 的 key 是小寫 spec_code / spec_name / machine_code
+    rows = fetch_mes_rows_for_specs(sorted(spec_codes), exclude_ti_to=True) or []
+
+    m: dict[str, dict] = {}
+    for r in rows:
+        mcode = (r.get("machine_code") or "").strip()   # ← 小寫
+        scode = (r.get("spec_code") or "").strip()      # ← 小寫
+        sname = (r.get("spec_name") or "").strip()      # ← 小寫
+        if not mcode or not scode:
+            continue
+        # 如果一台機台對應多個製程，你可以改成 list；這裡先取第一個
+        if mcode not in m:
+            m[mcode] = {"code": scode, "name": sname or scode}
+
+    return m
+
 
 @bp.get("/groups-machines")
 def groups_machines():
@@ -212,12 +256,26 @@ def groups_machines():
     specific = _norm(request.args.get("specific"))   # <-- NEW
     keyword  = _norm(request.args.get("keyword"))
 
+    # print(f"project: {project}, specific: {specific}, keyword: {keyword}")
     window = _allowed_codes_window(project=project, specific=specific, keyword=keyword)
 
     out: Dict[str, Dict] = {}
-    def _add(gcode: str, gname: str, mcode: str, mname: str):
+    # 先算好 machine_code -> spec
+    spec_map = _spec_map_for_project_specific(project, specific)
+
+    def _add(gcode: str, gname: str, mcode: str, mname: str, mbuilding: str):
+        machine_info = {
+            "name": mname,
+            "building": mbuilding,
+        }
+        # ★ 在這裡塞 spec_code / spec_name
+        spec_info = spec_map.get(mcode)
+        if spec_info:
+            machine_info["spec_code"] = spec_info["code"]
+            machine_info["spec_name"] = spec_info["name"]
+
         out.setdefault(gcode, {"name": gname, "machines": {}})
-        out[gcode]["machines"][mcode] = {"name": mname}
+        out[gcode]["machines"][mcode] = machine_info
 
     # If window explicitly empty -> empty payload
     if window == set():
@@ -228,12 +286,12 @@ def groups_machines():
           SELECT
             sm.MACHINE_CODE,
             NVL(sm.MACHINE_DESC, sm.MACHINE_CODE)                AS MACHINE_NAME,
+            NVL(sm.BUILDING, ''),
             NVL(mt.MACHINE_TYPE_NAME, '(未分類)')                     AS MACHINE_GROUP_CODE,
             NVL(mt.MACHINE_TYPE_DESC, sm.MACHINE_GROUP)          AS MACHINE_GROUP_NAME
           FROM IDBUSER.RMS_SYS_MACHINE sm
-          LEFT JOIN IDBUSER.RMS_SYS_MACHINE_TYPE mt
-                 ON mt.MACHINE_TYPE_ID = sm.MACHINE_TYPE_ID
-          WHERE 1=1
+          LEFT JOIN IDBUSER.RMS_SYS_MACHINE_TYPE mt ON mt.MACHINE_TYPE_ID = sm.MACHINE_TYPE_ID
+          WHERE 1=1 AND sm.EQM_ID <> 'NA' AND sm.ENABLED = 'Y'
         """
         binds = {}
         if isinstance(window, set):  # concrete allowed list
@@ -243,10 +301,107 @@ def groups_machines():
             binds.update({f"c{i}": code for i, code in enumerate(sorted(window))})
 
         cur.execute(sql, binds)
-        for mcode, mname, gcode, gname in cur.fetchall():
-            _add(gcode or "(未分類)", gname or "(未分類)", (mcode or "").strip(), (mname or mcode).strip())
+        for mcode, mname, mbuilding, gcode, gname in cur.fetchall():
+            _add(gcode or "(未分類)", gname or "(未分類)", (mcode or "").strip(), (mname or mcode).strip(), (mbuilding or ""))
 
     return send_response(200, True, "請求成功", {"groups": out})
+
+@bp.get("/spec-groups-machines")
+def spec_groups_machines():
+    """
+    根據多個適用工程 code (specific list) 回傳：
+    {
+      "specGroups": {
+        "R221-01": {
+          "GROUP_CODE": {
+            "name": "群組名稱",
+            "machines": [
+              {"code": "MACHINE_CODE", "name": "MACHINE_NAME", "building": "BD"},
+              ...
+            ]
+          },
+          ...
+        },
+        "R331-03": { ... },
+        ...
+      }
+    }
+    """
+    project = _norm(request.args.get("project"))
+    keyword = _norm(request.args.get("keyword"))
+
+    # 允許 ?specific=A&specific=B&specific=C 這種
+    raw_specs = request.args.getlist("specific") or request.args.getlist("specific[]")
+    specs = [_norm(s) for s in raw_specs if _norm(s)]
+
+    # 相容：只給一個 specific=xxx
+    if not specs:
+        one = _norm(request.args.get("specific"))
+        if one:
+            specs = [one]
+
+    # 沒有給 specific → 回空
+    if not specs:
+        return send_response(200, True, "請求成功", {"specGroups": {}})
+
+    result: Dict[str, Dict] = {}
+
+    with odb() as cur:
+        for spec in specs:
+            window = _allowed_codes_window(
+                project=project,
+                specific=spec,
+                keyword=keyword,
+            )
+
+            spec_groups: Dict[str, Dict] = {}
+            # 明確禁止 → 給空 map
+            if window == set():
+                result[spec] = spec_groups
+                continue
+
+            sql = """
+              SELECT
+                sm.MACHINE_CODE,
+                NVL(sm.MACHINE_DESC, sm.MACHINE_CODE)                AS MACHINE_NAME,
+                NVL(sm.BUILDING, ''),
+                NVL(mt.MACHINE_TYPE_NAME, '(未分類)')                 AS MACHINE_GROUP_CODE,
+                NVL(mt.MACHINE_TYPE_DESC, sm.MACHINE_GROUP)          AS MACHINE_GROUP_NAME
+              FROM IDBUSER.RMS_SYS_MACHINE sm
+              LEFT JOIN IDBUSER.RMS_SYS_MACHINE_TYPE mt ON mt.MACHINE_TYPE_ID = sm.MACHINE_TYPE_ID
+              WHERE 1=1 AND sm.EQM_ID <> 'NA' AND sm.ENABLED = 'Y'
+            """
+            binds = {}
+
+            if isinstance(window, set):
+                if not window:
+                    result[spec] = spec_groups
+                    continue
+                sql += f" AND sm.MACHINE_CODE IN ({','.join([f':c{i}' for i in range(len(window))])})"
+                binds.update({f"c{i}": code for i, code in enumerate(sorted(window))})
+
+            cur.execute(sql, binds)
+            for mcode, mname, mbuilding, gcode, gname in cur.fetchall():
+                gkey = (gcode or "(未分類)").strip()
+                gtitle = (gname or gkey).strip()
+                mcode_s = (mcode or "").strip()
+                mname_s = (mname or mcode_s).strip()
+                bld_s   = (mbuilding or "").strip()
+
+                if gkey not in spec_groups:
+                    spec_groups[gkey] = {"name": gtitle, "machines": []}
+
+                # 避免同一台機器重複塞
+                if not any(m["code"] == mcode_s for m in spec_groups[gkey]["machines"]):
+                    spec_groups[gkey]["machines"].append({
+                        "code": mcode_s,
+                        "name": mname_s,
+                        "building": bld_s,
+                    })
+
+            result[spec] = spec_groups
+
+    return send_response(200, True, "請求成功", {"specGroups": result})
 
 @bp.post("/filter-by-pms")
 def filter_by_pms():
@@ -295,7 +450,7 @@ def filter_by_pms():
             cur.execute("""
               SELECT NVL(MACHINE_DESC, MACHINE_CODE)
               FROM IDBUSER.RMS_SYS_MACHINE
-              WHERE MACHINE_CODE = :c
+              WHERE MACHINE_CODE = :c AND EQM_ID <> 'NA' AND ENABLED = 'Y'
             """, c=base_code)
             row = cur.fetchone()
             base_name = _clean_name(row[0] if row and row[0] else base_code)
@@ -322,11 +477,9 @@ def filter_by_pms():
             NVL(sm.MACHINE_GROUP, '(未分類)')            AS MACHINE_GROUP_CODE,
             NVL(mt.MACHINE_TYPE_DESC, sm.MACHINE_GROUP) AS MACHINE_GROUP_NAME
           FROM IDBUSER.RMS_SYS_MACHINE sm
-          LEFT JOIN IDBUSER.RMS_SYS_MACHINE_TYPE mt
-            ON mt.MACHINE_TYPE_NAME = sm.MACHINE_GROUP,
-            base_cnt bc
+          LEFT JOIN IDBUSER.RMS_SYS_MACHINE_TYPE mt ON mt.MACHINE_TYPE_NAME = sm.MACHINE_GROUP, base_cnt bc
           WHERE
-            (bc.cnt = 0 AND NOT EXISTS (SELECT 1 FROM cand cx WHERE cx.MACHINE_CODE = sm.MACHINE_CODE))
+            ((bc.cnt = 0 AND NOT EXISTS (SELECT 1 FROM cand cx WHERE cx.MACHINE_CODE = sm.MACHINE_CODE))
             OR
             (bc.cnt > 0
              AND EXISTS (SELECT 1 FROM cand cx WHERE cx.MACHINE_CODE = sm.MACHINE_CODE)
@@ -343,7 +496,7 @@ def filter_by_pms():
                    AND cx.SLOT_NAME = b.SLOT_NAME
                )
              )
-            )
+            )) AND sm.EQM_ID <> 'NA' AND sm.ENABLED = 'Y'
         """, c=base_code)
 
         rows = cur.fetchall()
@@ -406,6 +559,8 @@ def filter_by_baseline():
     specific   = _norm(body.get("specific"))
     keyword    = _norm(body.get("keyword"))
 
+    spec_map = _spec_map_for_project_specific(project, specific)
+
     # 1) 無基準 → 回原清單
     if not base_code:
         qs = {}
@@ -440,7 +595,7 @@ def filter_by_baseline():
             cur.execute("""
               SELECT NVL(MACHINE_DESC, MACHINE_CODE)
               FROM IDBUSER.RMS_SYS_MACHINE
-              WHERE MACHINE_CODE = :c
+              WHERE MACHINE_CODE = :c AND EQM_ID <> 'NA' AND ENABLED = 'Y'
             """, c=base_code)
             row = cur.fetchone()
             base_name = _clean_name(row[0] if row and row[0] else base_code)
@@ -464,14 +619,14 @@ def filter_by_baseline():
           SELECT
             sm.MACHINE_CODE,
             NVL(sm.MACHINE_DESC, sm.MACHINE_CODE)       AS MACHINE_NAME,
+            NVL(sm.building, ''),
             NVL(mt.MACHINE_TYPE_NAME, '(未分類)')        AS MACHINE_GROUP_CODE,
             NVL(mt.MACHINE_TYPE_DESC, sm.MACHINE_GROUP) AS MACHINE_GROUP_NAME
           FROM IDBUSER.RMS_SYS_MACHINE sm
           LEFT JOIN IDBUSER.RMS_SYS_MACHINE_TYPE mt
-              ON mt.MACHINE_TYPE_ID = sm.MACHINE_TYPE_ID,
-              base_cnt bc
+              ON mt.MACHINE_TYPE_ID = sm.MACHINE_TYPE_ID, base_cnt bc
           WHERE
-            (bc.cnt = 0 AND NOT EXISTS (SELECT 1 FROM cand cx WHERE cx.MACHINE_CODE = sm.MACHINE_CODE))
+            ((bc.cnt = 0 AND NOT EXISTS (SELECT 1 FROM cand cx WHERE cx.MACHINE_CODE = sm.MACHINE_CODE))
             OR
             (bc.cnt > 0
              AND EXISTS (SELECT 1 FROM cand cx WHERE cx.MACHINE_CODE = sm.MACHINE_CODE)
@@ -488,19 +643,20 @@ def filter_by_baseline():
                    AND cx.SLOT_NAME = b.SLOT_NAME
                )
              )
-            )
+            )) AND sm.EQM_ID <> 'NA' AND sm.ENABLED = 'Y'
         """, c=base_code)
 
         rows = cur.fetchall()
         pms_equal_codes: set[str] = set()
         meta: Dict[str, Dict] = {}
-        for mcode, mname, gcode, gname in rows:
+        for mcode, mname, mbuilding, gcode, gname in rows:
             code = _clean_code(mcode)
             if isinstance(window, set) and code not in window:
                 continue
             pms_equal_codes.add(code)
             meta[code] = {
                 "name":  _clean_name(mname) or code,
+                "building": (mbuilding or ""),
                 "gcode": (gcode or "(未分類)").strip(),
                 "gname": (gname or "(未分類)").strip(),
             }
@@ -565,13 +721,30 @@ def filter_by_baseline():
     # 6) 組回 groups payload
     groups_payload: Dict[str, Dict] = {}
     for code in sorted(final_codes):
-        m = meta.get(code, {"name": code, "gcode": "(未分類)", "gname": "(未分類)"})
+        m = meta.get(code, {
+            "name": code,
+            "gcode": "(未分類)",
+            "gname": "(未分類)",
+            "building": "",
+        })
         gcode, gname = m["gcode"], m["gname"]
         groups_payload.setdefault(gcode, {"name": gname, "machines": {}})
-        groups_payload[gcode]["machines"][code] = {"name": m["name"]}
+
+        machine_info = {
+            "name": m["name"],
+            "building": m["building"],
+        }
+
+        # ★ 補上 spec_code / spec_name
+        spec_info = spec_map.get(code)
+        print(f"code: {code}, sepc_info: {spec_info}")
+        if spec_info:
+            machine_info["spec_code"] = spec_info["code"]
+            machine_info["spec_name"] = spec_info["name"]
+
+        groups_payload[gcode]["machines"][code] = machine_info
 
     return send_response(200, True, "請求成功", {"groups": groups_payload})
-
 
 # --------- /machines ---------
 @bp.get("/machines")
@@ -829,6 +1002,7 @@ def delete_process_from_engineering(project_id, spec_code):
 # -------------------------------------- PMS --------------------------------------
 
 HEADER_ROW = ['槽體', '管理項目', '規格下限(OOS-)', '操作下限(OOC-)', '設定值', '操作上限(OOC+)', '規格上限(OOS+)', '單位', '參數下放', '說明']
+HEADER_ROW = ['槽體', '管理項目', '規格下限(OOS-)', '操作下限(OOC-)', '設定值', '操作上限(OOC+)', '規格上限(OOS+)', '參數下放', '說明']
 
 def _nz(v):  # small helper
     return (v or '').strip()
@@ -883,9 +1057,8 @@ def get_machine_pms_parameters_set_attribute():
             for it in items:
                 table_rows.append([
                     it["slot_name"],          # 槽體
-                    it["parameter_desc"],     # 管理項目
+                    f'{it["parameter_desc"]}({it["unit"]})',     # 管理項目
                     '', '', '', '', '',       # 中間 5 欄（前端繼續編輯）
-                    it["unit"],               # 單位
                     'Y',                      # 參數下放（依條件固定 Y）
                     ''                        # 說明
                 ])
@@ -956,23 +1129,8 @@ def get_machine_pms_parameters():
             })
 
         # ---- 新版 header ----
-        HEADER_ROW = [
-            "項次",
-            "槽體",
-            "管理項目",
-            "規格下限(OOS-)",
-            "操作下限(OOC-)",
-            "設定值",
-            "操作上限(OOC+)",
-            "規格上限(OOS+)",
-            "單位",
-            "檢查頻率",
-            "檢查方式",
-            "檢驗人員",
-            "記錄",
-            "備註/參考指示書",
-        ]
-
+        HEADER_ROW = [ "項次", "槽體", "管理項目", "規格下限(OOS-)", "操作下限(OOC-)", "設定值", "操作上限(OOC+)", "規格上限(OOS+)", "單位", "檢查頻率", "檢查方式", "檢驗人員", "記錄", "備註/參考指示書"]
+        HEADER_ROW = [ "項次", "槽體", "管理項目", "規格下限(OOS-)", "操作下限(OOC-)", "設定值", "操作上限(OOC+)", "規格上限(OOS+)", "檢查頻率", "檢查方式", "檢驗人員", "記錄", "備註/參考指示書"]
         table_rows: List[List[str]] = []
         if items:
             table_rows.append(HEADER_ROW[:])
@@ -980,9 +1138,8 @@ def get_machine_pms_parameters():
                 table_rows.append([
                     str(idx),                  # 項次（之後前端 updateTable 會重算也沒關係）
                     it["slot_name"],           # 槽體
-                    it["parameter_desc"],      # 管理項目
+                    f'{it["parameter_desc"]}({it["unit"]})',      # 管理項目(單位)
                     "", "", "", "", "",        # 規格/OOC/設定/OOC+/OOS+
-                    it["unit"],                # 單位
                     "", "", "", "", "",        # 檢查頻率 / 檢查方式 / 檢驗人員 / 記錄 / 備註
                 ])
 
@@ -1069,12 +1226,9 @@ def step1_specs():
             if machine:
                 sql += """
                   AND EXISTS (
-                    SELECT 1
-                    FROM IDBUSER.RMS_SYS_TERMINAL t
-                    JOIN IDBUSER.RMS_SYS_MACHINE m
-                      ON t.PDLINE_ID = m.PDLINE_ID
-                    WHERE t.PROCESS_ID = p.PROCESS_ID
-                      AND m.MACHINE_CODE = :mcode
+                    SELECT 1 FROM IDBUSER.RMS_SYS_TERMINAL t
+                    JOIN IDBUSER.RMS_SYS_MACHINE m ON t.PDLINE_ID = m.PDLINE_ID
+                    WHERE t.PROCESS_ID = p.PROCESS_ID AND m.MACHINE_CODE = :mcode AND m.EQM_ID <> 'NA' AND m.ENABLED = 'Y'
                   )
                 """
                 binds["mcode"] = machine
@@ -1130,9 +1284,8 @@ def step1_machines():
                 NVL(mt.MACHINE_TYPE_NAME, '(未分類)')                 AS MACHINE_GROUP_CODE,
                 NVL(mt.MACHINE_TYPE_DESC, sm.MACHINE_GROUP)          AS MACHINE_GROUP_NAME
               FROM IDBUSER.RMS_SYS_MACHINE sm
-              LEFT JOIN IDBUSER.RMS_SYS_MACHINE_TYPE mt
-                     ON mt.MACHINE_TYPE_ID = sm.MACHINE_TYPE_ID
-              WHERE 1=1
+              LEFT JOIN IDBUSER.RMS_SYS_MACHINE_TYPE mt ON mt.MACHINE_TYPE_ID = sm.MACHINE_TYPE_ID
+              WHERE 1=1 AND sm.EQM_ID <> 'NA' AND sm.ENABLED = 'Y'
             """
             binds = {}
 
