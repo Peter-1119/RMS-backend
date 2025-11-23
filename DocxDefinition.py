@@ -46,6 +46,87 @@ SPEC_HDRS = ['規格下限(OOS-)','操作下限(OOC-)','設定值','操作上限
 COLOR_RED = RGBColor(255, 0, 0)
 COLOR_BLUE = RGBColor(0, 0, 255)
 
+def clear_paragraph(p):
+    """把一個 paragraph 內原本所有 run/文字清掉"""
+    p.text = ""
+    # 保險一點也可以把底層 element 都清掉
+    for r in p.runs:
+        r._element.getparent().remove(r._element)
+
+def add_simple_field(paragraph, instr):
+    """
+    在 paragraph 中插入一個簡單欄位，例如:
+      instr = "PAGE" 或 "NUMPAGES"
+    實際出現會交給 Word 自己更新。
+    """
+    fld = OxmlElement('w:fldSimple')
+    fld.set(qn('w:instr'), instr)  # e.g. "PAGE", "NUMPAGES"
+
+    r = OxmlElement('w:r')
+    t = OxmlElement('w:t')
+    t.text = "1"   # 只是 placeholder，開啟文件時 Word 會更新
+    r.append(t)
+    fld.append(r)
+
+    paragraph._p.append(fld)
+    return paragraph
+
+def set_section_start_page(section, start_num: int = 0):
+    """
+    設定這個 section 的起始頁碼。start_num = 0 表示第一頁顯示 0，
+    但如果第一頁 header 不顯示頁碼（Different first page），
+    從第二頁開始看到的是 1、2、3...
+    """
+    sectPr = section._sectPr
+    pgNumType = sectPr.find(qn('w:pgNumType'))
+    if pgNumType is None:
+        pgNumType = OxmlElement('w:pgNumType')
+        sectPr.append(pgNumType)
+    pgNumType.set(qn('w:start'), str(start_num))
+
+def setup_page_numbers(doc):
+    """
+    1. 啟用第一頁不同頁首。
+    2. 第一頁 header 的 table (第 0 個) 第二列第五欄 -> NUMPAGES (總頁數)
+    3. 其他頁 header 的 table 第二列第五欄 -> PAGE (目前頁碼)
+       並把 section 起始頁碼設成 0，讓第 2 頁顯示 1，第三頁顯示 2...
+    """
+    section = doc.sections[1]
+
+    # 1) 第一頁不同頁首
+    # section.different_first_page_header_footer = True
+
+    # 2) 設定 section 起始頁碼為 0（第一頁是 0，第二頁是 1...）
+    # set_section_start_page(section, start_num=0)
+
+    # 3) 第一頁 header：總頁數 NUMPAGES
+    first_header = doc.sections[0].header  # 第一頁專用 header
+    if first_header and first_header.tables:
+        tbl_first = first_header.tables[0]
+        # 第二列第五欄： rows[1].cells[4]
+        cell_total = tbl_first.rows[1].cells[10]
+        if cell_total.paragraphs:
+            p_total = cell_total.paragraphs[0]
+        else:
+            p_total = cell_total.add_paragraph()
+
+        clear_paragraph(p_total)
+        # 這裡只塞總頁數，例如 "3"
+        add_simple_field(p_total, "NUMPAGES")
+
+    # 4) 其他頁 header：頁碼 PAGE（會是 1,2,3... 因為起始頁碼設為 0）
+    normal_header = doc.sections[1].header
+    if normal_header and normal_header.tables:
+        tbl_other = normal_header.tables[0]
+        cell_page = tbl_other.rows[1].cells[5]
+        if cell_page.paragraphs:
+            p_page = cell_page.paragraphs[0]
+        else:
+            p_page = cell_page.add_paragraph()
+
+        clear_paragraph(p_page)
+        add_simple_field(p_page, "PAGE")
+
 # Extract plain text and "first seen" color from a cell JSON (your ProseMirror-ish structure).
 def _extract_text_and_color_from_cell_json(cell_json, COLOR_DICT):
     txt_parts = []
@@ -156,7 +237,7 @@ def update_p(p, mapping):
     if mapping.get(full_text) == None:
         return
     
-    if ("POINT" in full_text) or ("REASON" in full_text) or ("DOC_NAME" in full_text) or ("PROJECT" in full_text):
+    if ("POINT" in full_text) or ("REASON" in full_text) or ("DOC_NAME" in full_text) or ("PROJECT" in full_text) or ("ITEM_TYPE" in full_text) or ("STYLE_NO" in full_text):
         p.alignment = WD_ALIGN_PARAGRAPH.LEFT
         
     for r in p.runs:
@@ -530,7 +611,7 @@ def draw_instruction_content(doc, data):
     for (stepIndex, itemInfo) in enumerate(DOCUMENT_STEP[DOCUMENT_TYPE(documentType).name].value):
         (step, stepInfo), = itemInfo.items()
         
-        print(f"stepIndex: {stepIndex}, step: {step}, stepInfo: {stepInfo}")
+        # print(f"stepIndex: {stepIndex}, step: {step}, stepInfo: {stepInfo}")
         # 1. Set the step title
         p_title = cell.paragraphs[0] if stepIndex == 0 else cell.add_paragraph()
         p_title.text = f"{stepIndex + 1}.{step}"
@@ -609,28 +690,41 @@ def draw_instruction_content(doc, data):
                 p_attr.paragraph_format.left_indent = p_attr.runs[0].font.size * 2
 
 def fill_from_template(template_path, out_path, data, title_mapping, info_mapping):
-    """
-    Open template DOCX (with the exact header you want),
-    replace placeholders in the header, and save to a new file.
-    """
     doc = Document(template_path)
     apply_default_fonts(doc, latin="Arial", east_asia="標楷體")
 
-    # Different-first-page header? You can choose which to edit:
-    for section in doc.sections:
+    # 產生內容（影響頁數）
+    draw_instruction_content(doc, data)
+
+    # 先做原本的 header/footer 文字替換
+    for index, section in enumerate(doc.sections):
+        # 如果你的第一頁 header 也要做文字替換，可以另外處理：
+        # replace_in_header(section.first_page_header, title_mapping)  # 視需求決定
         replace_in_header(section.header, title_mapping)
         replace_in_footer(section.footer, title_mapping)
+        print(f"index: {index}, section: {section.header}")
 
     for row in doc.tables[0].rows:
         for cell in row.cells:
             for p in cell.paragraphs:
                 update_p(p, info_mapping)
 
-    # Draw instruction content into Word.
-    draw_instruction_content(doc, data)
+    # ★ 內容都產生完之後，再插入頁碼欄位
+    setup_page_numbers(doc)
 
-    # Save document to local document
     doc.save(out_path)
+
+_code_prefix_re = re.compile(r"^\s*\(([^)]+)\)\s*(.*)$")
+
+def clean_process_name(raw: str) -> str:
+    """
+    PROCESS_NAME like "(L100-01)單面前處理" -> "單面前處理"
+    If there is no "(...)" prefix, returns the original, trimmed.
+    """
+    if not raw:
+        return ""
+    m = _code_prefix_re.match(raw)
+    return m.group(2).strip() if m else raw
 
 def get_docx(outpath, data, template = "docx-template/example3.docx"):
     # Get document fundamental attribute
@@ -641,8 +735,17 @@ def get_docx(outpath, data, template = "docx-template/example3.docx"):
     Title = "製造條件指示書" if attribute["documentType"] == 0 else "製造式樣書"
     Doc_name = attribute["documentName"]
 
+    itemType = attribute["attribute"].get("itemType")
+    styleNo = attribute["attribute"].get("styleNo")
+
     # Put placeholders like [DOC_NO], [REV], [DATE], [TOTAL_PAGES] in the header cells of your template.
     title_mapping = { "DOC_NO": Doc_id, "DATE": Date, "REV": Version, "PAGE": "1", "TITLE": Title, "DOC_NAME": Doc_name, "PROJECT": "", "DOC_CODE": "FM-R-MF-AZ-052 Rev7.0"}
+    if itemType != None:
+        specifications = [clean_process_name(s["name"]) for s in attribute["attribute"].get("specification")]
+        title_mapping["PROJECT"] = "_".join(specifications)
+        title_mapping["ITEM_TYPE"]=  itemType
+        title_mapping["STYLE_NO"] = styleNo.split("-", 1)[-1]
+
     info_mapping = {
         "REV1": "", "DATE1": "", "REASON1": "", "POINT1": "", "DEPT1": "", "APPROVER1": "", "CONFIRMER1": "", "AUTHOR1": "",
         "REV2": "", "DATE2": "", "REASON2": "", "POINT2": "", "DEPT2": "", "APPROVER2": "", "CONFIRMER2": "", "AUTHOR2": "",

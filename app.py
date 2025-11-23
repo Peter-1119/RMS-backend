@@ -6,7 +6,7 @@ from data_store import load_all
 
 def create_app():
     app = Flask(__name__)
-    CORS(app)
+    CORS(app, supports_credentials=True, expose_headers=["X-Document-ID"])
     os.makedirs(TEMP_ROOT_DIR, exist_ok=True)
 
     # blueprints

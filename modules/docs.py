@@ -82,7 +82,7 @@ def save_attributes():
         cur.execute("SELECT * FROM rms_document_attributes WHERE document_token=%s", (token,))
         row = cur.fetchone()
 
-    attr = jload(row[8], {}) if row else {}
+        attr = jload(row[8], {}) if row else {}
     resp_form = {
         "documentType": row[0] if row else 0,
         "documentID": row[5] if row else "",
@@ -97,7 +97,9 @@ def save_attributes():
         "documentPurpose": row[19] if row else "",
         "reviseReason": row[16] if row else "",
         "revisePoint": row[17] if row else "",
+        "previousDocumentToken": row[4] if row else "",  # 🔸 新增
     }
+
     issue = row[15].strftime("%Y-%m-%d %H:%M:%S") if (row and row[15]) else None
     return jsonify({"success": True, "token": token, "issueTime": issue, "form": resp_form})
 
@@ -127,6 +129,7 @@ def load_attributes(token):
                 "documentPurpose": r["purpose"] or "",
                 "reviseReason": r["change_reason"] or "",
                 "revisePoint": r["change_summary"] or "",
+                "previousDocumentToken": r["previous_document_token"] or "",  # 🔸 新增
             }
         })
 
@@ -287,6 +290,239 @@ def load_params(token):
         })
 
     return jsonify({"success": True, "blocks": blocks})
+
+from oracle_db import ora_cursor  # 下段輪巡會用到，順便先 import
+
+@bp.post("/revise")
+def create_revision():
+    """
+    建立新一版：
+      - 由前一版 previous_token 複製一份
+      - document_version + 1.00
+      - status = 0 (新的草稿)
+      - previous_document_token 指向舊 token
+      - document_id 直接沿用舊版（可能是 NULL，表示初版尚未產生文件）
+    """
+    body = request.get_json(silent=True) or {}
+    prev_token = (body.get("previous_token") or "").strip()
+    if not prev_token:
+        return send_response(400, False, "previous_token is required")
+
+    with db(dict_cursor=True) as (conn, cur):
+        cur.execute("SELECT * FROM rms_document_attributes WHERE document_token=%s", (prev_token,))
+        r = cur.fetchone()
+        if not r:
+            return send_response(404, False, "previous document not found")
+
+        new_token_ = new_token()
+        old_ver = float(r["document_version"] or 1.0)
+        new_ver = dver(old_ver + 1.0)
+
+        doc_id = r["document_id"]  # 🔸 變版沿用同一個 document_ID（可能是 NULL）
+        cur.execute("""
+          INSERT INTO rms_document_attributes
+          (document_type, EIP_id, status, document_token, previous_document_token,
+           document_id, document_name, document_version, attribute, department,
+           author_id, author, approver, confirmer, issue_date,
+           change_reason, change_summary, reject_reason, purpose)
+          VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s,%s,%s,%s)
+        """, (
+            r["document_type"], None, 0, new_token_, prev_token, doc_id, r["document_name"], new_ver, 
+            r["attribute"], r["department"], r["author_id"], r["author"], r["approver"], r["confirmer"], "", "", None, r["purpose"],
+        ))
+
+        conn.commit()
+
+    return jsonify({
+        "success": True,
+        "token": new_token_,
+        "form": {
+            "documentType": r["document_type"],
+            "documentID": doc_id or "",
+            "documentName": r["document_name"] or "",
+            "documentVersion": float(new_ver),
+            "attribute": jload(r["attribute"], {}) or {},
+            "department": r["department"] or "",
+            "author_id": r["author_id"] or "",
+            "author": r["author"] or "",
+            "approver": r["approver"] or "",
+            "confirmer": r["confirmer"] or "",
+            "documentPurpose": r["purpose"] or "",
+            "reviseReason": "",
+            "revisePoint": "",
+            "previousDocumentToken": prev_token,
+        }
+    })
+
+def _status_from_eip_flags(signed_val, rejected_val):
+    signed = str(signed_val).upper() == "TRUE"
+    rejected = str(rejected_val).upper() == "TRUE"
+
+    if not signed and not rejected:
+        return 1  # 已送審（EIP 有資料但尚未簽核 / 退回）
+    if signed and not rejected:
+        return 2  # 已簽核
+    if not signed and rejected:
+        return 3  # 已退回
+    # 其他組合目前不定義，就維持原狀
+    return None
+
+@bp.post("/sync-eip")
+def sync_eip():
+    """
+    從 Oracle IDBUSER.EIP_DOCUMENT_TABLE 同步狀態到 MySQL：
+      - 以 (Document_ID, Document_version, Document_name) 對應
+      - 更新 EIP_id / status / rejecter / reject_reason
+    """
+    updated = 0
+
+    # 1) 從 Oracle 抓資料
+    with ora_cursor() as cur_ora:
+        cur_ora.execute("""
+          SELECT
+            EIP_ID,
+            Document_ID,
+            Document_version,
+            Document_name,
+            signed,
+            rejected,
+            rejecter,
+            rejected_reason
+          FROM IDBUSER.EIP_DOCUMENT_TABLE
+        """)
+        rows = cur_ora.fetchall() or []
+
+    if not rows:
+        return jsonify({"success": True, "updated": 0})
+
+    # 2) 一筆一筆對到 MySQL
+    with db(dict_cursor=True) as (conn, cur):
+        for r in rows:
+            # oracledb 預設回 tuple，照欄位順序取
+            eip_id          = r[0]
+            doc_id          = r[1]
+            doc_ver         = float(r[2])
+            doc_name        = r[3]
+            signed_val      = r[4]
+            rejected_val    = r[5]
+            rejecter        = r[6]
+            rejected_reason = r[7]
+
+            cur.execute("""
+              SELECT document_token, status
+              FROM rms_document_attributes
+              WHERE document_id=%s
+                AND document_version=%s
+                AND document_name=%s
+            """, (doc_id, doc_ver, doc_name))
+            my = cur.fetchone()
+            if not my:
+                continue
+
+            new_status = _status_from_eip_flags(signed_val, rejected_val)
+            if new_status is None:
+                continue
+
+            cur.execute("""
+              UPDATE rms_document_attributes
+              SET EIP_id=%s,
+                  status=%s,
+                  rejecter=%s,
+                  reject_reason=%s
+              WHERE document_token=%s
+            """, (
+                eip_id,
+                new_status,
+                rejecter if new_status == 3 else None,
+                rejected_reason if new_status == 3 else None,
+                my["document_token"],
+            ))
+            updated += 1
+
+        conn.commit()
+
+    return jsonify({"success": True, "updated": updated})
+
+def next_document_id(prefix: str) -> str:
+    """
+    依照 PROJECT_CODE 前三碼 + 三位流水號產生 document_id：
+      WMA → WMA001, WMA002, ...
+    """
+    if not prefix or len(prefix) < 3:
+        prefix = "XXX"
+    prefix = prefix[:3]
+
+    with db(dict_cursor=True) as (conn, cur):
+        cur.execute("""
+          SELECT document_id
+          FROM rms_document_attributes
+          WHERE document_id LIKE %s
+          ORDER BY document_id DESC
+          LIMIT 1
+        """, (prefix + "%",))
+        row = cur.fetchone()
+
+        if not row or not row["document_id"]:
+            return f"{prefix}001"
+
+        tail = row["document_id"][-3:]
+        try:
+            num = int(tail)
+        except ValueError:
+            num = 0
+
+        return f"{prefix}{num + 1:03d}"
+
+def next_monthly_document_id(prefix: str = "W") -> str:
+    """
+    依照 W_YY_MM_XXX 規則產生 document_id：
+      W_25_11_001, W_25_11_002, ...
+    """
+    now = datetime.datetime.now()
+    yy = now.year % 100
+    mm = now.month
+
+    base = f"{prefix}_{yy:02d}_{mm:02d}_"
+
+    with db(dict_cursor=True) as (conn, cur):
+        cur.execute("""
+          SELECT document_id
+          FROM rms_document_attributes
+          WHERE document_id LIKE %s
+          ORDER BY document_id DESC
+          LIMIT 1
+        """, (base + "%",))
+        row = cur.fetchone()
+
+        if not row or not row["document_id"]:
+            return f"{base}001"
+
+        tail = row["document_id"][-3:]
+        try:
+            num = int(tail)
+        except ValueError:
+            num = 0
+
+        return f"{base}{num + 1:03d}"
+
+@bp.post("/clear-doc-id")
+def clear_doc_id():
+    """
+    前端在變更適用工程後呼叫，清除該 token 的 document_id。
+    """
+    body = request.get_json(silent=True) or {}
+    token = (body.get("token") or "").strip()
+    if not token:
+        return send_response(400, False, "missing token")
+
+    with db() as (conn, cur):
+        cur.execute("""
+          UPDATE rms_document_attributes
+          SET document_id=NULL
+          WHERE document_token=%s
+        """, (token,))
+    return jsonify({"success": True})
+
 
 @bp.get("/drafts")
 def list_drafts():
@@ -870,15 +1106,6 @@ def load_references(token):
             forms.append({"formId": r["refer_document"], "formName": r["refer_document_name"]})
     return jsonify({"success": True, "documents": docs, "forms": forms})
 
-def _safe_docname(s: str, fallback: str = "document") -> str:
-    s = (s or "").strip()
-    if not s:
-        return fallback
-    # keep Han/letters/digits/space/-_()
-    s = "".join(ch for ch in s if ch.isalnum() or ch in " _-()[]【】（）")
-    s = re.sub(r"\s+", "_", s)
-    return s[:80] or fallback
-
 def _build_doc_payload_from_token(token: str) -> dict:
     """
     給定 document_token：
@@ -1050,7 +1277,10 @@ def view_docx_from_token(token):
     out_path = os.path.join(view_dir, fname)
 
     # 產生 Word
-    get_docx(out_path, data)
+    if data["attribute"][-1]["documentType"] == 1:
+        get_docx(out_path, data, "docx-template/example4.docx")
+    else:
+        get_docx(out_path, data)
 
     # 回傳後刪掉暫存檔
     @after_this_request
@@ -1069,11 +1299,23 @@ def view_docx_from_token(token):
         mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
 
+def _safe_docname(name: str) -> str:
+    name = (name or "").strip()
+    if not name:
+        return "document"
+    # 簡單去掉不適合當檔名的字元
+    name = re.sub(r'[\\/:*?"<>|]+', "_", name)
+    return name[:80]
+
 @bp.post("/generate/word")
 def generate_word():
     """
-    Accept JSON body {attribute, content, reference}, save under a new payload_id,
-    generate a DOCX, and return the file.
+    Accept JSON body {token, attribute, content, reference}：
+    - 若有 token：
+        1) 用 _build_doc_payload_from_token(token) 把「前幾版 + 目前版」撈出來
+        2) 用前端傳進來的最新 attribute/content/reference 覆蓋「最新那一版」
+        3) 若為初版且尚無 document_id → 依適用工程前三碼產生一個，寫回 DB
+    - 若沒有 token：退回舊行為，直接用 body 的資料產生 Word
     """
     if not request.is_json:
         return jsonify({"ok": False, "error": "JSON body required"}), 400
@@ -1083,25 +1325,161 @@ def generate_word():
     data.setdefault("content", [])
     data.setdefault("reference", [])
 
-    payload_id = f"{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    token = (data.get("token") or "").strip()
 
-    # filename
+    # -------------------------------------------------------
+    # A) 有 token：走「DB + 前幾版」路線
+    # -------------------------------------------------------
+    if token:
+        try:
+            payload = _build_doc_payload_from_token(token)  # {attribute, content, reference}
+        except Exception as e:
+            print("[generate_word] _build_doc_payload_from_token error:", e)
+            return send_response(404, False, "document not found")
+
+        # 1) 先抓出最新那一版（attribute 最後一個）
+        latest_attr = payload["attribute"][-1]
+
+        # 2) 若前端有傳 attribute，就用最後一個覆蓋「最新那一版」的欄位
+        if data["attribute"]:
+            override_attr = data["attribute"][-1]
+            # 只覆蓋有定義的 key，避免整個丟掉前幾版必須欄位
+            for k, v in override_attr.items():
+                # 如果想保留前幾版資訊，只動 attribute / documentPurpose / reviseReason 等欄位
+                latest_attr[k] = v
+
+        # 3) 若前端有 content/reference，代表使用者目前畫面有「最新草稿」內容，要覆蓋 DB 內容
+        if data["content"]:
+            payload["content"] = data["content"]
+        if data["reference"]:
+            payload["reference"] = data["reference"]
+
+        # ---------------------------------------------------
+        # 4) 計算/更新 document_id（只看最新那一版）
+        # ---------------------------------------------------
+        with db(dict_cursor=True) as (conn, cur):
+            cur.execute("""
+            SELECT document_type, document_id, document_version, attribute
+            FROM rms_document_attributes
+            WHERE document_token=%s
+            """, (token,))
+            r = cur.fetchone()
+            if not r:
+                return send_response(404, False, "document not found")
+
+            doc_type = int(r["document_type"] or 0)
+            doc_id   = r["document_id"]
+            doc_ver  = float(r["document_version"] or 1.0)
+            attr_json = jload(r["attribute"], {}) or {}
+
+            latest_attr_json = latest_attr.get("attribute") or {}
+            attr_json.update(latest_attr_json)
+
+            # 初版且尚無 document_id → 依文件類型決定編碼規則
+            if doc_ver == 1.0 and not doc_id:
+                if doc_type == 1:
+                    # Specification：W_YY_MM_XXX
+                    doc_id = next_monthly_document_id("W")
+                else:
+                    # Instruction：適用工程前三碼 + 流水號
+                    apply_project = (attr_json.get("applyProject") or "").strip()
+                    prefix = (apply_project[:3] or "XXX").upper()
+                    doc_id = next_document_id(prefix)
+
+            cur.execute("""
+            UPDATE rms_document_attributes
+            SET document_id=%s,
+                attribute=%s
+            WHERE document_token=%s
+            """, (doc_id, jdump(attr_json), token))
+            conn.commit()
+
+
+
+        # 5) 把 docID 塞回最新那一版給 get_docx 用
+        latest_attr["documentID"] = doc_id or ""
+        if data["attribute"]:
+            data["attribute"][-1]["documentID"] = doc_id or ""
+
+
+        # 6) 檔名：用最新那一版
+        try:
+            doc_name = _safe_docname(
+                latest_attr.get("documentName")
+                or latest_attr.get("documentID")
+                or doc_id
+                or "document"
+            )
+        except Exception:
+            doc_name = "document"
+
+        out_path = os.path.join(BASE_DIR, f"{doc_name}.docx")
+        # 產生 Word
+        if data["attribute"][-1]["documentType"] == 1:
+            get_docx(out_path, data, "docx-template/example4.docx")
+        else:
+            get_docx(out_path, data)
+
+        @after_this_request
+        def add_docid_header(response):
+            if doc_id:
+                response.headers["X-Document-ID"] = doc_id
+            # 讓瀏覽器允許 JS 讀取這個自訂 header（跨網域情況下很重要）
+            existing = response.headers.get("Access-Control-Expose-Headers", "")
+            expose = "X-Document-ID"
+            if existing:
+                # 避免重複，加在後面
+                if expose not in existing:
+                    response.headers["Access-Control-Expose-Headers"] = existing + "," + expose
+            else:
+                response.headers["Access-Control-Expose-Headers"] = expose
+            return response
+
+
+        return send_file(
+            out_path,
+            as_attachment=True,
+            download_name=f"{doc_name}.docx",
+            mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+
+    # -------------------------------------------------------
+    # B) 沒有 token：保留舊的 fallback 行為
+    # -------------------------------------------------------
+    # 這支分支可以很簡單：沿用你之前的 generate_word 寫法（不整合 DB）
     try:
         attr_last = data["attribute"][-1]
-        doc_name  = _safe_docname(attr_last.get("documentName") or attr_last.get("documentID") or payload_id)
+        doc_name  = _safe_docname(
+            attr_last.get("documentName")
+            or attr_last.get("documentID")
+            or "document"
+        )
     except Exception:
-        doc_name = payload_id
+        doc_name = "document"
 
     out_path = os.path.join(BASE_DIR, f"{doc_name}.docx")
-    get_docx(out_path, data)
+    # 產生 Word
+    if data["attribute"][-1]["documentType"] == 1:
+        get_docx(out_path, data, "docx-template/example4.docx")
+    else:
+        get_docx(out_path, data)
 
-    return send_file(out_path, as_attachment=True, download_name=f"{doc_name}.docx", mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    return send_file(
+        out_path,
+        as_attachment=True,
+        download_name=f"{doc_name}.docx",
+        mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
 
 @bp.post("/preview/docx")
 def preview_docx():
     """
-    接收 {attribute, content, reference} JSON，產生一份暫存 DOCX，
-    給前端 blob 預覽使用（不強制下載）。
+    接收 {token?, attribute?, content?, reference?}：
+      - 若有 token：
+          1) 先用 _build_doc_payload_from_token(token) → 帶出前幾版 + 目前版
+          2) 前端若傳 attribute/content/reference，就覆蓋「最新那一版」及其內容
+      - 若無 token：
+          保留舊行為，直接用 body 的資料 preview。
     """
     if not request.is_json:
         return jsonify({"ok": False, "error": "JSON body required"}), 400
@@ -1111,107 +1489,78 @@ def preview_docx():
     data.setdefault("content", [])
     data.setdefault("reference", [])
 
-    # 產生一個 payload_id，當檔名/暫存檔用
+    token = (data.get("token") or "").strip()
+
+    # -------------------------------------------------------
+    # A) 有 token：用 DB + 前幾版 + 前端覆蓋最新版
+    # -------------------------------------------------------
+    if token:
+        try:
+            payload = _build_doc_payload_from_token(token)
+        except Exception as e:
+            print("[preview_docx] _build_doc_payload_from_token error:", e)
+            return jsonify({"ok": False, "error": "document not found"}), 404
+
+        latest_attr = payload["attribute"][-1]
+
+        # 前端若有傳 attribute，就覆蓋最新版欄位
+        if data["attribute"]:
+            override_attr = data["attribute"][-1]
+            for k, v in override_attr.items():
+                latest_attr[k] = v
+
+        # content/reference 若前端有傳，就覆蓋 DB 的
+        if data["content"]:
+            payload["content"] = data["content"]
+        if data["reference"]:
+            payload["reference"] = data["reference"]
+
+        base_payload = payload
+
+    else:
+        # ---------------------------------------------------
+        # B) 沒 token：維持舊有行為，直接用 body
+        # ---------------------------------------------------
+        base_payload = data
+
+
+    # 產生一個 payload_id，當暫存檔名的一部分
     payload_id = f"{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
 
-    # 取文件名稱（跟 generate_word 一樣邏輯）
+    # 取檔案名稱：優先用「最新版」的文件名稱 / 文管編號
     try:
-        attr_last = data["attribute"][-1]
-        raw_name  = attr_last.get("documentName") or attr_last.get("documentID") or payload_id
-        doc_name  = _safe_docname(raw_name)
+        if base_payload["attribute"]:
+            attr_last = base_payload["attribute"][-1]
+        else:
+            attr_last = {}
+        raw_name = attr_last.get("documentName") or attr_last.get("documentID") or payload_id
+        doc_name = _safe_docname(raw_name)
     except Exception:
         doc_name = payload_id
 
-    # 放暫存的資料夾：BASE_DIR/_preview
     preview_dir = os.path.join(BASE_DIR, "_preview")
     os.makedirs(preview_dir, exist_ok=True)
 
     out_path = os.path.join(preview_dir, f"{doc_name}-{payload_id}.docx")
 
-    # 用你現有的 get_docx 產生 Word
-    get_docx(out_path, data)
+    # 產生 Word
+    if data["attribute"][-1]["documentType"] == 1:
+        get_docx(out_path, data, "docx-template/example4.docx")
+    else:
+        get_docx(out_path, data)
 
-    # 回傳後把暫存檔刪掉
     @after_this_request
     def remove_file(response):
         try:
             if os.path.exists(out_path):
                 os.remove(out_path)
         except Exception as e:
-            # 這裡不要影響回應，只記 log 即可
             print("[preview_docx] remove temp file error:", e)
         return response
 
     return send_file(
         out_path,
-        as_attachment=False,  # 🔑 不強制下載，前端用 fetch+blob 來處理
+        as_attachment=False,
         download_name=f"{doc_name}.docx",
         mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
-
-def _safe_docname(name: str) -> str:
-    """
-    簡單版 safe name，可用你原本的實作。
-    """
-    import re
-    name = name or "document"
-    name = re.sub(r"[^\w\-一-龥]", "_", name)
-    return name[:64]
-
-@bp.post("/preview/pdf")
-def preview_pdf():
-    """
-    接收 JSON {attribute, content, reference}，
-    用 get_docx 產 DOCX，再用 LibreOffice 轉 PDF，
-    回傳 inline PDF（不存檔，暫存資料夾用完就自動刪掉）。
-    """
-    if not request.is_json:
-        return jsonify({"success": False, "error": "JSON body required"}), 400
-
-    data = request.get_json(silent=True) or {}
-    data.setdefault("attribute", [])
-    data.setdefault("content", [])
-    data.setdefault("reference", [])
-
-    payload_id = f"{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
-
-    try:
-        attr_list = data.get("attribute") or []
-        if attr_list:
-            attr_last = attr_list[-1]
-            doc_name = _safe_docname(
-                attr_last.get("documentName")
-                or attr_last.get("documentID")
-                or payload_id
-            )
-        else:
-            doc_name = payload_id
-
-        # 產 PDF bytes（全程在 TemporaryDirectory 裡）
-        pdf_bytes = docx_file_to_pdf_bytes(get_docx, data, filename_stem=doc_name)
-
-        debug_path = f"/tmp/preview-debug-{payload_id}.pdf"
-        with open(debug_path, "wb") as f:
-            f.write(pdf_bytes)
-        print("DEBUG preview pdf saved:", debug_path)
-
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-    pdf_io = BytesIO(pdf_bytes)
-    pdf_io.seek(0)
-
-    # 先用 send_file 建立 response
-    resp = send_file(
-        pdf_io,
-        mimetype="application/pdf",
-        as_attachment=False,
-        download_name=f"{doc_name}.pdf",
-    )
-
-    # 再補你要的 header
-    resp.headers["Cache-Control"] = "no-store"
-    resp.headers["Content-Disposition"] = f'inline; filename="{doc_name}.pdf"'
-    resp.headers["X-Content-Type-Options"] = "nosniff"
-
-    return resp
