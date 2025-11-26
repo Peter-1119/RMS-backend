@@ -1386,33 +1386,23 @@ def generate_word():
                     prefix = (apply_project[:3] or "XXX").upper()
                     doc_id = next_document_id(prefix)
 
-            cur.execute("""
-            UPDATE rms_document_attributes
-            SET document_id=%s,
-                attribute=%s
-            WHERE document_token=%s
-            """, (doc_id, jdump(attr_json), token))
+            cur.execute("""UPDATE rms_document_attributes SET document_id=%s, attribute=%s WHERE document_token=%s""", (doc_id, jdump(attr_json), token))
             conn.commit()
-
-
 
         # 5) 把 docID 塞回最新那一版給 get_docx 用
         latest_attr["documentID"] = doc_id or ""
         if data["attribute"]:
             data["attribute"][-1]["documentID"] = doc_id or ""
 
-
         # 6) 檔名：用最新那一版
         try:
-            doc_name = _safe_docname(
-                latest_attr.get("documentName")
-                or latest_attr.get("documentID")
-                or doc_id
-                or "document"
-            )
+            # doc_name = _safe_docname(latest_attr.get("documentName") or latest_attr.get("documentID") or doc_id or "document")
+            print(f'1 {latest_attr.get("documentName")}{latest_attr.get("documentVersion"):.1f}')
+            doc_name = _safe_docname(f'{latest_attr.get("documentName")}{latest_attr.get("documentVersion"):.1f}')
         except Exception:
             doc_name = "document"
 
+        print(f'3 doc_name: {doc_name}')
         out_path = os.path.join(BASE_DIR, f"{doc_name}.docx")
         # 產生 Word
         if data["attribute"][-1]["documentType"] == 1:
@@ -1449,14 +1439,13 @@ def generate_word():
     # 這支分支可以很簡單：沿用你之前的 generate_word 寫法（不整合 DB）
     try:
         attr_last = data["attribute"][-1]
-        doc_name  = _safe_docname(
-            attr_last.get("documentName")
-            or attr_last.get("documentID")
-            or "document"
-        )
+        # doc_name = _safe_docname(attr_last.get("documentName") or attr_last.get("documentID") or "document")
+        doc_name = _safe_docname(f'{attr_last.get("documentName")}{attr_last.get("documentVersion"):.1f}')
+        print(f'2 {attr_last.get("documentName")}{attr_last.get("documentVersion"):.1f}')
     except Exception:
         doc_name = "document"
 
+    print(f'4 doc_name: {doc_name}')
     out_path = os.path.join(BASE_DIR, f"{doc_name}.docx")
     # 產生 Word
     if data["attribute"][-1]["documentType"] == 1:

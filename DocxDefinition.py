@@ -175,16 +175,21 @@ def _to_float_or_none(s):
     m = _num_pat.search(str(s))
     return float(m.group(0)) if m else None
 
+_calc_significant_digits = lambda s: 0 if "." not in s else len(s.split(".")[-1])
 def _compose_value(set_txt, upper_txt, lower_txt):
     s = _to_float_or_none(set_txt)
     u = _to_float_or_none(upper_txt)
     l = _to_float_or_none(lower_txt)
     if s == None or u == None or l == None:
         return ""
-    
-    plus = u - s
-    minus = s - l
-    return f"+{plus:.2f}/-{minus:.2f}({l:.2f}~{u:.2f})"
+
+    s_sd = _calc_significant_digits(set_txt)
+    u_sd = _calc_significant_digits(upper_txt)
+    l_sd = _calc_significant_digits(lower_txt)
+
+    plus = round(u - s, max(s_sd, u_sd)) if s_sd + u_sd != 0 else int(u - s)
+    minus = round(s - l, max(s_sd, l_sd)) if s_sd + l_sd != 0 else int(s - l)
+    return f"+{plus}/-{minus}\n({lower_txt}~{upper_txt})"
 
 def set_style_fonts(style, latin="Arial", east_asia="標楷體"):
     """
@@ -689,6 +694,62 @@ def draw_instruction_content(doc, data):
                 p_attr.runs[0].font.size = Pt(12)
                 p_attr.paragraph_format.left_indent = p_attr.runs[0].font.size * 2
 
+def create_word_password_hash(password):
+    """
+    生成 Word 用於 'Restrict Editing' 的 Legacy Hash。
+    """
+    if not password:
+        return None
+    
+    password_hash = 0
+    if len(password) > 15:
+        password = password[:15]
+    
+    chars = [ord(c) for c in password]
+    for char_code in chars:
+        password_hash = ((password_hash >> 14) & 0x01) | ((password_hash << 1) & 0x7FFF)
+        password_hash ^= char_code
+        
+    password_hash = ((password_hash >> 14) & 0x01) | ((password_hash << 1) & 0x7FFF)
+    password_hash ^= len(password)
+    password_hash ^= 0xCE4B
+    
+    return f'{password_hash:X}'
+
+def enable_docx_protection(doc, password):
+    """
+    直接修改 python-docx 的 document 物件，注入保護設定。
+    """
+    # 1. 取得 settings 的根節點
+    settings_element = doc.settings.element
+
+    # 2. 產生雜湊密碼
+    hash_value = create_word_password_hash(password)
+
+    # 3. 建立 documentProtection 元素
+    # XML 結構: <w:documentProtection w:edit="forms" w:enforcement="1" ... />
+    protection = OxmlElement('w:documentProtection')
+    
+    # 設定屬性
+    protection.set(qn('w:edit'), 'forms')  # forms = 僅填寫表單 (即唯讀但允許表單)
+    protection.set(qn('w:enforcement'), '1')
+    
+    # 設定加密參數 (相容 Word 的標準參數)
+    protection.set(qn('w:cryptProviderType'), 'rsaAES')
+    protection.set(qn('w:cryptAlgorithmClass'), 'hash')
+    protection.set(qn('w:cryptAlgorithmType'), 'typeAny')
+    protection.set(qn('w:cryptAlgorithmSid'), '14')
+    protection.set(qn('w:cryptSpinCount'), '100000')
+    protection.set(qn('w:hash'), hash_value)
+
+    # 4. 檢查是否已經有保護標籤，若有則先移除 (避免重複)
+    existing = settings_element.find(qn('w:documentProtection'))
+    if existing is not None:
+        settings_element.remove(existing)
+
+    # 5. 將新標籤加入 settings
+    settings_element.append(protection)
+
 def fill_from_template(template_path, out_path, data, title_mapping, info_mapping):
     doc = Document(template_path)
     apply_default_fonts(doc, latin="Arial", east_asia="標楷體")
@@ -702,7 +763,7 @@ def fill_from_template(template_path, out_path, data, title_mapping, info_mappin
         # replace_in_header(section.first_page_header, title_mapping)  # 視需求決定
         replace_in_header(section.header, title_mapping)
         replace_in_footer(section.footer, title_mapping)
-        print(f"index: {index}, section: {section.header}")
+        # print(f"index: {index}, section: {section.header}")
 
     for row in doc.tables[0].rows:
         for cell in row.cells:
@@ -711,6 +772,8 @@ def fill_from_template(template_path, out_path, data, title_mapping, info_mappin
 
     # ★ 內容都產生完之後，再插入頁碼欄位
     setup_page_numbers(doc)
+
+    enable_docx_protection(doc, "123456")
 
     doc.save(out_path)
 
