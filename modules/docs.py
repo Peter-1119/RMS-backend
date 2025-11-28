@@ -1700,6 +1700,144 @@ def release_program_codes_by_document():
 
     return send_response(200, True, "程式號碼已釋放", {"document_token": document_token})
 
+# ===== helper function ===== #
+def _nz(s):
+    return (s or "").strip()
+
+def _load_machine_pms_signature(machine_code: str) -> set[str]:
+    """
+    從 Oracle 撈出目前機台的 PMS baseline，轉成一個 set 用來比對。
+    key: f"{slot_name}|{parameter_desc}({unit})"
+    這樣才會跟文件 content_text 的「槽體 / 管理項目」對得起來。
+    """
+    sig = set()
+    if not machine_code:
+        return sig
+
+    with ora_cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                TRIM(SLOT_NAME)      AS SLOT_NAME,
+                TRIM(PARAMETER_DESC) AS PARAMETER_DESC,
+                TRIM(UNIT)           AS UNIT
+            FROM IDBUSER.RMS_FLEX_PMS
+            WHERE MACHINE_CODE = :c
+              AND NVL(PARAM_COMPARE, 'N') = 'Y'
+              AND NVL(SET_ATTRIBUTE, 'N') = 'Y'
+            ORDER BY SLOT_NAME, PARAMETER_DESC
+            """,
+            c=machine_code
+        )
+        rows = cur.fetchall()
+
+    for slot_name, parameter_desc, unit in rows or []:
+        slot  = _nz(slot_name)
+        pdesc = _nz(parameter_desc)
+        u     = _nz(unit)
+
+        # 這裡和 get_machine_pms_parameters_set_attribute 完全一樣
+        mgmt = f"{pdesc}({u})" if u else f"{pdesc}()"
+        if slot or mgmt:
+            sig.add(f"{slot}|{mgmt}")
+    return sig
+
+def _load_machine_condition_signature(machine_code: str) -> set[str]:
+    """
+    從 MySQL 撈出目前機台的 Condition baseline，轉成一個 set 用來比對。
+    key: condition_name  → 對應到文件 condition table header。
+    """
+    sig = set()
+    if not machine_code:
+        return sig
+
+    with db() as (conn, cur):
+        cur.execute(
+            """
+            SELECT DISTINCT
+                t1.condition_name
+            FROM rms_conditions t1
+            INNER JOIN rms_condition_groups t2
+                ON t1.condition_id = t2.condition_id
+            INNER JOIN rms_group_machines t3
+                ON t2.group_id = t3.group_id AND t2.condition_id = t3.condition_id
+            WHERE t3.machine_id = %s
+            """,
+            (machine_code,)
+        )
+        rows = cur.fetchall()
+
+    for (cname,) in rows or []:
+        name = _nz(cname)
+        if name:
+            sig.add(name)
+    return sig
+
+def _parse_2d_from_text(text: str):
+    """
+    content_text 裡存的是像：
+    [
+      ["槽體","管理項目",...],
+      ["剝膜1","上噴關槽()", ...],
+      ...
+    ]
+    這裡把它轉成 Python list[list[str]]，不合法就回 []
+    """
+    if not text:
+        return []
+    try:
+        data = json.loads(text)
+        if isinstance(data, list):
+            return data
+        return []
+    except Exception:
+        return []
+
+def _build_doc_pms_signature_from_text(param_text: str) -> set[str]:
+    """
+    從參數表 content_text 取出「槽體 + 管理項目」組合當作文件當時的 PMS Signature。
+    依你說的：用 content_text 的 [:,0:2] 就夠了（第一列是 header，從第二列開始）。
+    """
+    sig = set()
+    table = _parse_2d_from_text(param_text)
+    if len(table) <= 1:
+        return sig
+
+    # 跳過 header (第 0 列)，從第 1 列開始
+    for row in table[1:]:
+        if not isinstance(row, list) or len(row) < 2:
+            continue
+        tank = _nz(row[0])
+        param = _nz(row[1])
+        if tank or param:
+            sig.add(f"{tank}|{param}")
+    return sig
+
+def _build_doc_condition_signature_from_text(cond_text: str) -> set[str]:
+    """
+    從條件表 content_text 取出 header 第一列的 [1:-1] 當作文件當時的 Condition Signature。
+    例如：
+      [["條件名稱","鍍銅厚度"], ["1","10"]]
+    => header = ["條件名稱","鍍銅厚度"]
+       => 取 header[1:] = ["鍍銅厚度"]
+    """
+    sig = set()
+    table = _parse_2d_from_text(cond_text)
+    if not table:
+        return sig
+
+    header = table[0]
+    if not isinstance(header, list) or len(header) <= 1:
+        return sig
+
+    # 這邊依照你講的 [1:-1] 或 [1:] 都可以，看你要不要排除最後一欄
+    # 我先採用 [1:]（通常最後也會是條件），如果你最後一欄是特別欄位，就改成 header[1:-1]
+    for col in header[1:]:
+        name = _nz(col)
+        if name:
+            sig.add(name)
+    return sig
+
 @bp.post("/parameters/copy-source")
 def copy_source_mcr():
     """
@@ -1708,6 +1846,8 @@ def copy_source_mcr():
     1. program_code 必須存在。
     2. 來源文件的機台必須與 base_machine_code 具有相同的 PMS Slot 設置 (Oracle)。
     3. 來源文件的機台必須與 base_machine_code 具有相同的 Condition Signature (MySQL)。
+    4. ✅ 新增：來源文件當時的 PMS / Condition 內容必須與「目前 baseline」相同
+              （避免複製到已經過期的規格）。
     """
     body = request.get_json(silent=True) or {}
     program_code = (body.get("program_code") or "").strip()
@@ -1716,7 +1856,7 @@ def copy_source_mcr():
     if not program_code or not base_machine_code:
         return send_response(400, False, "缺少必要參數", {"message": "請提供程式代碼與 Base Machine Code"})
 
-    print(f"[DEBUG] copy_source_mcr start: program={program_code}, base={base_machine_code}")
+    # print(f"[DEBUG] copy_source_mcr start: program={program_code}, base={base_machine_code}")
 
     # ==========================================
     # STEP 1: 找出所有 "PMS 相容" 的機台 (Oracle)
@@ -1724,9 +1864,6 @@ def copy_source_mcr():
     pms_compatible_machines = set()
     try:
         with ora_cursor() as cur:
-            # 這裡沿用 filter-by-baseline 的邏輯，找出 PMS Slot 結構完全一致的機台
-            # 簡化 SQL：只要找出 "與 base_machine_code 擁有相同 slot 集合" 的機台
-            # (以下 SQL 為邏輯示意，若原 filter-by-baseline SQL 運作正常可直接套用)
             sql = """
             WITH target_slots AS (
                 SELECT SLOT_NAME FROM IDBUSER.RMS_FLEX_PMS WHERE MACHINE_CODE = :base_code
@@ -1740,15 +1877,12 @@ def copy_source_mcr():
             JOIN target_count tc ON 1=1
             WHERE A.ENABLED = 'Y' AND A.EQM_ID <> 'NA'
             AND (
-                -- Case 1: Base has slots
                 (tc.cnt > 0 
                  AND EXISTS (SELECT 1 FROM candidates c WHERE c.MACHINE_CODE = A.MACHINE_CODE)
-                 -- A has all slots of Base
                  AND NOT EXISTS (
                     SELECT 1 FROM target_slots ts 
                     WHERE NOT EXISTS (SELECT 1 FROM candidates c WHERE c.MACHINE_CODE = A.MACHINE_CODE AND c.SLOT_NAME = ts.SLOT_NAME)
                  )
-                 -- Base has all slots of A
                  AND NOT EXISTS (
                     SELECT 1 FROM candidates c 
                     WHERE c.MACHINE_CODE = A.MACHINE_CODE 
@@ -1756,15 +1890,12 @@ def copy_source_mcr():
                  )
                 )
                 OR
-                -- Case 2: Base has NO slots (only matches others with no slots)
                 (tc.cnt = 0 AND NOT EXISTS (SELECT 1 FROM candidates c WHERE c.MACHINE_CODE = A.MACHINE_CODE))
             )
             """
             cur.execute(sql, {"base_code": base_machine_code})
             rows = cur.fetchall()
             pms_compatible_machines = {row[0] for row in rows}
-            
-            # 確保 base 自己一定在名單內
             pms_compatible_machines.add(base_machine_code)
 
     except Exception as e:
@@ -1774,16 +1905,12 @@ def copy_source_mcr():
     # ==========================================
     # STEP 2: 找出 "Condition 相容" 的機台 (MySQL)
     # ==========================================
-    # 在 PMS 相容的名單中，進一步篩選條件式樣 (Condition Signature) 相同的機台
     final_compatible_machines = []
-    
     if not pms_compatible_machines:
-        # 如果 Oracle 沒資料，至少自己跟自己相容
         final_compatible_machines = [base_machine_code]
     else:
         try:
             with db() as (conn, cur):
-                # 建構動態 UNION ALL 查詢來模擬 CTE
                 pms_list = list(pms_compatible_machines)
                 union_parts = [f"SELECT '{m}' as m_code" for m in pms_list]
                 union_sql = " UNION ALL ".join(union_parts)
@@ -1815,25 +1942,30 @@ def copy_source_mcr():
 
         except Exception as e:
             print(f"[ERROR] MySQL Condition check failed: {e}")
-            # Fallback: 如果 DB 查失敗，保守起見只允許 Base Machine 自己
             final_compatible_machines = [base_machine_code]
 
-    print(f"[DEBUG] Allowed machines: {final_compatible_machines}")
+    # print(f"[DEBUG] Allowed machines: {final_compatible_machines}")
 
     # ==========================================
     # STEP 3: 查詢已簽核文件 (Source Document)
+    #      + ✅ 新增「文件內容 vs baseline」比對
     # ==========================================
-    # 策略：
-    # 1. 搜尋所有包含該 program_code 的已簽核 Instruction (status=2, type=0)
-    # 2. 檢查該文件的 "machines" 屬性是否包含在 final_compatible_machines 內
-    
     try:
         with db() as (conn, cur):
             sql = """
             SELECT 
                 bc.document_token,
                 d.attribute,
-                bc.content_json as param_json,
+                bc.content_text      AS param_text,
+                bc.content_json      AS param_json,
+                (
+                    SELECT sub.content_text 
+                    FROM sfdb.rms_block_content sub 
+                    WHERE sub.document_token = bc.document_token 
+                      AND sub.step_type = 2 
+                      AND sub.sub_no = 1 
+                    LIMIT 1
+                ) as cond_text,
                 (
                     SELECT sub.content_json 
                     FROM sfdb.rms_block_content sub 
@@ -1842,7 +1974,7 @@ def copy_source_mcr():
                       AND sub.sub_no = 1 
                     LIMIT 1
                 ) as cond_json,
-                bc.metadata  -- [New] 新增撈取 metadata
+                bc.metadata
             FROM sfdb.rms_block_content bc
             JOIN sfdb.rms_document_attributes d ON d.document_token = bc.document_token
             WHERE d.status = 2
@@ -1853,64 +1985,322 @@ def copy_source_mcr():
               AND JSON_SEARCH(bc.metadata, 'one', %s, NULL, '$.programs[*].programCode') IS NOT NULL
             ORDER BY d.issue_date DESC
             """
-            
+
             cur.execute(sql, (program_code,))
             candidates = cur.fetchall()
 
             target_param_json = None
             target_cond_json = None
-            target_programs = [] # [New] 用來存儲來源的製程清單
-            found_machine = False
+            target_programs = []
+            found_valid_doc = False
+
+            # 預先算好「base machine 的 baseline signature」，如果你要用 base 做比較也可以；
+            # 這裡我會用「文件裡實際使用的那台 machine」當 baseline。
+            # base_pms_sig  = _load_machine_pms_signature(base_machine_code)
+            # base_cond_sig = _load_machine_condition_signature(base_machine_code)
 
             for row in candidates:
-                doc_token, attr_str, param_str, cond_str, meta_str = row # [New] 接收 meta_str
-                
+                (doc_token, attr_str, param_text, param_json_str, cond_text, cond_json_str, meta_str) = row
+
+                # 解析 Attribute 取得這份文件所掛的 machine 清單
                 try:
                     attr = json.loads(attr_str) if attr_str else {}
-                    doc_machines = attr.get('machines', [])
-                    doc_machine_codes = set(m.get('code') for m in doc_machines if m.get('code'))
-                except:
+                    doc_machines = attr.get("machines", [])
+                    doc_machine_codes = {m.get("code") for m in doc_machines if m.get("code")}
+                except Exception as e:
+                    print(f"[WARN] parse attribute failed for {doc_token}: {e}")
                     continue
 
+                # 只接受「文件使用的機台」裡，至少有一台在 final_compatible_machines 名單內
                 compatible_in_doc = doc_machine_codes.intersection(set(final_compatible_machines))
-                
-                if compatible_in_doc:
-                    found_machine = True
-                    target_param_json = json.loads(param_str) if param_str else None
-                    target_cond_json = json.loads(cond_str) if cond_str else None
-                    
-                    # [New] 解析 metadata 取得 programs
-                    try:
-                        meta = json.loads(meta_str) if meta_str else {}
-                        # 取得來源的 programs (包含 specCode, specName)
-                        # 我們只需要 spec 資訊，舊的 programCode 在這裡其實不需要傳回前端，
-                        # 因為前端要申請新的，但為了完整性可以先傳回。
-                        target_programs = meta.get("programs") or []
-                    except Exception as e:
-                        print(f"[WARN] Parse metadata failed: {e}")
-                        target_programs = []
+                if not compatible_in_doc:
+                    continue
 
-                    print(f"[DEBUG] Found compatible doc: {doc_token}, machines: {compatible_in_doc}")
-                    break
-            
-            if not found_machine:
+                # ✅ 選一台「文件實際使用 + 與 baseline 相容」的機台當作 baseline 比對標的
+                #    （這裡簡單選第一個，你也可以改成 if base_machine_code in compatible_in_doc 優先用 base）
+                doc_machine_for_compare = None
+                if base_machine_code in compatible_in_doc:
+                    doc_machine_for_compare = base_machine_code
+                else:
+                    doc_machine_for_compare = next(iter(compatible_in_doc))
+
+                # ------- 3.1 撈目前 baseline（這台機台）的 signature -------
+                current_pms_sig  = _load_machine_pms_signature(doc_machine_for_compare)
+                current_cond_sig = _load_machine_condition_signature(doc_machine_for_compare)
+
+                # ------- 3.2 從文件內容抽出當時的 signature -------
+                doc_pms_sig  = _build_doc_pms_signature_from_text(param_text or "")
+                doc_cond_sig = _build_doc_condition_signature_from_text(cond_text or "")
+
+                # ------- 3.3 做比對 -------
+                # ------- 3.3 做比對 + DEBUG -------
+                if current_pms_sig != doc_pms_sig or current_cond_sig != doc_cond_sig:
+                    # print(f"[DEBUG] doc {doc_token} skipped: PMS/Cond signature not matched.")
+                    # print(f"[DEBUG]   machine_for_compare = {doc_machine_for_compare}")
+
+                    # print(f"[DEBUG]   PMS current size = {len(current_pms_sig)}, doc size = {len(doc_pms_sig)}")
+                    only_in_current_pms = list(current_pms_sig - doc_pms_sig)[:10]
+                    only_in_doc_pms     = list(doc_pms_sig - current_pms_sig)[:10]
+                    # print(f"[DEBUG]   PMS only_in_current (first 10): {only_in_current_pms}")
+                    # print(f"[DEBUG]   PMS only_in_doc     (first 10): {only_in_doc_pms}")
+
+                    # print(f"[DEBUG]   COND current size = {len(current_cond_sig)}, doc size = {len(doc_cond_sig)}")
+                    only_in_current_cond = list(current_cond_sig - doc_cond_sig)[:10]
+                    only_in_doc_cond     = list(doc_cond_sig - current_cond_sig)[:10]
+                    # print(f"[DEBUG]   COND only_in_current (first 10): {only_in_current_cond}")
+                    # print(f"[DEBUG]   COND only_in_doc     (first 10): {only_in_doc_cond}")
+
+                    continue
+
+                # ------- 3.4 通過比對 → 這份文件才是合法來源 -------
+                found_valid_doc = True
+                try:
+                    target_param_json = json.loads(param_json_str) if param_json_str else None
+                except Exception:
+                    target_param_json = None
+
+                try:
+                    target_cond_json = json.loads(cond_json_str) if cond_json_str else None
+                except Exception:
+                    target_cond_json = None
+
+                try:
+                    meta = json.loads(meta_str) if meta_str else {}
+                    target_programs = meta.get("programs") or []
+                except Exception as e:
+                    print(f"[WARN] Parse metadata failed: {e}")
+                    target_programs = []
+
+                # print(f"[DEBUG] Found compatible + up-to-date doc: {doc_token}, machines: {compatible_in_doc}")
+                break
+
+            if not found_valid_doc:
                 return send_response(200, False, "條件參數不同無法複製", {
-                    "message": "雖有此代碼，但所屬機台的條件/PMS與目前機台不相容，無法複製。"
+                    "message": "雖有此程式代碼，但來源文件的 PMS/條件內容已與目前 baseline 不一致，無法複製。"
                 })
 
             return send_response(200, True, "複製成功", {
                 "blocks": {
                     "param_json": target_param_json,
                     "cond_json": target_cond_json,
-                    "source_programs": target_programs # [New] 回傳製程清單
+                    "source_programs": target_programs
                 }
             })
 
     except Exception as e:
         print(f"[ERROR] Fetch doc failed: {e}")
         return send_response(500, False, "系統錯誤", {"message": str(e)})
+
+# @bp.post("/parameters/copy-source")
+# def copy_source_mcr():
+#     """
+#     功能：從已簽核的 Instruction 文件中複製參數與條件表。
+#     限制：
+#     1. program_code 必須存在。
+#     2. 來源文件的機台必須與 base_machine_code 具有相同的 PMS Slot 設置 (Oracle)。
+#     3. 來源文件的機台必須與 base_machine_code 具有相同的 Condition Signature (MySQL)。
+#     """
+#     body = request.get_json(silent=True) or {}
+#     program_code = (body.get("program_code") or "").strip()
+#     base_machine_code = (body.get("base_machine_code") or "").strip()
+
+#     if not program_code or not base_machine_code:
+#         return send_response(400, False, "缺少必要參數", {"message": "請提供程式代碼與 Base Machine Code"})
+
+#     print(f"[DEBUG] copy_source_mcr start: program={program_code}, base={base_machine_code}")
+
+#     # ==========================================
+#     # STEP 1: 找出所有 "PMS 相容" 的機台 (Oracle)
+#     # ==========================================
+#     pms_compatible_machines = set()
+#     try:
+#         with ora_cursor() as cur:
+#             # 這裡沿用 filter-by-baseline 的邏輯，找出 PMS Slot 結構完全一致的機台
+#             # 簡化 SQL：只要找出 "與 base_machine_code 擁有相同 slot 集合" 的機台
+#             # (以下 SQL 為邏輯示意，若原 filter-by-baseline SQL 運作正常可直接套用)
+#             sql = """
+#             WITH target_slots AS (
+#                 SELECT SLOT_NAME FROM IDBUSER.RMS_FLEX_PMS WHERE MACHINE_CODE = :base_code
+#             ),
+#             target_count AS ( SELECT COUNT(*) as cnt FROM target_slots ),
+#             candidates AS (
+#                 SELECT MACHINE_CODE, SLOT_NAME FROM IDBUSER.RMS_FLEX_PMS
+#             )
+#             SELECT DISTINCT A.MACHINE_CODE
+#             FROM IDBUSER.RMS_SYS_MACHINE A
+#             JOIN target_count tc ON 1=1
+#             WHERE A.ENABLED = 'Y' AND A.EQM_ID <> 'NA'
+#             AND (
+#                 -- Case 1: Base has slots
+#                 (tc.cnt > 0 
+#                  AND EXISTS (SELECT 1 FROM candidates c WHERE c.MACHINE_CODE = A.MACHINE_CODE)
+#                  -- A has all slots of Base
+#                  AND NOT EXISTS (
+#                     SELECT 1 FROM target_slots ts 
+#                     WHERE NOT EXISTS (SELECT 1 FROM candidates c WHERE c.MACHINE_CODE = A.MACHINE_CODE AND c.SLOT_NAME = ts.SLOT_NAME)
+#                  )
+#                  -- Base has all slots of A
+#                  AND NOT EXISTS (
+#                     SELECT 1 FROM candidates c 
+#                     WHERE c.MACHINE_CODE = A.MACHINE_CODE 
+#                     AND NOT EXISTS (SELECT 1 FROM target_slots ts WHERE ts.SLOT_NAME = c.SLOT_NAME)
+#                  )
+#                 )
+#                 OR
+#                 -- Case 2: Base has NO slots (only matches others with no slots)
+#                 (tc.cnt = 0 AND NOT EXISTS (SELECT 1 FROM candidates c WHERE c.MACHINE_CODE = A.MACHINE_CODE))
+#             )
+#             """
+#             cur.execute(sql, {"base_code": base_machine_code})
+#             rows = cur.fetchall()
+#             pms_compatible_machines = {row[0] for row in rows}
+            
+#             # 確保 base 自己一定在名單內
+#             pms_compatible_machines.add(base_machine_code)
+
+#     except Exception as e:
+#         print(f"[ERROR] Oracle PMS check failed: {e}")
+#         return send_response(400, False, "PMS 資料比對失敗", {"message": "無法驗證機台 PMS 相容性"})
+
+#     # ==========================================
+#     # STEP 2: 找出 "Condition 相容" 的機台 (MySQL)
+#     # ==========================================
+#     # 在 PMS 相容的名單中，進一步篩選條件式樣 (Condition Signature) 相同的機台
+#     final_compatible_machines = []
     
-# modules/docs.py
+#     if not pms_compatible_machines:
+#         # 如果 Oracle 沒資料，至少自己跟自己相容
+#         final_compatible_machines = [base_machine_code]
+#     else:
+#         try:
+#             with db() as (conn, cur):
+#                 # 建構動態 UNION ALL 查詢來模擬 CTE
+#                 pms_list = list(pms_compatible_machines)
+#                 union_parts = [f"SELECT '{m}' as m_code" for m in pms_list]
+#                 union_sql = " UNION ALL ".join(union_parts)
+
+#                 sql = f"""
+#                 WITH input_machines AS (
+#                     {union_sql}
+#                 ),
+#                 machine_sigs AS (
+#                     SELECT 
+#                         im.m_code,
+#                         (
+#                             SELECT GROUP_CONCAT(rgm.condition_id ORDER BY rgm.condition_id SEPARATOR ',')
+#                             FROM sfdb.rms_group_machines rgm
+#                             WHERE rgm.machine_id = im.m_code
+#                         ) as sig
+#                     FROM input_machines im
+#                 ),
+#                 base_sig AS (
+#                     SELECT sig FROM machine_sigs WHERE m_code = %s
+#                 )
+#                 SELECT ms.m_code
+#                 FROM machine_sigs ms
+#                 JOIN base_sig bs ON (ms.sig IS NULL AND bs.sig IS NULL) OR (ms.sig = bs.sig)
+#                 """
+#                 cur.execute(sql, (base_machine_code,))
+#                 rows = cur.fetchall()
+#                 final_compatible_machines = [r[0] for r in rows]
+
+#         except Exception as e:
+#             print(f"[ERROR] MySQL Condition check failed: {e}")
+#             # Fallback: 如果 DB 查失敗，保守起見只允許 Base Machine 自己
+#             final_compatible_machines = [base_machine_code]
+
+#     print(f"[DEBUG] Allowed machines: {final_compatible_machines}")
+
+#     # ==========================================
+#     # STEP 3: 查詢已簽核文件 (Source Document)
+#     # ==========================================
+#     # 策略：
+#     # 1. 搜尋所有包含該 program_code 的已簽核 Instruction (status=2, type=0)
+#     # 2. 檢查該文件的 "machines" 屬性是否包含在 final_compatible_machines 內
+    
+#     try:
+#         with db() as (conn, cur):
+#             sql = """
+#             SELECT 
+#                 bc.document_token,
+#                 d.attribute,
+#                 bc.content_json as param_json,
+#                 (
+#                     SELECT sub.content_json 
+#                     FROM sfdb.rms_block_content sub 
+#                     WHERE sub.document_token = bc.document_token 
+#                       AND sub.step_type = 2 
+#                       AND sub.sub_no = 1 
+#                     LIMIT 1
+#                 ) as cond_json,
+#                 bc.metadata  -- [New] 新增撈取 metadata
+#             FROM sfdb.rms_block_content bc
+#             JOIN sfdb.rms_document_attributes d ON d.document_token = bc.document_token
+#             WHERE d.status = 2
+#               AND d.document_type = 0
+#               AND bc.step_type = 2
+#               AND bc.sub_no = 0
+#               AND JSON_UNQUOTE(JSON_EXTRACT(bc.metadata, '$.kind')) = 'mcr-parameter'
+#               AND JSON_SEARCH(bc.metadata, 'one', %s, NULL, '$.programs[*].programCode') IS NOT NULL
+#             ORDER BY d.issue_date DESC
+#             """
+            
+#             cur.execute(sql, (program_code,))
+#             candidates = cur.fetchall()
+
+#             target_param_json = None
+#             target_cond_json = None
+#             target_programs = [] # [New] 用來存儲來源的製程清單
+#             found_machine = False
+
+#             for row in candidates:
+#                 doc_token, attr_str, param_str, cond_str, meta_str = row # [New] 接收 meta_str
+                
+#                 try:
+#                     attr = json.loads(attr_str) if attr_str else {}
+#                     doc_machines = attr.get('machines', [])
+#                     doc_machine_codes = set(m.get('code') for m in doc_machines if m.get('code'))
+#                 except:
+#                     continue
+
+#                 compatible_in_doc = doc_machine_codes.intersection(set(final_compatible_machines))
+                
+#                 if compatible_in_doc:
+#                     found_machine = True
+#                     target_param_json = json.loads(param_str) if param_str else None
+#                     target_cond_json = json.loads(cond_str) if cond_str else None
+                    
+#                     # [New] 解析 metadata 取得 programs
+#                     try:
+#                         meta = json.loads(meta_str) if meta_str else {}
+#                         # 取得來源的 programs (包含 specCode, specName)
+#                         # 我們只需要 spec 資訊，舊的 programCode 在這裡其實不需要傳回前端，
+#                         # 因為前端要申請新的，但為了完整性可以先傳回。
+#                         target_programs = meta.get("programs") or []
+#                     except Exception as e:
+#                         print(f"[WARN] Parse metadata failed: {e}")
+#                         target_programs = []
+
+#                     print(f"[DEBUG] Found compatible doc: {doc_token}, machines: {compatible_in_doc}")
+#                     break
+            
+#             if not found_machine:
+#                 return send_response(200, False, "條件參數不同無法複製", {
+#                     "message": "雖有此代碼，但所屬機台的條件/PMS與目前機台不相容，無法複製。"
+#                 })
+
+#             return send_response(200, True, "複製成功", {
+#                 "blocks": {
+#                     "param_json": target_param_json,
+#                     "cond_json": target_cond_json,
+#                     "source_programs": target_programs # [New] 回傳製程清單
+#                 }
+#             })
+
+#     except Exception as e:
+#         print(f"[ERROR] Fetch doc failed: {e}")
+#         return send_response(500, False, "系統錯誤", {"message": str(e)})
+    
 @bp.post("/parameters/copy-spec-source")
 def copy_spec_source_mcr():
     """
