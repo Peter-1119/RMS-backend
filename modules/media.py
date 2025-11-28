@@ -18,48 +18,6 @@ def serve_file(filename):
         return "File Not Found", 404
     return send_from_directory(UPLOAD_ROOT_DIR, filename)
 
-# @bp.post("/image")
-# def upload_image():
-#     if 'file' not in request.files:
-#         return jsonify({"success": False, "message": "No file part"}), 400
-#     f = request.files['file']
-#     if not f or f.filename == '':
-#         return jsonify({"success": False, "message": "No selected file"}), 400
-#     if not allowed_file(f.filename):
-#         return jsonify({"success": False, "message": "File type not allowed"}), 400
-
-#     token = (request.args.get("token") or "").strip()
-#     original = secure_filename(f.filename)
-#     ext = '.' + original.rsplit('.', 1)[1].lower() if '.' in original else ''
-#     subdir = os.path.join(UPLOAD_ROOT_DIR, 'temp', datetime.now().strftime('%Y/%m/%d'))
-#     os.makedirs(subdir, exist_ok=True)
-
-#     fd, abs_path = tempfile.mkstemp(dir=subdir, suffix=ext); os.close(fd)
-#     f.save(abs_path)
-
-#     abstract_path = os.path.relpath(abs_path, UPLOAD_ROOT_DIR).replace(os.sep,'/')
-#     browser_url   = f"/uploads/{abstract_path}"
-
-#     asset_id = str(uuid.uuid4())
-#     try:
-#         with db() as (conn, cur):
-#             cur.execute("""
-#               INSERT INTO rms_assets (asset_id, storage_key, mime_type, byte_size, created_at)
-#               VALUES (%s,%s,%s,%s,NOW())
-#             """, (asset_id, f"uploads/{abstract_path}", f.mimetype, os.path.getsize(abs_path)))
-#             if token:
-#                 cur.execute("""
-#                   INSERT INTO rms_asset_links (asset_id, document_token, content_id, created_at)
-#                   VALUES (%s, %s, %s, NOW())
-#                 """, (asset_id, token, None))
-#     except Exception:
-#         asset_id = None
-
-#     payload = { "success": True, "url": browser_url, "path_to_save": abstract_path, "download_url": browser_url,}
-#     if asset_id:
-#         payload["asset_id"] = asset_id
-#     return jsonify(payload), 200
-
 @bp.post("/image")
 def upload_image():
     if 'file' not in request.files:
@@ -183,13 +141,8 @@ def upload_drawio_and_convert():
         asset_id = None
 
     payload = {"success": True, "url": browser_url, "path_to_save": abstract_path, "download_url": source_url}
-    # payload = {
-    #     "success": True,
-    #     "url": browser_url,                # PNG 圖片給 preview 用
-    #     "path_to_save": abstract_path,
-    #     "source_url": source_url,          # 原始 .drawio 的下載 URL
-    #     "source_path": source_abstract_path,
-    # }
+
     if asset_id:
         payload["asset_id"] = asset_id
+        
     return jsonify(payload), 200

@@ -575,7 +575,6 @@ def createPictures(cell, step_content_list):
                         run = p.add_run()
                         run.add_picture(src, width = Cm(width / 2 - 0.5))
 
-
 def createTable(cell, step_content_list):
     """Adds tables (jsonContent containing a table) for all items in the list to the cell."""
     for content_obj in step_content_list:
@@ -599,7 +598,6 @@ def createTable(cell, step_content_list):
                 # Table is created directly in the cell, as requested, to avoid left indent.
                 create_docx_table(cell, table_block)
 
-
 def draw_instruction_content(doc, data):
     attribute = data["attribute"][-1]
     contents = data["content"]
@@ -616,7 +614,6 @@ def draw_instruction_content(doc, data):
     for (stepIndex, itemInfo) in enumerate(DOCUMENT_STEP[DOCUMENT_TYPE(documentType).name].value):
         (step, stepInfo), = itemInfo.items()
         
-        # print(f"stepIndex: {stepIndex}, step: {step}, stepInfo: {stepInfo}")
         # 1. Set the step title
         p_title = cell.paragraphs[0] if stepIndex == 0 else cell.add_paragraph()
         p_title.text = f"{stepIndex + 1}.{step}"
@@ -636,10 +633,6 @@ def draw_instruction_content(doc, data):
         elif stepInfo["parent"] == "content":
             # Filter content items for the current step_type
             step_content_list = [content for content in contents if content["step_type"] == stepInfo["code"]]
-            # print(f"step_content_list: {step_content_list}")
-
-            # if stepInfo["code"] == 0:
-            #     print(f"type: {step_content_list}")
 
             if not step_content_list:
                 stepContent = "NA" if len(step_content_list) == 0 else stepContent
@@ -651,10 +644,13 @@ def draw_instruction_content(doc, data):
 
             # Process all data items across all matching step content objects
             for content_obj in step_content_list:
-                if content_obj.get("code") != None:
+                if content_obj["step_type"] == 2 or content_obj["step_type"] == 5:
+                    programCode = "NA"
+                    if len(content_obj["metadata"]['programs']) > 0:
+                        programCode = '、'.join([code["programCode"] for code in content_obj["metadata"]['programs']])
                     p = cell.add_paragraph()
                     p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                    p.text = f"程式代碼：{content_obj['code']}"
+                    p.text = f"程式代碼：{programCode}"
                     createTable(cell, [content_obj])
 
                 for index, item_data in enumerate(content_obj.get("data", [])):
@@ -802,12 +798,14 @@ def get_docx(outpath, data, template = "docx-template/example3.docx"):
     styleNo = attribute["attribute"].get("styleNo")
 
     # Put placeholders like [DOC_NO], [REV], [DATE], [TOTAL_PAGES] in the header cells of your template.
-    title_mapping = { "DOC_NO": Doc_id, "DATE": Date, "REV": Version, "PAGE": "1", "TITLE": Title, "DOC_NAME": Doc_name, "PROJECT": "", "DOC_CODE": "FM-R-MF-AZ-052 Rev7.0"}
+    title_mapping = { "DOC_NO": Doc_id, "DATE": Date, "REV": Version, "PAGE": "1", "TITLE": Title, "DOC_NAME": Doc_name, "DOC_CODE": "FM-R-MF-AZ-052 Rev7.0"}
     if itemType != None:
         specifications = [clean_process_name(s["name"]) for s in attribute["attribute"].get("specification")]
         title_mapping["PROJECT"] = "_".join(specifications)
         title_mapping["ITEM_TYPE"]=  itemType
         title_mapping["STYLE_NO"] = styleNo.split("-", 1)[-1]
+    else:
+        title_mapping["PROJECT"] = attribute["attribute"]["applyProject"]
 
     info_mapping = {
         "REV1": "", "DATE1": "", "REASON1": "", "POINT1": "", "DEPT1": "", "APPROVER1": "", "CONFIRMER1": "", "AUTHOR1": "",

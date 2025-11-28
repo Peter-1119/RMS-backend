@@ -1,11 +1,8 @@
 from __future__ import annotations
-import json, uuid
+import re, json, uuid
 from decimal import Decimal, ROUND_HALF_UP
 from flask import jsonify
 
-import re
-import unicodedata
-from typing import Dict, List, Any
 from db import db
 from oracle_db import ora_cursor
 

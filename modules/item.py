@@ -23,7 +23,7 @@ def search():
                 JOIN IDBUSER.RMS_SYS_PROCESS p ON r.KTSCH = p.PROCESS_DESC
                 JOIN IDBUSER.RMS_SYS_TERMINAL t ON p.PROCESS_ID = t.PROCESS_ID
                 JOIN IDBUSER.RMS_SYS_MACHINE sm ON t.PDLINE_ID = sm.PDLINE_ID
-                WHERE REGEXP_LIKE(p.PROCESS_NAME, '^\([LR][0-8][[:digit:]]{2}-[[:digit:]]{2}\)') AND p.PROCESS_NAME NOT LIKE '%人工%' AND sm.ENABLED = 'Y' AND sm.EQM_ID <> 'NA' AND t.SFHNR LIKE '%-ST%'
+                WHERE REGEXP_LIKE(p.PROCESS_NAME, '^\([LR][0-8][[:digit:]]{2}-[[:digit:]]{2}\)') AND p.PROCESS_NAME NOT LIKE '%人工%' AND sm.ENABLED = 'Y' AND sm.EQM_ID <> 'NA' AND t.SFHNR LIKE '%-ST%' AND t.WERKS = '1011'
             """
 
             if specific != None:
@@ -66,7 +66,7 @@ def list_styles():
                         ELSE
                             T.MATNR
                      END) = :matnr
-                  AND T.SFHNR LIKE '%-ST%'
+                  AND T.SFHNR LIKE '%-ST%' AND T.WERKS = '1011'
                 GROUP BY SUBSTR(T.SFHNR, 1, LENGTH(T.SFHNR) - 1)
                 ORDER BY STYLE_NO
             """
@@ -100,7 +100,7 @@ def list_processes():
                 SELECT DISTINCT P.PROCESS_NAME, R.KTSCH AS PROCESS_DESC FROM IDBUSER.EZFLEX_ROUTING R
                 JOIN IDBUSER.EZFLEX_TOOL T ON R.MATNR = T.MATNR AND R.REVLV = T.REVLV AND R.VORNR = T.VORNR
                 JOIN IDBUSER.RMS_SYS_PROCESS P ON P.PROCESS_DESC = R.KTSCH
-                WHERE T.SFHNR = :sfhnr AND T.SFHNR LIKE '%-ST%' AND (CASE WHEN INSTR(T.MATNR, '-') > 0 THEN SUBSTR(T.MATNR, 1, INSTR(T.MATNR, '-') - 1) ELSE T.MATNR END) = :matnr
+                WHERE T.SFHNR = :sfhnr AND T.SFHNR LIKE '%-ST%' AND (CASE WHEN INSTR(T.MATNR, '-') > 0 THEN SUBSTR(T.MATNR, 1, INSTR(T.MATNR, '-') - 1) ELSE T.MATNR END) = :matnr AND T.WERKS = '1011'
                 ORDER BY R.KTSCH
             """
             cur.execute(sql, {"matnr": matnr, "sfhnr": sfhnr})

@@ -1,14 +1,13 @@
 # modules/docs.py
 from __future__ import annotations
-import json, datetime, os, uuid, re
-from io import BytesIO
+import datetime, os, uuid, re, json
 
 # Flask's send_file must be explicitly imported
 from flask import Blueprint, request, jsonify, send_file, after_this_request
 from db import db
+from oracle_db import ora_cursor as odb
 from utils import send_response, jload, jdump, dver, none_if_blank, new_token
 from DocxDefinition import get_docx
-
 
 BASE_DIR = "docxTemp"
 os.makedirs(BASE_DIR, exist_ok=True)
@@ -28,6 +27,32 @@ def init_doc():
           VALUES (%s,%s,%s,%s,1.00,NOW())
         """, (doc_type, None, 0, token))
     return jsonify({"success": True, "token": token})
+
+@bp.get("/get-personnel")
+def get_personnel():
+    emp_id = request.args.get("emp_id")
+    if emp_id == None:
+        return send_response(400, True, "工號未提供", {"message": "請提供工號"})
+    
+    try:
+        with odb() as cur:
+            sql = f"""
+                SELECT A.EMP_NO, A.EMPNAME, A.IN_DATE, C.EMP_NO, C.EMPNAME, B.LEV, E.EMP_NO, E.EMPNAME, D.LEV FROM IDBUSER.RMS_USERS A
+                INNER JOIN IDBUSER.RMS_DEPT B ON A.DEPT_NO = B.DEPT_NO
+                LEFT JOIN IDBUSER.RMS_USERS C ON B.LEADER_EMP_ID = C.EMP_NO
+                LEFT JOIN IDBUSER.RMS_DEPT D ON B.GL_DEPARTMENT_CODE = D.DEPT_NO
+                LEFT JOIN IDBUSER.RMS_USERS E ON D.LEADER_EMP_ID = E.EMP_NO
+                WHERE A.OUT_DATE IS NULL AND A.EMP_NO = '{emp_id}'
+            """
+            cur.execute(sql)
+            personnelInfo = cur.fetchall()[0]
+    
+    except Exception as e:
+        print(f"error result: {e}")
+        return send_response(400, True, "請求資料", {"message": "無法取得人員資料，請重新嘗試"})
+
+    personnel = {"confirmer": personnelInfo[4], "approver": personnelInfo[7]}
+    return send_response(200, True, "請求成功", {"personnel": personnel})
 
 @bp.post("/attributes/save")
 def save_attributes():
@@ -214,14 +239,13 @@ def save_params():
 
         for b in blocks:
             tier = int(b.get("tier_no", 1))
-            code = b.get("code") or f"XXXX{tier}"
 
             # Parameter table (sub 0)
             param_json = b.get("jsonParameterContent")  # TipTap JSON (optional)
             param_arr  = b.get("arrayParameterData") or []  # 2D array
             cur.execute(ins, (
                 new_token(), token, step_type, tier, 0, 2,
-                code, None,
+                None, None,
                 jdump(param_arr),  # content_text
                 jdump(param_json), # content_json
                 jdump([]),         # files
@@ -229,16 +253,17 @@ def save_params():
             ))
 
             # Condition table (sub 1)
-            cond_json = b.get("jsonConditionContent")
-            cond_arr  = b.get("arrayConditionData") or []
-            cur.execute(ins, (
-                new_token(), token, step_type, tier, 1, 2,
-                code, None,
-                jdump(cond_arr),
-                jdump(cond_json),
-                jdump([]),
-                jdump({"kind": "mcr-condition"})
-            ))
+            if step_type == 2:
+                cond_json = b.get("jsonConditionContent")
+                cond_arr  = b.get("arrayConditionData") or []
+                cur.execute(ins, (
+                    new_token(), token, step_type, tier, 1, 2,
+                    None, None,
+                    jdump(cond_arr),
+                    jdump(cond_json),
+                    jdump([]),
+                    jdump({"kind": "mcr-condition", **b.get("metadata", {})})
+                ))
 
     return jsonify({"success": True, "count": len(blocks)})
 
@@ -1397,12 +1422,10 @@ def generate_word():
         # 6) 檔名：用最新那一版
         try:
             # doc_name = _safe_docname(latest_attr.get("documentName") or latest_attr.get("documentID") or doc_id or "document")
-            print(f'1 {latest_attr.get("documentName")}{latest_attr.get("documentVersion"):.1f}')
             doc_name = _safe_docname(f'{latest_attr.get("documentName")}{latest_attr.get("documentVersion"):.1f}')
         except Exception:
             doc_name = "document"
 
-        print(f'3 doc_name: {doc_name}')
         out_path = os.path.join(BASE_DIR, f"{doc_name}.docx")
         # 產生 Word
         if data["attribute"][-1]["documentType"] == 1:
@@ -1441,11 +1464,9 @@ def generate_word():
         attr_last = data["attribute"][-1]
         # doc_name = _safe_docname(attr_last.get("documentName") or attr_last.get("documentID") or "document")
         doc_name = _safe_docname(f'{attr_last.get("documentName")}{attr_last.get("documentVersion"):.1f}')
-        print(f'2 {attr_last.get("documentName")}{attr_last.get("documentVersion"):.1f}')
     except Exception:
         doc_name = "document"
 
-    print(f'4 doc_name: {doc_name}')
     out_path = os.path.join(BASE_DIR, f"{doc_name}.docx")
     # 產生 Word
     if data["attribute"][-1]["documentType"] == 1:
@@ -1553,3 +1574,457 @@ def preview_docx():
         download_name=f"{doc_name}.docx",
         mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
+
+# ----------------------------------------------------------------------------------
+def build_prefix(spec_code: str) -> str:
+    """
+    spec_code: e.g. "R221-01"
+    回傳前 8 碼，例如: "RER22101"
+    """
+    sc = (spec_code or "").replace("-", "")[:6]  # R221-01 → R22101
+    return f"RE{sc:0<6}"                         # 不足補 0
+
+@bp.post("/program-codes/allocate")
+def allocate_program_code():
+    """
+    body: { specCode, document_token }
+    回傳: { specCode, programCode, prefix, serial }
+    """
+    body = request.get_json(silent=True) or {}
+    spec_code = (body.get("specCode") or "").strip()
+    document_token = (body.get("document_token") or "").strip()
+
+    if not spec_code or not document_token:
+        return send_response(400, False, "specCode & document_token 為必填", None)
+
+    prefix = build_prefix(spec_code)
+
+    with db(dict_cursor=True) as (conn, cur):
+        # ❌ 不要用 conn.start_transaction()，MySQLdb 沒這個 method
+        # conn.start_transaction()
+
+        # 1) 先看有沒有舊的釋放號碼可以重用（status=9）
+        cur.execute("""
+            SELECT id, serial_no, program_code
+            FROM rms_program_code
+            WHERE spec_code = %s AND status = 9
+            ORDER BY serial_no ASC
+            LIMIT 1
+            FOR UPDATE
+        """, (spec_code,))
+        row = cur.fetchone()
+
+        if row:
+            # 重用舊號碼，改成 reserved 狀態
+            cur.execute("""
+                UPDATE rms_program_code
+                SET status = 0,
+                    document_token = %s
+                WHERE id = %s
+            """, (document_token, row["id"]))
+            # 這裡可以不寫 conn.commit()，交給 db() 做
+            serial = row["serial_no"]
+            program_code = row["program_code"]
+        else:
+            # 2) 沒有可重用 → 取最大 serial_no + 1
+            cur.execute("""
+                SELECT MAX(serial_no) AS max_serial
+                FROM rms_program_code
+                WHERE spec_code = %s
+                FOR UPDATE
+            """, (spec_code,))
+            r = cur.fetchone()
+            max_serial = r["max_serial"] or 0
+            serial = max_serial + 1
+            program_code = f"{prefix}{serial:03d}"
+
+            # 寫入資料表
+            cur.execute("""
+                INSERT INTO rms_program_code
+                    (spec_code, serial_no, program_code, document_token, status)
+                VALUES (%s, %s, %s, %s, 0)
+            """, (spec_code, serial, program_code, document_token))
+            # 一樣可以不用手動 conn.commit()
+
+    data = {
+        "specCode": spec_code,
+        "programCode": program_code,
+        "prefix": prefix,
+        "serial": serial,
+    }
+    return send_response(200, True, "程式號碼配號成功", data)
+
+@bp.post("/program-codes/release")
+def release_program_code():
+    """
+    body: { programCode }
+    將 status 改成 9，document_token 清空 → 之後可重用
+    """
+    body = request.get_json(silent=True) or {}
+    program_code = (body.get("programCode") or "").strip()
+
+    if not program_code:
+        return send_response(400, False, "programCode 為必填", None)
+
+    with db(dict_cursor=True) as (conn, cur):
+        cur.execute("""
+            UPDATE rms_program_code
+            SET status = 9, document_token = NULL
+            WHERE program_code = %s
+        """, (program_code,))
+        # 你也可以檢查 rowcount 判斷有沒有真的更新到
+        conn.commit()
+
+    return send_response(200, True, "程式號碼已釋放", {"programCode": program_code})
+
+@bp.post("/program-codes/release-by-document")
+def release_program_codes_by_document():
+    """
+    body: { document_token }
+    將該文件底下 status=0(reserved) 的程式號碼全部改成 9 並清空 document_token
+    用在：刪除草稿 / 作廢文件時
+    """
+    body = request.get_json(silent=True) or {}
+    document_token = (body.get("document_token") or "").strip()
+
+    if not document_token:
+        return send_response(400, False, "document_token 為必填", None)
+
+    with db(dict_cursor=True) as (conn, cur):
+        cur.execute("""
+            UPDATE rms_program_code
+            SET status = 9, document_token = NULL
+            WHERE document_token = %s AND status = 0
+        """, (document_token,))
+        conn.commit()
+
+    return send_response(200, True, "程式號碼已釋放", {"document_token": document_token})
+
+@bp.post("/parameters/copy-source")
+def copy_source_mcr():
+    """
+    功能：從已簽核的 Instruction 文件中複製參數與條件表。
+    限制：
+    1. program_code 必須存在。
+    2. 來源文件的機台必須與 base_machine_code 具有相同的 PMS Slot 設置 (Oracle)。
+    3. 來源文件的機台必須與 base_machine_code 具有相同的 Condition Signature (MySQL)。
+    """
+    body = request.get_json(silent=True) or {}
+    program_code = (body.get("program_code") or "").strip()
+    base_machine_code = (body.get("base_machine_code") or "").strip()
+
+    if not program_code or not base_machine_code:
+        return send_response(400, False, "缺少必要參數", {"message": "請提供程式代碼與 Base Machine Code"})
+
+    print(f"[DEBUG] copy_source_mcr start: program={program_code}, base={base_machine_code}")
+
+    # ==========================================
+    # STEP 1: 找出所有 "PMS 相容" 的機台 (Oracle)
+    # ==========================================
+    pms_compatible_machines = set()
+    try:
+        with ora_cursor() as cur:
+            # 這裡沿用 filter-by-baseline 的邏輯，找出 PMS Slot 結構完全一致的機台
+            # 簡化 SQL：只要找出 "與 base_machine_code 擁有相同 slot 集合" 的機台
+            # (以下 SQL 為邏輯示意，若原 filter-by-baseline SQL 運作正常可直接套用)
+            sql = """
+            WITH target_slots AS (
+                SELECT SLOT_NAME FROM IDBUSER.RMS_FLEX_PMS WHERE MACHINE_CODE = :base_code
+            ),
+            target_count AS ( SELECT COUNT(*) as cnt FROM target_slots ),
+            candidates AS (
+                SELECT MACHINE_CODE, SLOT_NAME FROM IDBUSER.RMS_FLEX_PMS
+            )
+            SELECT DISTINCT A.MACHINE_CODE
+            FROM IDBUSER.RMS_SYS_MACHINE A
+            JOIN target_count tc ON 1=1
+            WHERE A.ENABLED = 'Y' AND A.EQM_ID <> 'NA'
+            AND (
+                -- Case 1: Base has slots
+                (tc.cnt > 0 
+                 AND EXISTS (SELECT 1 FROM candidates c WHERE c.MACHINE_CODE = A.MACHINE_CODE)
+                 -- A has all slots of Base
+                 AND NOT EXISTS (
+                    SELECT 1 FROM target_slots ts 
+                    WHERE NOT EXISTS (SELECT 1 FROM candidates c WHERE c.MACHINE_CODE = A.MACHINE_CODE AND c.SLOT_NAME = ts.SLOT_NAME)
+                 )
+                 -- Base has all slots of A
+                 AND NOT EXISTS (
+                    SELECT 1 FROM candidates c 
+                    WHERE c.MACHINE_CODE = A.MACHINE_CODE 
+                    AND NOT EXISTS (SELECT 1 FROM target_slots ts WHERE ts.SLOT_NAME = c.SLOT_NAME)
+                 )
+                )
+                OR
+                -- Case 2: Base has NO slots (only matches others with no slots)
+                (tc.cnt = 0 AND NOT EXISTS (SELECT 1 FROM candidates c WHERE c.MACHINE_CODE = A.MACHINE_CODE))
+            )
+            """
+            cur.execute(sql, {"base_code": base_machine_code})
+            rows = cur.fetchall()
+            pms_compatible_machines = {row[0] for row in rows}
+            
+            # 確保 base 自己一定在名單內
+            pms_compatible_machines.add(base_machine_code)
+
+    except Exception as e:
+        print(f"[ERROR] Oracle PMS check failed: {e}")
+        return send_response(400, False, "PMS 資料比對失敗", {"message": "無法驗證機台 PMS 相容性"})
+
+    # ==========================================
+    # STEP 2: 找出 "Condition 相容" 的機台 (MySQL)
+    # ==========================================
+    # 在 PMS 相容的名單中，進一步篩選條件式樣 (Condition Signature) 相同的機台
+    final_compatible_machines = []
+    
+    if not pms_compatible_machines:
+        # 如果 Oracle 沒資料，至少自己跟自己相容
+        final_compatible_machines = [base_machine_code]
+    else:
+        try:
+            with db() as (conn, cur):
+                # 建構動態 UNION ALL 查詢來模擬 CTE
+                pms_list = list(pms_compatible_machines)
+                union_parts = [f"SELECT '{m}' as m_code" for m in pms_list]
+                union_sql = " UNION ALL ".join(union_parts)
+
+                sql = f"""
+                WITH input_machines AS (
+                    {union_sql}
+                ),
+                machine_sigs AS (
+                    SELECT 
+                        im.m_code,
+                        (
+                            SELECT GROUP_CONCAT(rgm.condition_id ORDER BY rgm.condition_id SEPARATOR ',')
+                            FROM sfdb.rms_group_machines rgm
+                            WHERE rgm.machine_id = im.m_code
+                        ) as sig
+                    FROM input_machines im
+                ),
+                base_sig AS (
+                    SELECT sig FROM machine_sigs WHERE m_code = %s
+                )
+                SELECT ms.m_code
+                FROM machine_sigs ms
+                JOIN base_sig bs ON (ms.sig IS NULL AND bs.sig IS NULL) OR (ms.sig = bs.sig)
+                """
+                cur.execute(sql, (base_machine_code,))
+                rows = cur.fetchall()
+                final_compatible_machines = [r[0] for r in rows]
+
+        except Exception as e:
+            print(f"[ERROR] MySQL Condition check failed: {e}")
+            # Fallback: 如果 DB 查失敗，保守起見只允許 Base Machine 自己
+            final_compatible_machines = [base_machine_code]
+
+    print(f"[DEBUG] Allowed machines: {final_compatible_machines}")
+
+    # ==========================================
+    # STEP 3: 查詢已簽核文件 (Source Document)
+    # ==========================================
+    # 策略：
+    # 1. 搜尋所有包含該 program_code 的已簽核 Instruction (status=2, type=0)
+    # 2. 檢查該文件的 "machines" 屬性是否包含在 final_compatible_machines 內
+    
+    try:
+        with db() as (conn, cur):
+            sql = """
+            SELECT 
+                bc.document_token,
+                d.attribute,
+                bc.content_json as param_json,
+                (
+                    SELECT sub.content_json 
+                    FROM sfdb.rms_block_content sub 
+                    WHERE sub.document_token = bc.document_token 
+                      AND sub.step_type = 2 
+                      AND sub.sub_no = 1 
+                    LIMIT 1
+                ) as cond_json,
+                bc.metadata  -- [New] 新增撈取 metadata
+            FROM sfdb.rms_block_content bc
+            JOIN sfdb.rms_document_attributes d ON d.document_token = bc.document_token
+            WHERE d.status = 2
+              AND d.document_type = 0
+              AND bc.step_type = 2
+              AND bc.sub_no = 0
+              AND JSON_UNQUOTE(JSON_EXTRACT(bc.metadata, '$.kind')) = 'mcr-parameter'
+              AND JSON_SEARCH(bc.metadata, 'one', %s, NULL, '$.programs[*].programCode') IS NOT NULL
+            ORDER BY d.issue_date DESC
+            """
+            
+            cur.execute(sql, (program_code,))
+            candidates = cur.fetchall()
+
+            target_param_json = None
+            target_cond_json = None
+            target_programs = [] # [New] 用來存儲來源的製程清單
+            found_machine = False
+
+            for row in candidates:
+                doc_token, attr_str, param_str, cond_str, meta_str = row # [New] 接收 meta_str
+                
+                try:
+                    attr = json.loads(attr_str) if attr_str else {}
+                    doc_machines = attr.get('machines', [])
+                    doc_machine_codes = set(m.get('code') for m in doc_machines if m.get('code'))
+                except:
+                    continue
+
+                compatible_in_doc = doc_machine_codes.intersection(set(final_compatible_machines))
+                
+                if compatible_in_doc:
+                    found_machine = True
+                    target_param_json = json.loads(param_str) if param_str else None
+                    target_cond_json = json.loads(cond_str) if cond_str else None
+                    
+                    # [New] 解析 metadata 取得 programs
+                    try:
+                        meta = json.loads(meta_str) if meta_str else {}
+                        # 取得來源的 programs (包含 specCode, specName)
+                        # 我們只需要 spec 資訊，舊的 programCode 在這裡其實不需要傳回前端，
+                        # 因為前端要申請新的，但為了完整性可以先傳回。
+                        target_programs = meta.get("programs") or []
+                    except Exception as e:
+                        print(f"[WARN] Parse metadata failed: {e}")
+                        target_programs = []
+
+                    print(f"[DEBUG] Found compatible doc: {doc_token}, machines: {compatible_in_doc}")
+                    break
+            
+            if not found_machine:
+                return send_response(200, False, "條件參數不同無法複製", {
+                    "message": "雖有此代碼，但所屬機台的條件/PMS與目前機台不相容，無法複製。"
+                })
+
+            return send_response(200, True, "複製成功", {
+                "blocks": {
+                    "param_json": target_param_json,
+                    "cond_json": target_cond_json,
+                    "source_programs": target_programs # [New] 回傳製程清單
+                }
+            })
+
+    except Exception as e:
+        print(f"[ERROR] Fetch doc failed: {e}")
+        return send_response(500, False, "系統錯誤", {"message": str(e)})
+    
+# modules/docs.py
+@bp.post("/parameters/copy-spec-source")
+def copy_spec_source_mcr():
+    """
+    處理需求 7: 從 Specification Document 複製參數
+    """
+    body = request.get_json(silent=True) or {}
+    program_code = (body.get("program_code") or "").strip()
+
+    if not program_code:
+        return send_response(400, False, "請輸入程式代碼", None)
+
+    try:
+        # -------------------------------------------------------
+        # STEP 1: 找出對應的 Source Block [需求 7 & 7.4]
+        # -------------------------------------------------------
+        with db() as (conn, cur):
+            sql = """
+            SELECT 
+                bc.content_json,
+                bc.content_text,  -- 用於解析當下的 PMS 結構
+                bc.metadata,
+                d.document_token
+            FROM sfdb.rms_block_content bc
+            JOIN sfdb.rms_document_attributes d ON d.document_token = bc.document_token
+            WHERE d.status = 2            -- [需求 7] status = 2 (已簽核)
+              AND d.document_type = 1     -- [需求 7] document_type = 1 (Spec Doc)
+              AND bc.step_type = 5        -- [需求 7.4] step_type = 5
+              AND bc.sub_no = 0           -- [需求 7.4] sub_no = 0
+              AND JSON_UNQUOTE(JSON_EXTRACT(bc.metadata, '$.kind')) = 'mcr-parameter'
+              AND JSON_SEARCH(bc.metadata, 'one', %s, NULL, '$.programs[*].programCode') IS NOT NULL
+            LIMIT 1
+            """
+            cur.execute(sql, (program_code,))
+            row = cur.fetchone()
+
+            if not row:
+                return send_response(200, False, "查無此代碼或文件不符合複製條件 (需為已簽核規格書)", None)
+
+            content_json_str, content_text_str, meta_str, doc_token = row
+            
+            meta = json.loads(meta_str) if meta_str else {}
+            machine_code = meta.get("machine") or ""
+            group_code = meta.get("machineGroup") or ""
+
+            if not machine_code:
+                return send_response(200, False, "來源資料異常：無機台資訊", None)
+
+            # -------------------------------------------------------
+            # STEP 2: [需求 7.1 & 7.3] PMS 比對
+            # -------------------------------------------------------
+            
+            # 2.1 取得 Oracle 目前最新的 PMS
+            # [需求 7.1] PARAM_COMPARE='Y' AND SET_ATTRIBUTE='Y'
+            current_pms_signature = set()
+            try:
+                with ora_cursor() as ora:
+                    ora.execute("""
+                        SELECT TRIM(SLOT_NAME), TRIM(PARAMETER_DESC)
+                        FROM IDBUSER.RMS_FLEX_PMS
+                        WHERE MACHINE_CODE = :m 
+                          AND NVL(PARAM_COMPARE, 'N') = 'Y' 
+                          AND NVL(SET_ATTRIBUTE, 'N') = 'Y'
+                    """, {"m": machine_code})
+                    for r in ora.fetchall():
+                        # [需求 7.3] 比較 SLOT_NAME 與 PARAMETER_DESC
+                        current_pms_signature.add((r[0], r[1]))
+            except Exception as e:
+                print(f"[PMS Check] Oracle Error: {e}")
+                return send_response(400, False, "PMS 驗證失敗：無法連接 MES", None)
+
+            # 2.2 解析 Source Block 的 PMS 結構 (從 content_text)
+            source_pms_signature = set()
+            try:
+                # content_text 格式範例: [["Slot","Param",...], ["SlotA","ParamA",...]]
+                text_arr = json.loads(content_text_str) if content_text_str else []
+                
+                # 跳過 Header (第一列)
+                if len(text_arr) > 1:
+                    for row_data in text_arr[1:]:
+                        if len(row_data) >= 2:
+                            slot = str(row_data[0]).strip()
+                            # 需注意：前端表格中的 Parameter Desc 可能包含 "(單位)"
+                            # 如果 Oracle 的 DESC 沒有單位，這裡比對會失敗。
+                            # 建議：先嘗試比對 Slot Name，這最準確且不易受單位顯示影響
+                            # [需求 7.3] 若要嚴格比對 Desc，需確保格式一致
+                            # 這裡我們先採用 Slot Name 比對作為主要依據，因為這是硬體結構
+                            if slot:
+                                source_pms_signature.add(slot)
+            except Exception as e:
+                print(f"[PMS Check] Parse JSON Error: {e}")
+
+            # 2.3 執行比對
+            # 為了避免單位括號造成的誤判，我們這裡主要比對 Slot 是否一致
+            current_slots = {k[0] for k in current_pms_signature}
+            
+            # 如果 Slot 集合不一致，視為 PMS 變更
+            if source_pms_signature != current_slots:
+                 return send_response(200, False, "PMS版本不符", {
+                    "message": f"機台 PMS 設定已變更，無法複製。\n(來源 Slot 與目前 MES 設定不符)"
+                })
+
+            # -------------------------------------------------------
+            # STEP 3: 回傳資料
+            # -------------------------------------------------------
+            return send_response(200, True, "複製成功", {
+                "blocks": {
+                    "content_json": json.loads(content_json_str) if content_json_str else None,
+                    "machine": machine_code,
+                    "machineGroup": group_code,
+                    # 注意：我們不回傳 programCode，因為前端要自己配新的 (需求 7.5)
+                }
+            })
+
+    except Exception as e:
+        print(f"[ERROR] copy_spec_source: {e}")
+        return send_response(500, False, "系統錯誤", {"message": str(e)})
+    

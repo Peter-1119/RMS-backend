@@ -57,11 +57,10 @@ def groups_machines():
         elif spec_map != None and len(spec_map) == 0:
             return send_response(200, False, "請求成功", {"groups": out})
         
-        if len(spec_map) > 0:
+        if spec_map != None and len(spec_map) > 0:
             spec_map = list(spec_map) if len(spec_map) > 1 else spec_map.pop()
         elif spec_map == None and specific != None:
             spec_map = specific
-
 
     try:
         out = {}
@@ -175,13 +174,14 @@ def filter_by_baseline():
         spec_map = set(spec_map_by_project)
 
         if len(spec_map) == 0:  # There is no any specification in project
+            print("1")
             return send_response(200, False, "查詢成功", {"groups": {}})
 
         elif specific != None and specific not in spec_map:  # Argument specification conflict with project
+            print("2")
             return send_response(400, False, "查詢失敗", {"message": "查詢條件互相衝突請重新確認"})
 
-        elif specific != None:  # specific belong
-            spec_map = list(spec_map) if len(spec_map) > 1 else spec_map.pop()
+        spec_map = list(spec_map) if len(spec_map) > 1 else spec_map.pop()
     
     # If no project input just get specific
     elif specific != None:
