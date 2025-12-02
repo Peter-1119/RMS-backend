@@ -251,10 +251,14 @@ def update_p(p, mapping):
     p.runs[0].text = str(mapping[full_text])
 
 def replace_in_footer(footer, title_mapping):
-    p = footer.paragraphs[0]
-    full_text = p.runs[0].text
-    if title_mapping.get(full_text) != None:
-        p.runs[0].text = title_mapping[full_text]
+    for row in footer.tables[0].rows:
+        for cell in row.cells:
+            for p in cell.paragraphs:
+                update_p(p, title_mapping)
+    # p = footer.paragraphs[0]
+    # full_text = p.runs[0].text
+    # if title_mapping.get(full_text) != None:
+    #     p.runs[0].text = title_mapping[full_text]
 
 def replace_in_header(header, title_mapping):
     # tables in header
@@ -568,12 +572,12 @@ def createPictures(cell, step_content_list):
                     # p = cell.add_paragraph(f"圖片連結: {file_info.get('url', 'N/A')}")
                     # p.runs[0].font.size = Pt(10)
                     # p.paragraph_format.left_indent = base_indent * indent_factor
-                    if file_info.get("url") != None:
+                    if file_info.get("path_to_save") != None:
                         p = cell.add_paragraph()
                         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                        src = file_info["url"].split("/", 1)[-1]
+                        src = file_info["path_to_save"].split("/", 1)[-1]
                         run = p.add_run()
-                        run.add_picture(src, width = Cm(width / 2 - 0.5))
+                        run.add_picture(f'uploads/temp/{src}', width = Cm(width / 2 - 0.5))
 
 def createTable(cell, step_content_list):
     """Adds tables (jsonContent containing a table) for all items in the list to the cell."""
@@ -646,6 +650,7 @@ def draw_instruction_content(doc, data):
             for content_obj in step_content_list:
                 if content_obj["step_type"] == 2 or content_obj["step_type"] == 5:
                     programCode = "NA"
+                    print(f"content_obj: {type(content_obj)}")
                     if len(content_obj["metadata"]['programs']) > 0:
                         programCode = '、'.join([code["programCode"] for code in content_obj["metadata"]['programs']])
                     p = cell.add_paragraph()
@@ -786,7 +791,6 @@ def clean_process_name(raw: str) -> str:
     return m.group(2).strip() if m else raw
 
 def get_docx(outpath, data, template = "docx-template/example3.docx"):
-    # Get document fundamental attribute
     attribute = data["attribute"][-1]
     Doc_id = attribute["documentID"]
     Date = datetime.now().strftime("%Y/%m/%d")
@@ -797,21 +801,34 @@ def get_docx(outpath, data, template = "docx-template/example3.docx"):
     itemType = attribute["attribute"].get("itemType")
     styleNo = attribute["attribute"].get("styleNo")
 
-    # Put placeholders like [DOC_NO], [REV], [DATE], [TOTAL_PAGES] in the header cells of your template.
-    title_mapping = { "DOC_NO": Doc_id, "DATE": Date, "REV": Version, "PAGE": "1", "TITLE": Title, "DOC_NAME": Doc_name, "DOC_CODE": "FM-R-MF-AZ-052 Rev7.0"}
-    if itemType != None:
+    # 👇 新增 documentKey（每次下載的唯一 key）
+    doc_key = attribute.get("documentKey", "")
+
+    title_mapping = {
+        "DOC_NO": Doc_id,
+        "DATE": Date,
+        "REV": Version,
+        "PAGE": "1",
+        "TITLE": Title,
+        "DOC_NAME": Doc_name,
+        "DOC_KEY": doc_key,              # 👈 你可以在 footer 放 [DOC_KEY]
+    }
+    if itemType is not None:
         specifications = [clean_process_name(s["name"]) for s in attribute["attribute"].get("specification")]
         title_mapping["PROJECT"] = "_".join(specifications)
         title_mapping["ITEM_TYPE"]=  itemType
         title_mapping["STYLE_NO"] = styleNo.split("-", 1)[-1]
     else:
-        title_mapping["PROJECT"] = attribute["attribute"]["applyProject"]
+        title_mapping["PROJECT"] = attribute["attribute"].get("applyProject")
 
     info_mapping = {
         "REV1": "", "DATE1": "", "REASON1": "", "POINT1": "", "DEPT1": "", "APPROVER1": "", "CONFIRMER1": "", "AUTHOR1": "",
         "REV2": "", "DATE2": "", "REASON2": "", "POINT2": "", "DEPT2": "", "APPROVER2": "", "CONFIRMER2": "", "AUTHOR2": "",
         "REV3": "", "DATE3": "", "REASON3": "", "POINT3": "", "DEPT3": "", "APPROVER3": "", "CONFIRMER3": "", "AUTHOR3": ""
     }
+
+    # 若你要在內容 table 裡也顯示 key，可以這樣放：
+    # info_mapping["DOC_KEY"] = doc_key
 
     # Place document attribute into Word
     for index, attribute in enumerate(data["attribute"]):
