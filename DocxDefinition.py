@@ -4,7 +4,7 @@ from enum import Enum
 
 from docx import Document
 from docx.shared import Cm, Pt, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_UNDERLINE
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_ALIGN_VERTICAL
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
@@ -53,21 +53,58 @@ def clear_paragraph(p):
     for r in p.runs:
         r._element.getparent().remove(r._element)
 
-def add_simple_field(paragraph, instr):
+from docx.shared import Pt, RGBColor
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+
+def add_simple_field(paragraph, instr, font_size=None, hidden=False, color=None):
     """
     在 paragraph 中插入一個簡單欄位，例如:
       instr = "PAGE" 或 "NUMPAGES"
-    實際出現會交給 Word 自己更新。
+    font_size: Pt(...) / 數字 (例如 10.5)，會轉成半點數給 w:sz
+    hidden: True => 使用 w:vanish 隱藏這個 run
+    color: RGBColor(...)，可選 (例如 RGBColor(255, 255, 255) = 白色)
     """
     fld = OxmlElement('w:fldSimple')
     fld.set(qn('w:instr'), instr)  # e.g. "PAGE", "NUMPAGES"
 
     r = OxmlElement('w:r')
-    t = OxmlElement('w:t')
-    t.text = "1"   # 只是 placeholder，開啟文件時 Word 會更新
-    r.append(t)
-    fld.append(r)
 
+    # ---- run properties (rPr) ----
+    rPr = OxmlElement('w:rPr')
+
+    # 字型大小
+    if font_size is not None:
+        # Word 的 w:sz 是「半點數」：10.5pt => 21
+        val = int(round(float(font_size) * 2))
+        sz = OxmlElement('w:sz')
+        sz.set(qn('w:val'), str(val))
+        rPr.append(sz)
+
+        szCs = OxmlElement('w:szCs')  # complex script size，順便設
+        szCs.set(qn('w:val'), str(val))
+        rPr.append(szCs)
+
+    # 顏色
+    if color is not None:
+        color_el = OxmlElement('w:color')
+        color_el.set(qn('w:val'), f"{color.rgb:06X}" if hasattr(color, "rgb") else color)
+        # 如果用 RGBColor，就使用 color.rgb；如果直接傳 "FFFFFF" 也可以
+        rPr.append(color_el)
+
+    # 隱藏文字 (預設 Word 不顯示)
+    if hidden:
+        vanish = OxmlElement('w:vanish')
+        rPr.append(vanish)
+
+    r.append(rPr)
+
+    # 內容本身只是 placeholder，Word 會自己更新
+    t = OxmlElement('w:t')
+    t.text = "1"
+    r.append(t)
+
+    fld.append(r)
     paragraph._p.append(fld)
     return paragraph
 
@@ -86,46 +123,42 @@ def set_section_start_page(section, start_num: int = 0):
 
 def setup_page_numbers(doc):
     """
-    1. 啟用第一頁不同頁首。
-    2. 第一頁 header 的 table (第 0 個) 第二列第五欄 -> NUMPAGES (總頁數)
-    3. 其他頁 header 的 table 第二列第五欄 -> PAGE (目前頁碼)
-       並把 section 起始頁碼設成 0，讓第 2 頁顯示 1，第三頁顯示 2...
+    第一頁 header：放一個「隱藏的 NUMPAGES」+ 一個正常顯示的 NUMPAGES
+    其他頁 header：放 PAGE
     """
-    section = doc.sections[1]
-
-    # 1) 第一頁不同頁首
-    # section.different_first_page_header_footer = True
-
-    # 2) 設定 section 起始頁碼為 0（第一頁是 0，第二頁是 1...）
-    # set_section_start_page(section, start_num=0)
-
-    # 3) 第一頁 header：總頁數 NUMPAGES
-    first_header = doc.sections[0].header  # 第一頁專用 header
+    # 第一頁 header
+    first_header = doc.sections[0].header
     if first_header and first_header.tables:
         tbl_first = first_header.tables[0]
-        # 第二列第五欄： rows[1].cells[4]
-        cell_total = tbl_first.rows[1].cells[10]
+        cell_total = tbl_first.rows[1].cells[10]   # 你原本用的那格
+
         if cell_total.paragraphs:
             p_total = cell_total.paragraphs[0]
         else:
             p_total = cell_total.add_paragraph()
 
         clear_paragraph(p_total)
-        # 這裡只塞總頁數，例如 "3"
-        add_simple_field(p_total, "NUMPAGES")
 
-    # 4) 其他頁 header：頁碼 PAGE（會是 1,2,3... 因為起始頁碼設為 0）
+        # (1) 隱藏的 NUMPAGES：促使 Word 重算整份文件
+        add_simple_field(p_total,"NUMPAGES",font_size=1,hidden=True)
+
+        # (2) 正常顯示的 NUMPAGES
+        add_simple_field(p_total, "NUMPAGES", font_size=10.5)
+
+    # 其他頁 header：顯示頁碼 PAGE
     normal_header = doc.sections[1].header
     if normal_header and normal_header.tables:
         tbl_other = normal_header.tables[0]
         cell_page = tbl_other.rows[1].cells[5]
+
         if cell_page.paragraphs:
             p_page = cell_page.paragraphs[0]
         else:
             p_page = cell_page.add_paragraph()
 
         clear_paragraph(p_page)
-        add_simple_field(p_page, "PAGE")
+
+        add_simple_field(p_page, "PAGE", font_size=10.5)
 
 # Extract plain text and "first seen" color from a cell JSON (your ProseMirror-ish structure).
 def _extract_text_and_color_from_cell_json(cell_json, COLOR_DICT):
@@ -249,6 +282,7 @@ def update_p(p, mapping):
         r.text = ""
 
     p.runs[0].text = str(mapping[full_text])
+    set_run_node_text_font_style(p.runs[0])
 
 def replace_in_footer(footer, title_mapping):
     for row in footer.tables[0].rows:
@@ -277,9 +311,29 @@ def set_repeat_table_header(row):
     return row
 
 # --- New Content Generation Helper Functions ---
+def set_run_node_text_font_style(run_node):
+    # 基本字型：英文 Arial，中文 標楷體
+    run_node.font.name = "Arial"
+
+    r = run_node._element  # CT_R
+    # ⭐ 正確取得/建立 <w:rPr>
+    rPr = r.get_or_add_rPr()
+
+    # ⭐ 取得/建立 <w:rFonts>
+    rFonts = rPr.rFonts
+    if rFonts is None:
+        rFonts = OxmlElement("w:rFonts")
+        rPr.append(rFonts)
+
+    # 設定字型：英文 + 中文
+    rFonts.set(qn("w:ascii"), "Arial")
+    rFonts.set(qn("w:hAnsi"), "Arial")
+    rFonts.set(qn("w:eastAsia"), "標楷體")
+
 def set_table_run_text(p_node, text, color = COLOR_DICT['#000']):
     run = p_node.add_run(text)
     run.font.color.rgb = color
+    set_run_node_text_font_style(run)
     if color == COLOR_DICT["#0000ff"]:
         run.underline = True
 
@@ -296,6 +350,158 @@ def set_docx_table_cell_text(cell_node, text, color = COLOR_DICT["#000"], vCente
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
     return p
+
+# ----- helper function for table merge processing and cell filling ----- #
+def _extract_tiptap_table(json_table_data):
+    """
+    接受整個 doc 或 table node,
+    回傳 table_node 與 rows_data(list of tableRow)
+    """
+    node_type = json_table_data.get("type")
+    if node_type == "doc":
+        # doc -> 第一個 table
+        table_node = next(
+            (n for n in json_table_data.get("content", []) if n.get("type") == "table"),
+            None
+        )
+    elif node_type == "table":
+        table_node = json_table_data
+    else:
+        table_node = None
+
+    if not table_node:
+        return None, []
+
+    rows_data = [r for r in table_node.get("content", []) if r.get("type") == "tableRow"]
+    return table_node, rows_data
+
+def _compute_table_size(rows_data):
+    """
+    根據 TipTap 的 colspan / rowspan 計算邏輯上的 rowCount, colCount
+    colCount = 每一 row 的 colspan 加總的最大值
+    rowCount = rows_data 的長度
+    """
+    rowCount = len(rows_data)
+    colCount = 0
+
+    for row in rows_data:
+        cells = [c for c in row.get("content", []) if c.get("type") in ["customTableCell", "tableCell", "tableHeader"]]
+        col_span_sum = 0
+        for cell in cells:
+            attr = cell.get("attrs", {}) or {}
+            col_span_sum += int(attr.get("colspan", 1) or 1)
+        colCount = max(colCount, col_span_sum)
+
+    return rowCount, colCount
+
+def _build_span_grid(rows_data, rowCount, colCount):
+    """
+    建一個 rowCount x colCount 的矩陣 grid
+    grid[r][c] = {
+       "is_anchor": bool,
+       "cell_data": cell_json or None,
+       "rowspan": int,
+       "colspan": int,
+    }
+    非 anchor 的被覆蓋格子也會填一格 {is_anchor: False, ...}
+    """
+    # 初始化為 None
+    grid = [[None for _ in range(colCount)] for _ in range(rowCount)]
+
+    for r_idx, row in enumerate(rows_data):
+        cells = [c for c in row.get("content", []) if c.get("type") in ["customTableCell", "tableCell", "tableHeader"]]
+
+        c_idx = 0  # 目前要填入的 column index
+        for cell in cells:
+            # 找到下一個空的 column
+            while c_idx < colCount and grid[r_idx][c_idx] is not None:
+                c_idx += 1
+            if c_idx >= colCount:
+                break  # 超出，理論上不會發生，防禦一下
+
+            attr = cell.get("attrs", {}) or {}
+            colspan = int(attr.get("colspan", 1) or 1)
+            rowspan = int(attr.get("rowspan", 1) or 1)
+
+            # 錨點
+            grid[r_idx][c_idx] = {
+                "is_anchor": True,
+                "cell_data": cell,
+                "rowspan": rowspan,
+                "colspan": colspan,
+            }
+
+            # 填入被覆蓋的格子（非錨點）
+            for dr in range(rowspan):
+                for dc in range(colspan):
+                    rr = r_idx + dr
+                    cc = c_idx + dc
+                    if rr == r_idx and cc == c_idx:
+                        continue  # 錨點已填
+                    if rr < rowCount and cc < colCount:
+                        grid[rr][cc] = {
+                            "is_anchor": False,
+                            "cell_data": None,
+                            "rowspan": 0,
+                            "colspan": 0,
+                        }
+
+            c_idx += colspan
+
+    return grid
+
+def _fill_docx_cell_from_tiptap(docx_cell, cell_data, COLOR_DICT):
+    """
+    把 TipTap 的 cell_data 內容寫進 python-docx 的 cell
+    保留你原本的 dropdown / paragraph / image 邏輯
+    """
+    attr = cell_data.get("attrs", {}) or {}
+    dropdownValue = attr.get("dropdownValue")
+
+    # 清掉 cell 內原本的空段落
+    docx_cell.text = ""
+
+    if dropdownValue:
+        p = set_docx_table_cell_text(
+            docx_cell,
+            dropdownValue,
+            color=COLOR_DICT.get(attr.get("dropdownColor")),
+            vCenter=True,
+            center=True,
+        )
+        p.paragraph_format.keep_together = True
+        return
+
+    items = cell_data.get("content", []) or []
+    first_para = True
+
+    for item in items:
+        if item.get("type") != "paragraph":
+            continue
+
+        # 第一個 paragraph 用現有的，之後用 add_paragraph
+        p = docx_cell.paragraphs[0] if first_para and docx_cell.paragraphs else docx_cell.add_paragraph()
+        first_para = False
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+        for text_item in item.get("content", []) or []:
+            if text_item.get("type") == "text":
+                marks = text_item.get("marks")
+                run = p.add_run(text_item.get("text", ""))
+                set_run_node_text_font_style(run)
+                if marks:
+                    # 假設只有一種 color mark
+                    color_key = marks[0].get("attrs", {}).get("color")
+                    if color_key in COLOR_DICT:
+                        run.font.color.rgb = COLOR_DICT[color_key]
+                    run.underline = True
+
+            elif text_item.get("type") == "image":
+                src = text_item["attrs"]["src"].split("/", 3)[-1]
+                run = p.add_run()
+                # 以目前 cell 寬度大概估一下圖片寬度
+                cell_width_cm = docx_cell.width.cm if hasattr(docx_cell, "width") else 4
+                run.add_picture(src, width=Cm(max(cell_width_cm - 0.5, 0.5)))
 
 def create_docx_table(cell, json_table_data):
     rows_data = [row for row in json_table_data.get("content", []) if row.get("type") == "tableRow"]
@@ -314,48 +520,55 @@ def create_docx_table(cell, json_table_data):
 
     # If NOT a spec table, render as-is (your original behavior)
     if pos is None:
-        table = cell.add_table(rows=0, cols=len(row0_cells_json))
-        table.width = cell.width.cm - Cm(1)
-        table.style = 'Table Grid'
-        # write all rows/cells like your previous logic
-        for rowIndex, row_data in enumerate(rows_data):
-            cells_data = [c for c in row_data.get("content", []) if c.get("type") in ["customTableCell", "tableCell", "tableHeader"]]
-            row = table.add_row()
-            row.allow_row_break_across_pages = False
-            if rowIndex == 0:
-                set_repeat_table_header(row)
-            for i in range(len(cells_data)):
-                cell_data = cells_data[i]  # get cell data
+        # 1) 抓 table / rows
+        table_node, rows_data = _extract_tiptap_table(json_table_data)
+        if not rows_data:
+            return
 
-                docx_cell = row.cells[i]  # get docx table cell
-                width = docx_cell.width.cm
+        # 2) 計算 rowCount / colCount
+        rowCount, colCount = _compute_table_size(rows_data)
 
-                attr = cell_data.get("attrs", {}) or {}
-                dropdownValue = attr.get("dropdownValue")
-                if dropdownValue:
-                    p = set_docx_table_cell_text(docx_cell, dropdownValue, color = COLOR_DICT.get(attr.get("dropdownColor")), vCenter = True, center = True)
-                    p.paragraph_format.keep_together = True
-                    continue
+        # 3) 建立 span grid
+        grid = _build_span_grid(rows_data, rowCount, colCount)
 
-                # normal paragraphs/images
-                items = cell_data.get("content", []) or []
-                for idx, item in enumerate(items):
-                    if item.get("type") == "paragraph":
-                        p = docx_cell.paragraphs[0] if idx == 0 else docx_cell.add_paragraph()
-                        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                        for text_item in item.get("content", []) or []:
-                            if text_item.get("type") == "text":
-                                marks = text_item.get("marks")
+        # 4) 建立 docx table（一次給足 rows / cols）
+        table = cell.add_table(rows=rowCount, cols=colCount)
+        table.style = "Table Grid"
+        # 如果你有想控制寬度，可以在外面處理，這裡先略過
+        # table.width = cell.width.cm - Cm(1)
 
-                                run = p.add_run(text_item.get("text",""))
-                                if marks != None:
-                                    run.font.color.rgb = COLOR_DICT[marks[0]["attrs"]["color"]]
-                                    run.underline = True
+        # 設定 header repeat（第一 row 視為 header）
+        if rowCount > 0:
+            set_repeat_table_header(table.rows[0])
 
-                            elif text_item.get("type") == "image":
-                                src = text_item["attrs"]["src"].split("/", 3)[-1]
-                                run = p.add_run()
-                                run.add_picture(src, width=Cm(max(width - 0.5, 0.5)))
+        # 5) 先填內容，同時記錄 spanMap
+        spanMap = {}  # (r,c) -> (rowspan, colspan)
+
+        for r in range(rowCount):
+            for c in range(colCount):
+                info = grid[r][c]
+                if not info or not info.get("is_anchor"):
+                    continue  # 非錨點 cell，不用填內容，只等之後 merge
+
+                cell_data = info["cell_data"]
+                rowspan = int(info.get("rowspan", 1) or 1)
+                colspan = int(info.get("colspan", 1) or 1)
+
+                docx_cell = table.rows[r].cells[c]
+
+                # 寫入實際內容
+                _fill_docx_cell_from_tiptap(docx_cell, cell_data, COLOR_DICT)
+
+                # 有合併才記錄
+                if rowspan > 1 or colspan > 1:
+                    spanMap[(r, c)] = (rowspan, colspan)
+
+        # 6) 全部內容填完，再進行 merge
+        for (r, c), (rowspan, colspan) in spanMap.items():
+            first = table.cell(r, c)
+            last = table.cell(r + rowspan - 1, c + colspan - 1)
+            first.merge(last)
+
         return
 
     # ---------- SPEC TABLE TRANSFORMATION ----------
@@ -397,6 +610,7 @@ def create_docx_table(cell, json_table_data):
     set_repeat_table_header(hdr)
     for j, title in enumerate(new_header_titles):
         hdr.cells[j].text = title
+        set_run_node_text_font_style(hdr.cells[j].paragraphs[0].runs[0])
         hdr.cells[j].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
         hdr.cells[j].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
 
@@ -519,6 +733,7 @@ def parse_json_content(parent_object, json_data, indent = None, header = False, 
                     marks = item.get("marks", [])
                     color = COLOR_DICT[marks[0].get("attrs", {"color": "#000"}).get("color")] if len(marks) > 0 else COLOR_DICT["#000"]
                     run = set_table_run_text(p, item.get("text", ""), color)
+                    set_run_node_text_font_style(run)
                     run.font.size = Pt(12)
 
 
@@ -622,6 +837,7 @@ def draw_instruction_content(doc, data):
         p_title = cell.paragraphs[0] if stepIndex == 0 else cell.add_paragraph()
         p_title.text = f"{stepIndex + 1}.{step}"
         p_title.runs[0].font.size = Pt(12)
+        set_run_node_text_font_style(p_title.runs[0])
         p_title.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
         # 2. Get current step content
@@ -632,6 +848,7 @@ def draw_instruction_content(doc, data):
                 p_attr = cell.add_paragraph(stepContent)
                 p_attr.alignment = WD_ALIGN_PARAGRAPH.LEFT
                 p_attr.runs[0].font.size = Pt(12)
+                set_run_node_text_font_style(p_attr.runs[0])
                 p_attr.paragraph_format.left_indent = p_attr.runs[0].font.size * 2
         
         elif stepInfo["parent"] == "content":
@@ -643,6 +860,7 @@ def draw_instruction_content(doc, data):
                 p_attr = cell.add_paragraph(stepContent)
                 p_attr.alignment = WD_ALIGN_PARAGRAPH.LEFT
                 p_attr.runs[0].font.size = Pt(12)
+                set_run_node_text_font_style(p_attr.runs[0])
                 p_attr.paragraph_format.left_indent = p_attr.runs[0].font.size * 2
                 continue
 
@@ -650,12 +868,12 @@ def draw_instruction_content(doc, data):
             for content_obj in step_content_list:
                 if content_obj["step_type"] == 2 or content_obj["step_type"] == 5:
                     programCode = "NA"
-                    print(f"content_obj: {type(content_obj)}")
                     if len(content_obj["metadata"]['programs']) > 0:
                         programCode = '、'.join([code["programCode"] for code in content_obj["metadata"]['programs']])
                     p = cell.add_paragraph()
                     p.alignment = WD_ALIGN_PARAGRAPH.LEFT
                     p.text = f"程式代碼：{programCode}"
+                    set_run_node_text_font_style(p.runs[0])
                     createTable(cell, [content_obj])
 
                 for index, item_data in enumerate(content_obj.get("data", [])):

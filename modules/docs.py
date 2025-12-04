@@ -860,15 +860,18 @@ def create_revision():
 
 def apply_snapshot_to_main_db(snap_row, oracle_row):
     """
-    snap_row: 來自 rms_document_snapshots 的一列
+    snap_row: 來自 rms_document_snapshots 的一列（只有 meta，有 snapshot_id）
     oracle_row: 來自 Oracle.RMS_DCC2EIP 的一列
     """
-    token = snap_row["document_token"]
-    rms_id = snap_row["rms_id"]
+    token   = snap_row["document_token"]
+    rms_id  = snap_row["rms_id"]
+    snap_id = snap_row["snapshot_id"]
 
-    doc_snap = jload(snap_row["document_row"], {}) or {}
-    blocks_snap = jload(snap_row["blocks_rows"], []) or []
-    refs_snap = jload(snap_row["references_rows"], []) or []
+    # 🔹 從 payload table 撈 JSON
+    payload     = _load_snapshot_payload(snap_id)
+    doc_snap    = payload["document_row"]     or {}
+    blocks_snap = payload["blocks_rows"]      or []
+    refs_snap   = payload["references_rows"]  or []
 
     # 解析 Oracle 欄位（依你實際欄位順序調整 index）
     RMS_ID          = oracle_row[0]
@@ -915,7 +918,6 @@ def apply_snapshot_to_main_db(snap_row, oracle_row):
             RMS_DCCNO or doc_snap.get("document_id"),
             RMS_DCCNAME or doc_snap.get("document_name"),
             RMS_VER,
-            # 🔧 這裡改成 decode+encode
             jdump(_normalize_metadata(doc_snap.get("attribute"))),
             doc_snap.get("department"),
             doc_snap.get("author_id"),
@@ -972,7 +974,7 @@ def apply_snapshot_to_main_db(snap_row, oracle_row):
             """
             for r in refs_snap:
                 cur.execute(ins_ref, (
-                    r.get("id"),                 # 保留原本 id
+                    r.get("id"),
                     r.get("document_token") or token,
                     r.get("refer_type"),
                     r.get("refer_document"),
@@ -980,7 +982,7 @@ def apply_snapshot_to_main_db(snap_row, oracle_row):
                     r.get("created_at") or datetime.datetime.now(),
                 ))
 
-        # 3) 更新 snapshot 本身狀態 & 同 token 其它 snapshot
+        # 3) 更新 snapshot 本身狀態（這裡留著也沒關係，等一下會整批刪掉）
         cur.execute("""
             UPDATE rms_document_snapshots
             SET sync_status = 2, synced_at = NOW()
@@ -996,24 +998,11 @@ def apply_snapshot_to_main_db(snap_row, oracle_row):
         conn.commit()
 
 def _apply_reject_status_to_main_attributes(snap_row, oracle_row):
-    """
-    snap_row: rms_document_snapshots 一列 (dict_cursor)
-    oracle_row: Oracle.RMS_DCC2EIP 一列 (tuple)
-
-    ✅ 新需求：不要改 rms_document_attributes.status
-      - 保留原本 status（通常是草稿 or 送審）
-      - 只回寫 rejecter / reject_reason，以及（視需求）docId / docName / version
-    """
     token = snap_row["document_token"]
 
-    # 從 snapshot 的 document_row 取出原本 attribute 狀態
-    doc_snap = jload(snap_row["document_row"], {}) or {}
-
-    # 解析 EIP 欄位
     RMS_DCCNO       = oracle_row[1]
     RMS_VER         = oracle_row[2]
     RMS_DCCNAME     = oracle_row[3]
-    EIP_STATUS_STR  = (oracle_row[8] or "").strip()
     DECISION_USER   = oracle_row[9]
     DECISION_COMMENT= oracle_row[10]
 
@@ -1027,14 +1016,42 @@ def _apply_reject_status_to_main_attributes(snap_row, oracle_row):
                 document_version= COALESCE(%s, document_version)
             WHERE document_token = %s
         """, (
-            DECISION_USER or doc_snap.get("rejecter"),
-            DECISION_COMMENT or doc_snap.get("reject_reason"),
+            DECISION_USER,
+            DECISION_COMMENT,
             RMS_DCCNO,
             RMS_DCCNAME,
             RMS_VER,
             token,
         ))
         conn.commit()
+
+def _load_snapshot_payload(snapshot_id: int):
+    """
+    依 snapshot_id 從 rms_document_snapshot_payloads 撈出
+    document_row / blocks_rows / references_rows。
+    回傳 dict：{"document_row": dict, "blocks_rows": list, "references_rows": list}
+    """
+    with db(dict_cursor=True) as (conn, cur):
+        cur.execute("""
+            SELECT document_row, blocks_rows, references_rows
+            FROM rms_document_snapshot_payloads
+            WHERE snapshot_id = %s
+        """, (snapshot_id,))
+        row = cur.fetchone()
+
+    if not row:
+        raise RuntimeError(f"snapshot payload not found for snapshot_id={snapshot_id}")
+
+    # MySQL JSON type 會直接給 dict/list；為安全起見，用 _normalize_metadata / jload 再處理一次
+    doc_row   = _normalize_metadata(row.get("document_row"))   or {}
+    blocks_rs = _normalize_metadata(row.get("blocks_rows"))    or []
+    refs_rs   = _normalize_metadata(row.get("references_rows")) or []
+
+    return {
+        "document_row":   doc_row,
+        "blocks_rows":    blocks_rs,
+        "references_rows": refs_rs,
+    }
 
 def _normalize_metadata(raw):
     """
@@ -1056,6 +1073,52 @@ def _normalize_metadata(raw):
             break
         v = parsed
     return v
+
+def _rebind_mcr_program_codes(cur, latest_token: str):
+    """
+    重新把 MCR 的程式碼 (program_code) 綁到最新版本的 document_token 上。
+
+    規則：
+      - 從最新版本該文件的 rms_block_content.metadata 中找出
+        kind = "mcr-parameter" 的資料
+      - 取出所有 programs[].programCode
+      - 在 rms_program_code 中用這些 program_code 更新 document_token = latest_token, status = 1
+    """
+    # 1) 把這份文件所有 block 的 metadata 抓出來
+    cur.execute("""
+        SELECT metadata
+        FROM rms_block_content
+        WHERE document_token = %s
+          AND metadata IS NOT NULL
+    """, (latest_token,))
+    rows = cur.fetchall() or []
+
+    program_codes = set()
+
+    for r in rows:
+        meta = _normalize_metadata(r.get("metadata"))
+        if not isinstance(meta, dict):
+            continue
+        if meta.get("kind") != "mcr-parameter":
+            continue
+
+        for p in meta.get("programs") or []:
+            code = (p.get("programCode") or "").strip()
+            if code:
+                program_codes.add(code)
+
+    if not program_codes:
+        return  # 沒有任何程式碼要綁定
+
+    placeholders = ",".join(["%s"] * len(program_codes))
+    sql = f"""
+        UPDATE rms_program_code
+        SET document_token = %s,
+            status = 1
+        WHERE program_code IN ({placeholders})
+    """
+    params = [latest_token] + list(program_codes)
+    cur.execute(sql, params)
 
 def _row_ts(row):
     """
@@ -1121,30 +1184,45 @@ def sync_eip():
             # 收集這個版本所有非空的 EIP_STATUS
             statuses = {(r[8] or "").strip() for r in rows_for_ver if (r[8] or "").strip()}
 
-            # ----------------------------------------------------------
+                        # ----------------------------------------------------------
             # Case 2: 若有「已簽核」 → 正常結案，刪掉所有 snapshots
             # ----------------------------------------------------------
             if "已簽核" in statuses:
                 # 挑該版本中「已簽核」且最新的一筆 Oracle 紀錄
                 ver_signed_rows = [r for r in rows_for_ver if (r[8] or "").strip() == "已簽核"]
                 target_row = max(ver_signed_rows, key=_row_ts)
+                target_rms_id = target_row[0]  # RMS_ID
 
-                # 找對應 snapshot：同 doc_id + version 中最新的一筆
+                # 先用 version + rms_id 做精準對應
                 snap_candidates = []
                 for s in snaps:
                     try:
                         s_ver = float(s.get("document_version") or 1.0)
                     except (TypeError, ValueError):
                         s_ver = 1.0
-                    if ver is None or abs(s_ver - ver) < 1e-6:
+
+                    if ver is not None and abs(s_ver - ver) >= 1e-6:
+                        continue
+
+                    if s.get("rms_id") == target_rms_id:
                         snap_candidates.append(s)
 
+                # 如果真的找不到 rms_id 對應（理論上不應該發生），才退一步只看 version
                 if not snap_candidates:
-                    # 理論上不應發生：有 Oracle row 卻找不到 snapshot
-                    print("[sync-eip] no snapshot found for signed doc", doc_id, ver)
+                    for s in snaps:
+                        try:
+                            s_ver = float(s.get("document_version") or 1.0)
+                        except (TypeError, ValueError):
+                            s_ver = 1.0
+                        if ver is None or abs(s_ver - ver) < 1e-6:
+                            snap_candidates.append(s)
+
+                if not snap_candidates:
+                    print("[sync-eip] no snapshot found for signed doc", doc_id, ver, target_rms_id)
                     continue
 
                 snap = max(snap_candidates, key=lambda s: s.get("created_at") or datetime.datetime.min)
+
 
                 try:
                     apply_snapshot_to_main_db(snap, target_row)
@@ -1153,17 +1231,78 @@ def sync_eip():
                     print("[sync-eip] apply snapshot failed (已簽核)", doc_id, ver, e)
                     continue
 
-                # ★ 刪掉該文件 + 該版本的所有 snapshots（你的步驟 2）
+                # 注意：這裡視乎 Oracle 的 RMS_VER 是否一定存在
+                ver_value = ver if ver is not None else float(snap.get("document_version") or 1.0)
+                latest_token = snap["document_token"]
+
                 with db(dict_cursor=True) as (conn, cur):
+                    # 2-1) 刪除同一文件 + 同一版本的所有 snapshots（含剛同步那一筆）
                     cur.execute("""
                         DELETE FROM rms_document_snapshots
                         WHERE document_id = %s
-                        AND ABS(document_version - %s) < 1e-6
-                    """, (doc_id, ver if ver is not None else float(snap.get("document_version") or 1.0)))
-                    conn.commit()
+                          AND ABS(document_version - %s) < 1e-6
+                    """, (doc_id, ver_value))
 
-                # 這個版本已經結案，直接看下一個版本
-                continue
+                    # 2-2) 刪除同一文件 + 同一版本、但不是這個 token 的「草稿/未簽核」文件
+                    cur.execute("""
+                        DELETE FROM rms_document_attributes
+                        WHERE document_id = %s
+                          AND ABS(document_version - %s) < 1e-6
+                          AND document_token <> %s
+                          AND status IN (0, 1)
+                    """, (doc_id, ver_value, latest_token))
+
+                    # ------------------------------
+                    # 2-3) ⭐ 新增：簽核後舊版整理邏輯
+                    # ------------------------------
+                    # 只看「已簽核版本」(status = 2)，按版本從新到舊排
+                    cur.execute("""
+                        SELECT document_token, document_version
+                        FROM rms_document_attributes
+                        WHERE document_id = %s
+                          AND status = 2
+                        ORDER BY document_version DESC
+                    """, (doc_id,))
+                    ver_rows = cur.fetchall() or []
+
+                    if ver_rows:
+                        # 保留最新版 + 前兩版的 attributes
+                        keep_rows = ver_rows[:3]  # 最多 3 筆
+                        keep_tokens = [r["document_token"] for r in keep_rows]
+
+                        # 最新版 token（理論上就是 latest_token，但這裡再保險抓一次）
+                        latest_attr_token = keep_tokens[0]
+
+                        # 要保留 attribute 但清掉內容的舊版 token：前兩版（index 1,2）
+                        clear_tokens = [r["document_token"] for r in keep_rows[1:]]
+
+                        # 超過 2 個版本之前的舊版：整個 attributes 直接刪掉（CASCADE 掉內容）
+                        delete_attr_tokens = [r["document_token"] for r in ver_rows[3:]]
+
+                        # (a) 刪除舊版的 content / references（但保留 attributes）
+                        if clear_tokens:
+                            ph = ",".join(["%s"] * len(clear_tokens))
+                            cur.execute(f"""
+                                DELETE FROM rms_block_content
+                                WHERE document_token IN ({ph})
+                            """, clear_tokens)
+                            cur.execute(f"""
+                                DELETE FROM rms_references
+                                WHERE document_token IN ({ph})
+                            """, clear_tokens)
+
+                        # (b) 刪除比前兩版更舊的 attributes（rms_block_content / rms_references 會跟著 FK CASCADE）
+                        if delete_attr_tokens:
+                            ph = ",".join(["%s"] * len(delete_attr_tokens))
+                            cur.execute(f"""
+                                DELETE FROM rms_document_attributes
+                                WHERE document_token IN ({ph})
+                            """, delete_attr_tokens)
+
+                        # (c) 重新把 MCR 的程式號碼綁定到「最新版」的 document_token
+                        _rebind_mcr_program_codes(cur, latest_attr_token)
+
+                    conn.commit()
 
             # ----------------------------------------------------------
             # Case 3: 沒有已簽核，但有「否決 / 退回申請者」
@@ -1256,11 +1395,14 @@ def _get_pending_snapshots_grouped_by_doc_id():
       "WMD001": [snap_row1, snap_row2, ...],
       "WMD002": [...],
     }
-    僅抓 sync_status=0 的 snapshot。
+    僅抓 sync_status = 0 的 snapshot。
+    這裡只需要 meta，不讀 payload。
     """
     with db(dict_cursor=True) as (conn, cur):
         cur.execute("""
-            SELECT *
+            SELECT snapshot_id, document_token, rms_id,
+                   document_id, document_version, document_name,
+                   created_by, created_at, sync_status
             FROM rms_document_snapshots
             WHERE sync_status = 0
         """)
@@ -1595,6 +1737,7 @@ def _list_documents_impl(
     order: str = "desc",
     doc_types: list[str] | None = None,
     scope: str = "mine",         # "mine" | "all"
+    document_id: str | None = None,   # 新增但暫時只有 /documents /submitted 等用到
 ):
     sort_map = {
         "issue_date": "issue_date",
@@ -1613,6 +1756,11 @@ def _list_documents_impl(
             raise ValueError("user_id is required for scope=mine")
         where.append("author_id = %s")
         params.append(user_id)
+
+    # 依 document_id 過濾（可選）
+    if document_id:
+        where.append("document_id = %s")
+        params.append(document_id)
 
     # statuses (required)
     where.append(f"status IN ({', '.join(['%s'] * len(statuses))})")
@@ -1710,18 +1858,116 @@ def list_all_documents():
     sort_key = (request.args.get("sort") or "issue_date")
     order    = (request.args.get("order") or "desc")
 
-    data = _list_documents_impl(
-        user_id=None,           # no author filter → all authors
-        statuses=statuses,
-        keyword=keyword,        # strong search: name/author/version/id
-        page=page,
-        page_size=page_size,
-        sort_key=sort_key,
-        order=order,
-        doc_types=None,         # <— IMPORTANT: do not filter by type
-        scope="all",
-    )
-    return jsonify(data), 200
+    # ---- 決定排序欄位 ----
+    sort_map = {
+        "issue_date": "issue_date",
+        "document_version": "document_version",
+        "document_name": "document_name",
+    }
+    sort_col = sort_map.get((sort_key or "issue_date").lower(), "issue_date")
+    order_sql = "DESC" if (order or "desc").lower() not in ("asc", "ASC") else "ASC"
+
+    # ---- WHERE 條件：這裡沒有 author_id 限制，因為是 all ----
+    where = []
+    params = []
+
+    # statuses（必填）
+    where.append(f"status IN ({', '.join(['%s'] * len(statuses))})")
+    params.extend(statuses)
+
+    # keyword
+    kw_sql, kw_params = _build_keyword_predicate(keyword)
+    if kw_sql:
+        where.append(kw_sql)
+        params.extend(kw_params)
+
+    where_sql = " AND ".join(where) if where else "1=1"
+    offset = (page - 1) * page_size
+
+    # 1) total = 不同 document_id 的數量（在同樣的 where 條件下）
+    count_sql = f"""
+      SELECT COUNT(*) AS cnt
+      FROM (
+        SELECT DISTINCT document_id
+        FROM rms_document_attributes
+        WHERE {where_sql}
+      ) AS t
+    """
+
+    # 2) data = 每個 document_id 的「document_version 最大」那一筆
+    data_sql = f"""
+      SELECT
+        a.document_type,
+        a.document_token,
+        a.document_name,
+        a.document_version,
+        a.author,
+        a.author_id,
+        a.issue_date,
+        a.document_id,
+        a.status,
+        a.rejecter,
+        a.reject_reason
+      FROM (
+        SELECT
+          document_type,
+          document_token,
+          document_name,
+          document_version,
+          author,
+          author_id,
+          issue_date,
+          document_id,
+          status,
+          rejecter,
+          reject_reason,
+          ROW_NUMBER() OVER (
+            PARTITION BY document_id
+            ORDER BY document_version DESC
+          ) AS rn
+        FROM rms_document_attributes
+        WHERE {where_sql}
+      ) AS a
+      WHERE a.rn = 1
+      ORDER BY a.{sort_col} {order_sql}
+      LIMIT %s OFFSET %s
+    """
+
+    with db(dict_cursor=True) as (_, cur):
+        cur.execute(count_sql, params)
+        total = int(cur.fetchone()["cnt"])
+
+        cur.execute(data_sql, params + [page_size, offset])
+        rows = cur.fetchall() or []
+
+    def to_item(r):
+        iso_date = None
+        if r.get("issue_date"):
+            try:
+                iso_date = r["issue_date"].isoformat(timespec="seconds")
+            except Exception:
+                iso_date = str(r["issue_date"])
+        return {
+            "documentType": r["document_type"],
+            "documentToken": r["document_token"],
+            "documentName": r["document_name"],
+            "documentVersion": float(r["document_version"]) if r["document_version"] is not None else None,
+            "author": r["author"],
+            "authorId": r["author_id"],
+            "issueDate": iso_date,
+            "documentId": r.get("document_id"),
+            "status": r.get("status"),
+            "rejecter": r.get("rejecter"),
+            "rejectReason": r.get("reject_reason"),
+        }
+
+    return jsonify({
+        "success": True,
+        "items": [to_item(r) for r in rows],
+        "total": total,
+        "page": page,
+        "pageSize": page_size,
+    }), 200
 
 @bp.get("/passed")
 def list_passed():
@@ -1746,17 +1992,118 @@ def list_passed():
     sort_key = (request.args.get("sort") or "issue_date")
     order    = (request.args.get("order") or "desc")
 
-    data = _list_documents_impl(
-        user_id=user_id,
-        statuses=[2],              # <— PASSED
-        keyword=keyword,
-        page=page,
-        page_size=page_size,
-        sort_key=sort_key,
-        order=order,
-        doc_types=doc_types,       # <— filter if provided
-    )
-    return jsonify(data), 200
+    # ---- 決定排序欄位 ----
+    sort_map = {
+        "issue_date": "issue_date",
+        "document_version": "document_version",
+        "document_name": "document_name",
+    }
+    sort_col = sort_map.get((sort_key or "issue_date").lower(), "issue_date")
+    order_sql = "DESC" if (order or "desc").lower() not in ("asc", "ASC") else "ASC"
+
+    # ---- where：author + status=2 + optional type + keyword ----
+    where = ["author_id = %s", "status = 2"]
+    params = [user_id]
+
+    if doc_types:
+        where.append(f"document_type IN ({', '.join(['%s'] * len(doc_types))})")
+        params.extend(doc_types)
+
+    kw_sql, kw_params = _build_keyword_predicate(keyword)
+    if kw_sql:
+        where.append(kw_sql)
+        params.extend(kw_params)
+
+    where_sql = " AND ".join(where) if where else "1=1"
+    offset = (page - 1) * page_size
+
+    # 1) total = 不同 document_id 數量
+    count_sql = f"""
+      SELECT COUNT(*) AS cnt
+      FROM (
+        SELECT DISTINCT document_id
+        FROM rms_document_attributes
+        WHERE {where_sql}
+      ) AS t
+    """
+
+    # 2) data = 每個 document_id 的最新版本那一筆
+    data_sql = f"""
+      SELECT
+        a.document_type,
+        a.document_token,
+        a.document_name,
+        a.document_version,
+        a.author,
+        a.author_id,
+        a.issue_date,
+        a.document_id,
+        a.status,
+        a.rejecter,
+        a.reject_reason
+      FROM (
+        SELECT
+          document_type,
+          document_token,
+          document_name,
+          document_version,
+          author,
+          author_id,
+          issue_date,
+          document_id,
+          status,
+          rejecter,
+          reject_reason,
+          ROW_NUMBER() OVER (
+            PARTITION BY document_id
+            ORDER BY document_version DESC
+          ) AS rn
+        FROM rms_document_attributes
+        WHERE {where_sql}
+      ) AS a
+      WHERE a.rn = 1
+      ORDER BY a.{sort_col} {order_sql}
+      LIMIT %s OFFSET %s
+    """
+
+    with db(dict_cursor=True) as (_, cur):
+        cur.execute(count_sql, params)
+        total = int(cur.fetchone()["cnt"])
+
+        cur.execute(data_sql, params + [page_size, offset])
+        rows = cur.fetchall() or []
+
+    for index, r in enumerate(rows):
+        print(f"{index}: {r}")
+
+    def to_item(r):
+        iso_date = None
+        if r.get("issue_date"):
+            try:
+                iso_date = r["issue_date"].isoformat(timespec="seconds")
+            except Exception:
+                iso_date = str(r["issue_date"])
+        return {
+            "documentType": r["document_type"],
+            "documentToken": r["document_token"],
+            "documentName": r["document_name"],
+            "documentVersion": float(r["document_version"]) if r["document_version"] is not None else None,
+            "author": r["author"],
+            "authorId": r["author_id"],
+            "issueDate": iso_date,
+            "documentId": r.get("document_id"),
+            "status": r.get("status"),
+            "rejecter": r.get("rejecter"),
+            "rejectReason": r.get("reject_reason"),
+        }
+
+    return jsonify({
+        "success": True,
+        "items": [to_item(r) for r in rows],
+        "total": total,
+        "page": page,
+        "pageSize": page_size,
+    }), 200
 
 @bp.get("/documents")
 def list_documents():
@@ -2336,8 +2683,8 @@ make_rms_id = lambda: uuid.uuid4().hex[:15]
 def create_snapshot_and_oracle_row(token: str, rms_id: str, user_emp_no: str):
     """
     1) 從 MySQL 撈出目前 token 的 document_row / blocks_rows / references_rows
-    2) 先在 Oracle.IDBUSER.RMS_DCC2EIP 新增 RMS_* 一筆  ← 若失敗直接 raise
-    3) 再寫入 sfdb.rms_document_snapshots
+    2) 先在 Oracle.IDBUSER.RMS_DCC2EIP 新增 RMS_* 一筆
+    3) 再寫入 sfdb.rms_document_snapshots (meta) + rms_document_snapshot_payloads (JSON)
     """
     # --- 1) 讀 MySQL 現況（只讀，不動資料） ---
     with db(dict_cursor=True) as (conn, cur):
@@ -2354,7 +2701,6 @@ def create_snapshot_and_oracle_row(token: str, rms_id: str, user_emp_no: str):
         doc_name = doc_row.get("document_name") or ""
         issue_dt = doc_row.get("issue_date") or datetime.datetime.now()
 
-        # blocks / references 先撈起來，之後做 snapshot 用
         cur.execute("""
             SELECT * FROM rms_block_content WHERE document_token=%s
             ORDER BY step_type, tier_no, sub_no
@@ -2367,8 +2713,7 @@ def create_snapshot_and_oracle_row(token: str, rms_id: str, user_emp_no: str):
         """, (token,))
         ref_rows = cur.fetchall() or []
 
-    # --- 2) 先寫 Oracle.RMS_DCC2EIP（如果沒權限會在這裡炸） ---
-    # ※ 不吞錯，讓呼叫端決定要不要回 500 or 400
+    # --- 2) 先寫 Oracle.RMS_DCC2EIP ---
     with odb() as cur_o:
         cur_o.execute("""
             INSERT INTO IDBUSER.RMS_DCC2EIP (RMS_ID, RMS_DCCNO, RMS_VER, RMS_DCCNAME, RMS_INSDT)
@@ -2376,47 +2721,35 @@ def create_snapshot_and_oracle_row(token: str, rms_id: str, user_emp_no: str):
         """, (rms_id, doc_id, doc_ver, doc_name, issue_dt))
         cur_o.connection.commit()
 
-    # --- 3) Oracle 成功後，才做 snapshot（MySQL） ---
+    # --- 3) 再寫 MySQL snapshot（meta + payload 分兩張表） ---
     doc_row_json = _normalize_for_json(doc_row)
     blocks_json  = _normalize_for_json(blocks_rows)
     refs_json    = _normalize_for_json(ref_rows)
 
-    # Debug：dump 失敗時印型別
     try:
         doc_row_str = jdump(doc_row_json)
+        blocks_str  = jdump(blocks_json)
+        refs_str    = jdump(refs_json)
     except TypeError as e:
-        print("[snapshot DEBUG] doc_row_json dump failed:", e)
-        print("[snapshot DEBUG] doc_row_json types:",
-              {k: type(v).__name__ for k, v in doc_row_json.items()})
-        raise
-
-    try:
-        blocks_str = jdump(blocks_json)
-    except TypeError as e:
-        print("[snapshot DEBUG] blocks_json dump failed:", e)
-        if blocks_json:
-            sample = blocks_json[:3]
-            print("[snapshot DEBUG] blocks_json sample types:")
-            for i, row in enumerate(sample):
-                print(f"  row[{i}] ->", {k: type(v).__name__ for k, v in row.items()})
-        raise
-
-    try:
-        refs_str = jdump(refs_json)
-    except TypeError as e:
-        print("[snapshot DEBUG] refs_json dump failed:", e)
-        if refs_json:
-            sample = refs_json[:3]
-            print("[snapshot DEBUG] refs_json sample types:")
-            for i, row in enumerate(sample):
-                print(f"  row[{i}] ->", {k: type(v).__name__ for k, v in row.items()})
+        print("[snapshot DEBUG] json dump failed:", e)
         raise
 
     with db(dict_cursor=True) as (conn, cur):
+        # 3-1) 先插入輕量的 snapshots（拿到 snapshot_id）
         cur.execute("""
-            INSERT INTO rms_document_snapshots (document_token, rms_id, document_id, document_version, document_name, document_row, blocks_rows, references_rows, created_by)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """, (token, rms_id, doc_id, doc_ver, doc_name, doc_row_str, blocks_str, refs_str, user_emp_no))
+            INSERT INTO rms_document_snapshots
+            (document_token, rms_id, document_id, document_version, document_name, created_by)
+            VALUES (%s,%s,%s,%s,%s,%s)
+        """, (token, rms_id, doc_id, doc_ver, doc_name, user_emp_no))
+        snapshot_id = cur.lastrowid
+
+        # 3-2) 再插入 payload
+        cur.execute("""
+            INSERT INTO rms_document_snapshot_payloads
+            (snapshot_id, document_row, blocks_rows, references_rows)
+            VALUES (%s,%s,%s,%s)
+        """, (snapshot_id, doc_row_str, blocks_str, refs_str))
+
         conn.commit()
 
 def next_document_id(prefix: str) -> str:
@@ -2537,6 +2870,7 @@ def generate_word():
 
     if token:
         try:
+            # A) 一開始就從 DB 撈「前幾版 + 最新版」payload
             payload = _build_doc_payload_from_token(token)
         except Exception as e:
             print("[generate_word] _build_doc_payload_from_token error:", e)
@@ -2544,11 +2878,13 @@ def generate_word():
 
         latest_attr = payload["attribute"][-1]
 
+        # B) 前端有送 attribute，就覆蓋「最新版」欄位
         if data["attribute"]:
             override_attr = data["attribute"][-1]
             for k, v in override_attr.items():
                 latest_attr[k] = v
 
+        # C) content / reference 若前端有傳，就覆蓋 DB 的（只影響最新版）
         if data["content"]:
             payload["content"] = data["content"]
         if data["reference"]:
@@ -2557,7 +2893,8 @@ def generate_word():
         # 4) 計算/更新 document_id + documentKey（只看最新那一版）
         with db(dict_cursor=True) as (conn, cur):
             cur.execute("""
-                SELECT document_type, document_id, document_version, attribute, author_id, document_name FROM rms_document_attributes
+                SELECT document_type, document_id, document_version, attribute, author_id, document_name
+                FROM rms_document_attributes
                 WHERE document_token=%s
             """, (token,))
             r = cur.fetchone()
@@ -2588,49 +2925,52 @@ def generate_word():
             attr_json["documentKey"] = rms_id
 
             cur.execute("""
-                UPDATE rms_document_attributes SET document_id=%s, attribute=%s
+                UPDATE rms_document_attributes
+                SET document_id=%s, attribute=%s
                 WHERE document_token=%s
             """, (doc_id, jdump(attr_json), token))
             conn.commit()
 
-        # 5) 把 docID & documentKey 塞回最新那一版給 get_docx 用
+        # 5) 把 docID & documentKey 塞回「最新版 attribute」（在 payload 上）
         latest_attr["documentID"] = doc_id or ""
         latest_attr["documentKey"] = rms_id
 
+        # 如果你還有想讓前端回收的 data，也可以同步更新：
         if data["attribute"]:
             data["attribute"][-1]["documentID"] = doc_id or ""
             data["attribute"][-1]["documentKey"] = rms_id
 
-        # 5.5) 暫存內容
+        # 5.5) 暫存內容（寫回 rms_document_attributes）
         _update_attributes_from_latest_attr(token, latest_attr)
 
         # 6) 檔名
-        print(f"latest_attr: {latest_attr}")
         try:
-            doc_name = _safe_docname(f'{latest_attr.get("documentName")}{latest_attr.get("documentVersion"):.1f}')
+            doc_name = _safe_docname(
+                f'{latest_attr.get("documentName")}{latest_attr.get("documentVersion"):.1f}'
+            )
         except Exception:
             doc_name = "document"
-        print(f"doc_name: {doc_name}")
 
         # 7) 先做 Oracle / snapshot（如果失敗 → 不產 DOCX，直接回錯誤）
         try:
-            create_snapshot_and_oracle_row(
-                token=token,
-                rms_id=rms_id,
-                user_emp_no=author_id or "UNKNOWN",
-            )
+            create_snapshot_and_oracle_row(token=token, rms_id=rms_id, user_emp_no=author_id or "UNKNOWN")
         except Exception as e:
-            # 這裡很關鍵：**當作致命錯誤處理**
             print("[generate_word] create_snapshot_and_oracle_row FAILED:", e)
-            # 你可以決定回 500 或 400，看公司規範
-            return send_response(500, False, f"EIP 建檔 / 歷史快照失敗，請聯絡系統管理員。詳細訊息：{e}")
+            return send_response(
+                500,
+                False,
+                f"EIP 建檔 / 歷史快照失敗，請聯絡系統管理員。詳細訊息：{e}"
+            )
 
         # 8) Oracle + snapshot 都成功後，才產生 Word
         out_path = os.path.join(BASE_DIR, f"{doc_name}.docx")
-        if data["attribute"][-1]["documentType"] == 1:
-            get_docx(out_path, data, "docx-template/SpecificationDocument.docx")
+
+        # 🔑 用 payload（包含歷史版本 attributes），而不是 data
+        doc_type_for_word = latest_attr.get("documentType", 0)
+        if doc_type_for_word == 1:
+            get_docx(out_path, payload, "docx-template/SpecificationDocument.docx")
         else:
-            get_docx(out_path, data, "docx-template/InstructionDocument.docx")
+            get_docx(out_path, payload, "docx-template/InstructionDocument.docx")
 
         @after_this_request
         def add_docid_header(response):
@@ -2752,77 +3092,105 @@ def preview_docx():
     )
 
 def _build_payload_for_docx_from_snapshot(snap_row):
-    """
-    將 rms_document_snapshots 一列，轉成給 get_docx 使用的 payload。
-    結構改成「跟前端一樣」：
-    {
-      "token": token,
-      "attribute": [form],
-      "content": [
-        # 流程 / 管理條件 / 異常處置...
-        {
-          "step_type": 0 或 1 或 3,
-          "tier": 1,
-          "data": [
-            {
-              "option": 0/1/2,
-              "jsonHeader": {...} | None,
-              "jsonContent": {...} | None,
-              "files": [...]
-            },
-            ...
-          ]
-        },
-        # MCR 參數
-        {
-          "step_type": 2,
-          "tier_no": 1,
-          "jsonParameterContent": {...} | None,
-          "arrayParameterData": [...],
-          "jsonConditionContent": {...} | None,
-          "arrayConditionData": [...],
-          "metadata": {...},
-        },
-        ...
-      ],
-      "reference": { "documents": [...], "forms": [...] },
-    }
-    """
-    token = snap_row["document_token"]
+    token   = snap_row["document_token"]
+    snap_id = snap_row["snapshot_id"]
 
-    doc_row   = jload(snap_row.get("document_row"), {}) or {}
-    blocks_rs = jload(snap_row.get("blocks_rows"), []) or []
-    refs_rs   = jload(snap_row.get("references_rows"), []) or []
+    payload   = _load_snapshot_payload(snap_id)
+    doc_row   = payload["document_row"]
+    blocks_rs = payload["blocks_rows"]
+    refs_rs   = payload["references_rows"]
 
-    # ---------- attributes -> form ----------
+    # ---------- 1.1 歷史版本（已經是 yyyy/mm/dd，就保留你現在的實作） ----------
+    attrs: list[dict] = []
+
+    prev_token = doc_row.get("previous_document_token")
+    hops = 0
+    seen = set()
+
+    if prev_token:
+        with db(dict_cursor=True) as (conn, cur):
+            while prev_token and prev_token not in seen and hops < 2:
+                seen.add(prev_token)
+                cur.execute(
+                    "SELECT * FROM rms_document_attributes WHERE document_token=%s",
+                    (prev_token,),
+                )
+                r = cur.fetchone()
+                if not r:
+                    break
+
+                attr_json = jload(r.get("attribute"), {}) or {}
+                issue = r.get("issue_date")
+                if hasattr(issue, "strftime"):
+                    # ✅ 歷史版本：yyyy/mm/dd
+                    issue_str = issue.strftime("%Y/%m/%d")
+                else:
+                    issue_str = issue or ""
+
+                attrs.append({
+                    "documentType":     r.get("document_type") or 0,
+                    "documentID":       r.get("document_id") or "",
+                    "documentName":     r.get("document_name") or "",
+                    "documentVersion":  float(r.get("document_version") or 1.0),
+                    "attribute":        attr_json,
+                    "department":       r.get("department") or "",
+                    "author_id":        r.get("author_id") or "",
+                    "author":           r.get("author") or "",
+                    "approver":         r.get("approver") or "",
+                    "confirmer":        r.get("confirmer") or "",
+                    "issueDate":        issue_str,   # 🔑 統一用 issueDate
+                    "reviseReason":     r.get("change_reason") or "",
+                    "revisePoint":      r.get("change_summary") or "",
+                    "documentPurpose":  r.get("purpose") or "",
+                })
+
+                prev_token = r.get("previous_document_token")
+                hops += 1
+
+    attrs.reverse()
+
+    # ---------- 1.2 目前這一版（snapshot 對應的版本） ----------
     issue = doc_row.get("issue_date")
-    if hasattr(issue, "strftime"):
-        issue_str = issue.strftime("%Y-%m-%d %H:%M:%S")
+
+    if isinstance(issue, str):
+        # 優先試著當 ISO 解析（含 T 的情況）
+        try:
+            dt = datetime.datetime.fromisoformat(issue)
+            issue_str = dt.strftime("%Y/%m/%d")
+        except Exception:
+            # 退而求其次：直接取前 10 碼，轉 yyyy/mm/dd
+            # 支援 "2025-12-03 09:03:28" 或 "2025-12-03T09:03:28"
+            s = issue[:10]
+            issue_str = s.replace("-", "/")
+    elif hasattr(issue, "strftime"):
+        # MySQL datetime 物件
+        issue_str = issue.strftime("%Y/%m/%d")
     else:
-        issue_str = issue
+        issue_str = ""
 
     attr_json = jload(doc_row.get("attribute"), {}) or {}
 
-    form = {
-        "documentType": doc_row.get("document_type") or 0,
-        "documentID": doc_row.get("document_id") or "",
-        "documentName": doc_row.get("document_name") or "",
-        "documentVersion": float(doc_row.get("document_version") or 1.0),
-        "attribute": attr_json,
-        "department": doc_row.get("department") or "",
-        "author_id": doc_row.get("author_id") or "",
-        "author": doc_row.get("author") or "",
-        "approver": doc_row.get("approver") or "",
-        "confirmer": doc_row.get("confirmer") or "",
-        "documentPurpose": doc_row.get("purpose") or "",
-        "reviseReason": doc_row.get("change_reason") or "",
-        "revisePoint": doc_row.get("change_summary") or "",
+    latest_form = {
+        "documentType":     doc_row.get("document_type") or 0,
+        "documentID":       doc_row.get("document_id") or "",
+        "documentName":     doc_row.get("document_name") or "",
+        "documentVersion":  float(doc_row.get("document_version") or 1.0),
+        "attribute":        attr_json,
+        "department":       doc_row.get("department") or "",
+        "author_id":        doc_row.get("author_id") or "",
+        "author":           doc_row.get("author") or "",
+        "approver":         doc_row.get("approver") or "",
+        "confirmer":        doc_row.get("confirmer") or "",
+        "documentPurpose":  doc_row.get("purpose") or "",
+        "reviseReason":     doc_row.get("change_reason") or "",
+        "revisePoint":      doc_row.get("change_summary") or "",
+        "issueDate":        issue_str,  # ✅ 現在一定是 yyyy/mm/dd
         "previousDocumentToken": doc_row.get("previous_document_token") or "",
-        "issueTime": issue_str,
     }
 
-    # ---------- blocks / params ----------
-    # 先依 step_type 分組（這是 snapshot 當初存下來的 rms_block_content rows）
+    attrs.append(latest_form)
+
+    # ---------- 2) blocks / params：只用 snapshot 的 blocks_rs ----------
     by_step = {}
     for r in blocks_rs:
         try:
@@ -2835,15 +3203,14 @@ def _build_payload_for_docx_from_snapshot(snap_row):
 
     for st, rows in by_step.items():
         if st in (2, 5):
-            # MCR 參數類：還原成 serializeMCRToParams 的格式
+            # MCR 參數類...
             merged = {}
             for r in rows:
                 try:
-                    t = int(r.get("tier_no"))   # 對應前端的 tier_no
-                    sub = int(r.get("sub_no"))  # 0: 參數, 1: 條件
+                    t = int(r.get("tier_no"))
+                    sub = int(r.get("sub_no"))
                 except (TypeError, ValueError):
                     continue
-
                 merged.setdefault(t, {
                     "jsonParameterContent": None,
                     "arrayParameterData": [],
@@ -2851,16 +3218,14 @@ def _build_payload_for_docx_from_snapshot(snap_row):
                     "arrayConditionData": [],
                     "metadata": None,
                 })
-
                 if sub == 0:
-                    merged[t]["arrayParameterData"] = jload(r.get("content_text"), []) or []
+                    merged[t]["arrayParameterData"]   = jload(r.get("content_text"), []) or []
                     merged[t]["jsonParameterContent"] = _normalize_metadata(r.get("content_json"))
-                    merged[t]["metadata"] = _normalize_metadata(r.get("metadata"))
+                    merged[t]["metadata"]             = _normalize_metadata(r.get("metadata"))
                 elif sub == 1:
-                    merged[t]["arrayConditionData"] = jload(r.get("content_text"), []) or []
+                    merged[t]["arrayConditionData"]   = jload(r.get("content_text"), []) or []
                     merged[t]["jsonConditionContent"] = _normalize_metadata(r.get("content_json"))
 
-            # 合併好的每一個 tier_no → 一個 content item
             for t in sorted(merged.keys()):
                 b = merged[t]
                 content_items.append({
@@ -2872,9 +3237,7 @@ def _build_payload_for_docx_from_snapshot(snap_row):
                     "arrayConditionData": b["arrayConditionData"],
                     "metadata": b["metadata"],
                 })
-
         else:
-            # 一般 blocks（流程 / 管理條件 / 異常處置...)
             grouped = {}
             for r in rows:
                 try:
@@ -2890,12 +3253,12 @@ def _build_payload_for_docx_from_snapshot(snap_row):
 
             for t in sorted(grouped.keys()):
                 content_items.append({
-                    "step_type": st,   # ★ 跟前端一樣，給 draw_instruction_content 用
+                    "step_type": st,
                     "tier": t,
                     "data": grouped[t],
                 })
 
-    # ---------- references ----------
+    # ---------- 3) references：只用 snapshot 的 refs_rs ----------
     references = []
     for r in refs_rs:
         try:
@@ -2904,30 +3267,21 @@ def _build_payload_for_docx_from_snapshot(snap_row):
             ref_type = 0
 
         references.append({
-            "referenceType": ref_type,                              # 對應前端 referenceType
-            "referenceDocumentID": r.get("refer_document"),         # 對應 referenceDocumentID
-            "referenceDocumentName": r.get("refer_document_name"),  # 對應 referenceDocumentName
+            "referenceType": ref_type,
+            "referenceDocumentID": r.get("refer_document"),
+            "referenceDocumentName": r.get("refer_document_name"),
         })
 
     return {
         "token": token,
-        "attribute": [form],
-        "content": content_items,   # ★ 跟前端 serializeXxxToBlocks 完全同一種型態
-        "reference": references,    # ★ 給 DocxDefinition 的格式，跟前端一致
+        "attribute": attrs,           # 🔑 不再只有一個 form，而是 [舊版..., 最新版]
+        "content": content_items,
+        "reference": references,
     }
 
 @bp.get("/preview/<token>")
 def preview_docx_from_snapshot(token):
-    """
-    用 snapshot 裡的資料產一份 DOCX 預覽（只讀）。
-    完全使用 rms_document_snapshots 的資料來繪製 Word。
-
-    支援 query string：
-      - rms_id: 以 (token, rms_id) 精準指定是哪一筆 snapshot
-      - 沒給：  fallback 為該 token 的最新 snapshot
-    """
     rms_id = request.args.get("rms_id")
-    print(f"rms_id: {rms_id}")
 
     with db(dict_cursor=True) as (conn, cur):
         if rms_id:
@@ -2952,6 +3306,7 @@ def preview_docx_from_snapshot(token):
     if not snap:
         return jsonify({"ok": False, "error": "snapshot not found"}), 404
 
+    # 🔹 這裡的 snap 是「輕量 meta」，真正的 JSON 在 _build_payload_for_docx_from_snapshot 裡讀
     payload = _build_payload_for_docx_from_snapshot(snap)
 
     # 取文件類型 & 名稱
