@@ -70,28 +70,59 @@ def search_conditions_by_machines():
         with db() as (conn, cur):
             like = f"%{keyword}%"
             cur.execute("""
-                SELECT DISTINCT
-                    t1.condition_id, t1.condition_name, t4.parameter_name
-                FROM rms_conditions t1
-                INNER JOIN rms_condition_groups t2
-                    ON t1.condition_id = t2.condition_id
-                INNER JOIN rms_group_machines t3
-                    ON t2.group_id = t3.group_id AND t2.condition_id = t3.condition_id
-                INNER JOIN rms_condition_parameters t4
-                    ON t1.condition_id = t4.condition_id
-                WHERE LOWER(t3.machine_id) LIKE %s OR LOWER(t3.machine_name) LIKE %s
+                SELECT DISTINCT t1.condition_id, t1.condition_name, t4.parameter_name FROM rms_conditions t1
+                INNER JOIN rms_condition_groups t2 ON t1.condition_id = t2.condition_id
+                INNER JOIN rms_group_machines t3 ON t2.group_id = t3.group_id AND t2.condition_id = t3.condition_id
+                INNER JOIN rms_condition_parameters t4 ON t1.condition_id = t4.condition_id
+                WHERE LOWER(t3.machine_id) LIKE %s OR LOWER(t3.machine_name) LIKE %s ORDER BY t1.condition_id
             """, (like, like))
             rows = cur.fetchall()
-
-        temp = {}
-        for condition_id, condition_name, parameter_name in rows:
-            bucket = temp.setdefault(condition_name, {"id": condition_id, "parameters": []})
-            bucket["parameters"].append(parameter_name)
-
-        conditions = [{"name": cn, **ci} for (cn, ci) in temp.items()]
-        return send_response(200, True, "請求成功", {"conditions": conditions})
     except Exception as e:
+        print(e)
         return send_response(500, True, "請求失敗", {"message": f"DB錯誤: {e}"})
+
+    index = 0
+    conditions_name_index_dict = {}
+    conditions = []
+    for condition_id, condition_name, parameter_name in rows:
+        if conditions_name_index_dict.get(condition_name) == None:
+            conditions.append({"name": condition_name, "id": condition_id, "parameters": []})
+            conditions_name_index_dict[condition_name] = index
+            index += 1
+        conditions[conditions_name_index_dict[condition_name]]["parameters"].append(parameter_name)
+
+    return send_response(200, True, "請求成功", {"conditions": conditions})
+
+@bp.get("/search-conditions-by-keyword")
+def search_conditions_by_keyword():
+    keyword = (request.args.get("keyword") or "").strip().lower()
+    if not keyword:
+        # reuse get-conditions when empty, for convenience
+        return get_conditions()
+    try:
+        with db() as (conn, cur):
+            like = f"%{keyword}%"
+            cur.execute("""
+                SELECT DISTINCT t1.condition_id, t1.condition_name, t2.parameter_name FROM rms_conditions t1
+                INNER JOIN rms_condition_parameters t2 ON t1.condition_id = t2.condition_id
+                WHERE LOWER(t2.parameter_name) LIKE %s OR LOWER(t1.condition_name) LIKE %s ORDER BY t1.condition_id
+            """, (like, like))
+            rows = cur.fetchall()
+    except Exception as e:
+        print(e)
+        return send_response(500, True, "請求失敗", {"message": f"DB錯誤: {e}"})
+
+    index = 0
+    conditions_name_index_dict = {}
+    conditions = []
+    for condition_id, condition_name, parameter_name in rows:
+        if conditions_name_index_dict.get(condition_name) == None:
+            conditions.append({"name": condition_name, "id": condition_id, "parameters": []})
+            conditions_name_index_dict[condition_name] = index
+            index += 1
+        conditions[conditions_name_index_dict[condition_name]]["parameters"].append(parameter_name)
+
+    return send_response(200, True, "請求成功", {"conditions": conditions})
 
 @bp.get("/delete-condition-by-id")
 def delete_condition_by_id():

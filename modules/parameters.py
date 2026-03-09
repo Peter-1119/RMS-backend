@@ -1,426 +1,235 @@
 # modules/parameters.py
 from flask import Blueprint, request
 from db import db
-from oracle_db import ora_cursor
 from loginFunctions.utils import send_response
-import json
+import json, math
 
-bp = Blueprint("parameters", __name__)
+bp = Blueprint("parameters", __name__, url_prefix="/parameters")
 
-
-def _parse_int(v, default=None):
-    try:
-        return int(v)
-    except Exception:
-        return default
-
-
-def _extract_text_from_node(node):
-    """
-    簡單提取 TipTap node 裡面的 plain text。
-    只處理我們在表格裡會遇到的情境：text / nested content。
-    """
-    if not isinstance(node, dict):
-        return ""
-    if node.get("type") == "text":
-        return node.get("text") or ""
-    text_parts = []
-    for child in node.get("content", []):
-        text_parts.append(_extract_text_from_node(child))
-    return "".join(text_parts).strip()
-
-
-def _find_first_table(doc_json):
-    """
-    在 TipTap doc 裡找第一個 type = 'table' 的節點。
-    """
-    if not isinstance(doc_json, dict):
-        return None
-
-    if doc_json.get("type") == "table":
-        return doc_json
-
-    for child in doc_json.get("content", []):
-        found = _find_first_table(child)
-        if found is not None:
-            return found
-    return None
-
-
-def _parse_condition_table_text(text_content):
-    """
-    解析 content_text 為 [["Header1", "Header2"], ["Val1", "Val2"]] 格式的字串
-    返回: {"Header1": "Val1", "Header2": "Val2"}
-    """
-    if not text_content:
-        return {}
-    try:
-        # 假設存儲格式是 JSON string list of lists
-        import json
-        data = json.loads(text_content)
-        if isinstance(data, list) and len(data) >= 2:
-            headers = data[0] # 第一列是標題
-            # 找到 "條件名稱" 或使用者選擇的那一列 (通常是第二列，或者是標記為使用者選擇的那列)
-            # 根據提示：第二列後續的內容為使用者選擇的條件式樣
-            values = data[1] 
-            
-            result = {}
-            for i, h in enumerate(headers):
-                if i < len(values):
-                    # 排除 "條件名稱" 這個 column 本身，只取後面的條件
-                    if h == "條件名稱": 
-                        continue
-                    result[h] = str(values[i]).strip()
-            return result
-    except Exception as e:
-        print(f"解析條件表文字失敗: {e}")
-    return {}
-
-@bp.post("/parameters/search")
-def search_parameters():
-    body = request.get_json(silent=True) or {}
-
-    # 1. 參數解析
-    doc_status = _parse_int(body.get("status"), 2)
-    if doc_status is None: doc_status = 2
-
-    # 搜尋條件
-    specific_code = (body.get("specific_code") or "").strip() # 適用工程 (SpecCode)
-    machine_code  = (body.get("machine_code") or "").strip()
-    item_code     = (body.get("item_code") or "").strip()
-    program_code  = (body.get("program_code") or "").strip()
+# ==========================================
+# 1. 搜尋 API (Step 3)
+# ==========================================
+@bp.get("/search")
+def search():
+    # 1. 接收參數
+    specific = request.args.get("specific")
+    machine = request.args.get("machine")
+    item = request.args.get("item")
+    code = request.args.get("code")
     
-    # 分頁
-    page      = _parse_int(body.get("page"), 1) or 1
-    page_size = _parse_int(body.get("page_size"), 10) or 10
-    page_size = max(1, min(page_size, 100))
-    offset    = (page - 1) * page_size
+    # 分頁參數
+    try:
+        page = max(1, int(request.args.get("page", 1)))
+        page_size = int(request.args.get("pageSize", 20))
+    except:
+        page = 1
+        page_size = 20
 
-    # 動態條件 (來自前端 Select)
-    raw_conditions = body.get("conditions") or [] 
-    # 判斷是否選擇了任一條件參數 (若有，則強制只查 Instruction)
-    has_condition_filter = any((c.get("parameter_name") or "").strip() for c in raw_conditions)
+    # 動態條件
+    conditions_filter = {k: v for k, v in request.args.items() if k not in ["specific", "machine", "item", "code", "page", "pageSize"]}
+
+    # 防呆
+    if not any([specific, machine, item, code]) and not conditions_filter:
+        return send_response(400, False, "請至少輸入一個查詢條件", {})
+
+    # [邏輯控制 1] 是否需要展開條件表？
+    # 規則：只有在「有輸入 Machine」且「沒有輸入 Item (指示書)」時，才展開條件
+    # 如果只輸入 Code 或 Specific，machine 為 None，這裡會是 False -> 不展開
+    is_instruction_mode = (not item)
+    should_explode_conditions = (machine is not None and len(machine) > 0) and is_instruction_mode
+
+    results = []
+    total_count = 0
 
     try:
-        with db() as (conn, cur):
-            # -------------------------------------------------------
-            # A. 取得機台條件 Headers (用於前端 Table Header 顯示)
-            # -------------------------------------------------------
-            machine_condition_headers = []
-            if machine_code:
-                cur.execute("""
-                    SELECT DISTINCT rc.condition_name
-                    FROM rms_conditions rc
-                    JOIN rms_group_machines rgm ON rc.condition_id = rgm.condition_id
-                    WHERE rgm.machine_id = %s
-                    ORDER BY rc.condition_name
-                """, (machine_code,))
-                machine_condition_headers = [row[0] for row in cur.fetchall()]
-
-            # -------------------------------------------------------
-            # B. 建構 SQL (Base Logic)
-            # -------------------------------------------------------
-            # 核心邏輯：
-            # 1. 主體是 rms_block_content (bc) 的 sub_no=0 (參數表)
-            # 2. 透過 JSON_TABLE 展開 bc.metadata -> programs
-            # 3. Join rms_document_attributes (d) 取得文件屬性
-            # 4. (關鍵) 若是 Instruction，需關聯 sub_no=1 的 block 取得條件表內容
+        with db(dict_cursor=True) as (_, cur):
+            # =================================================================================
+            # 動態組裝 SQL：根據是否展開條件，決定 JOIN 的內容
+            # =================================================================================
             
-            base_sql = """
-                FROM rms_block_content AS bc
-                CROSS JOIN JSON_TABLE(
-                    bc.metadata,
-                    '$.programs[*]'
-                    COLUMNS (
-                        specCode VARCHAR(50) PATH '$.specCode',
-                        specName VARCHAR(255) PATH '$.specName',
-                        programCode VARCHAR(255) PATH '$.programCode'
-                    )
-                ) AS p
-                LEFT JOIN rms_document_attributes AS d 
-                   ON bc.document_token = d.document_token
-            """
+            # 1. Select Clause
+            # [修正 2] raw_content_text 來源改為條件表 (rbc_cond)
+            # 如果不展開條件，這裡就給 NULL，避免混淆
+            cond_text_field = "rbc_cond.content_text" if should_explode_conditions else "NULL"
+            cond_row_field = "jt_cond.row_data" if should_explode_conditions else "NULL"
 
-            # -------------------------------------------------------
-            # C. 建構 WHERE 條件
-            # -------------------------------------------------------
-            where = []
-            params = []
-            
-            # 基本限制
-            where.append("d.status = %s")
-            params.append(doc_status)
-            where.append("bc.sub_no = 0") # 只查參數 Block
-            where.append("JSON_UNQUOTE(JSON_EXTRACT(bc.metadata, '$.kind')) = 'mcr-parameter'")
-
-            # --- 條件 2.2: 若有品目 -> 只查 Spec Document (step_type=5) ---
-            if item_code:
-                where.append("bc.step_type = 5")
-                where.append("JSON_UNQUOTE(JSON_EXTRACT(d.attribute, '$.itemType')) = %s")
-                params.append(item_code)
-            
-            # --- 條件 2.3.2: 若有選條件參數 -> 只查 Instruction Document (step_type=2) ---
-            elif has_condition_filter:
-                where.append("bc.step_type = 2")
-            
-            # --- 條件 2.3.1: 否則搜尋兩者 (step_type IN (2, 5)) ---
-            else:
-                where.append("bc.step_type IN (2, 5)")
-
-            # --- 條件 2.4 / 1: 機台過濾 ---
-            # Spec (step=5): 機台在 metadata.machine
-            # Instruction (step=2): 機台在 document_attribute.machines List 中
-            if machine_code:
-                where.append("""
-                    (
-                        (bc.step_type = 5 AND JSON_UNQUOTE(JSON_EXTRACT(bc.metadata, '$.machine')) = %s)
-                        OR
-                        (bc.step_type = 2 AND JSON_CONTAINS(d.attribute, JSON_OBJECT('code', %s), '$.machines'))
-                    )
-                """)
-                params.extend([machine_code, machine_code])
-
-            # --- 適用工程 (SpecCode) ---
-            # 改為直接查 JSON 展開後的 specCode (metadata 或 programs 裡都有)
-            if specific_code:
-                where.append("p.specCode = %s")
-                params.append(specific_code)
-
-            # --- 程式代碼 ---
-            if program_code:
-                where.append("p.programCode LIKE %s")
-                params.append(f"%{program_code}%")
-
-            # --- 進階條件過濾 (針對 Instruction 的條件表) ---
-            # 因為條件表在 sub_no=1，我們需要用 EXISTS 子查詢來過濾
-            for c in raw_conditions:
-                pname = (c.get("parameter_name") or "").strip()
-                if not pname: continue
-                
-                # 這裡使用 LIKE 來匹配 content_text (如 prompt 所述: [["條件", "厚度"], ["1", "10"]])
-                # 簡單匹配：確保該 document 有一個 sub_no=1 的 block 包含該數值
-                # 注意：這是一個模糊匹配，若要精準需解析 JSON，但在 SQL 層級 LIKE 較快且符合 prompt "content_text LIKE"
-                where.append("""
-                    EXISTS (
-                        SELECT 1 FROM rms_block_content sub_bc
-                        WHERE sub_bc.document_token = bc.document_token
-                          AND sub_bc.step_type = 2
-                          AND sub_bc.sub_no = 1
-                          AND sub_bc.content_text LIKE %s
-                    )
-                """)
-                params.append(f"%{pname}%")
-
-            where_sql = " AND ".join(where) if where else "1=1"
-
-            # -------------------------------------------------------
-            # D. Count 總數
-            # -------------------------------------------------------
-            count_sql = f"SELECT COUNT(*) {base_sql} WHERE {where_sql}"
-            cur.execute(count_sql, params)
-            total = cur.fetchone()[0] or 0
-
-            if total == 0:
-                return send_response(200, False, "查無資料", {
-                    "total": 0, "page": page, "page_size": page_size,
-                    "condition_headers": machine_condition_headers, "items": []
-                })
-
-            # -------------------------------------------------------
-            # E. 撈取資料 (包含條件表的內容)
-            # -------------------------------------------------------
-            # 這裡我們使用一個子查詢來撈取 Instruction 的 Condition Table (step=2, sub=1)
-            data_sql = f"""
+            select_clause = f"""
                 SELECT 
-                    bc.document_token,
-                    d.document_type,
-                    d.attribute,
-                    bc.metadata,
-                    p.specCode,
-                    p.specName,
-                    p.programCode,
-                    -- 嘗試抓取 Instruction 的條件表內容 (step=2, sub=1)
-                    (
-                        SELECT sub_bc.content_text 
-                        FROM rms_block_content sub_bc
-                        WHERE sub_bc.document_token = bc.document_token
-                          AND sub_bc.step_type = 2
-                          AND sub_bc.sub_no = 1
-                        LIMIT 1
-                    ) as condition_table_text
-                {base_sql}
-                WHERE {where_sql}
-                ORDER BY d.issue_date DESC, p.programCode ASC
-                LIMIT %s OFFSET %s
+                    rbc.content_id,
+                    rbc.document_token,
+                    rda.document_name,
+                    rda.document_version,
+                    rda.document_type,
+                    rda.attribute,
+                    
+                    jt_prog.spec_name as process_name,
+                    jt_prog.program_code,
+                    jt_mach.machine_code,
+                    
+                    {cond_row_field} as condition_row_json,
+                    {cond_text_field} as raw_content_text
             """
-            params.extend([page_size, offset])
-            cur.execute(data_sql, params)
+
+            # 2. From & Join Clause
+            # 基礎 JOIN
+            from_clause = """
+                FROM rms_block_content rbc
+                JOIN rms_document_attributes rda ON rbc.document_token = rda.document_token
+                
+                -- [Explode 1] 展開 Programs
+                JOIN JSON_TABLE(
+                    rbc.metadata, 
+                    '$.programs[*]' 
+                    COLUMNS (
+                        program_code VARCHAR(50) PATH '$.programCode',
+                        spec_name VARCHAR(100) PATH '$.specName'
+                    )
+                ) AS jt_prog ON 1=1
+
+                -- [Explode 2] 展開 Machines
+                JOIN JSON_TABLE(
+                    IF(rda.document_type = 1, rbc.metadata->'$.machines', rda.attribute->'$.machines'),
+                    '$[*]' 
+                    COLUMNS (
+                        machine_code VARCHAR(50) PATH '$'
+                    )
+                ) AS jt_mach ON 1=1
+            """
+
+            # [修正 1] 動態加入條件表的 JOIN
+            # 只有需要展開時，才去 JOIN 條件表
+            if should_explode_conditions:
+                from_clause += """
+                    -- [Self Join] 預先關聯條件表 Block
+                    LEFT JOIN rms_block_content rbc_cond 
+                        ON rbc.document_token = rbc_cond.document_token 
+                        AND rbc_cond.step_type = 2 
+                        AND rbc_cond.sub_no = 1
+                    
+                    -- [Explode 3] 展開條件表
+                    JOIN JSON_TABLE(
+                        rbc_cond.content_text,
+                        '$[*]'
+                        COLUMNS (
+                            row_idx FOR ORDINALITY,
+                            row_data JSON PATH '$'
+                        )
+                    ) AS jt_cond ON 1=1
+                """
+
+            # 3. Where Clause
+            where_clauses = ["rbc.step_type IN (2, 5)", "rbc.sub_no = 0"]
+            params = []
+
+            # 如果展開條件，必須排除 Header (row_idx > 1)
+            if should_explode_conditions:
+                where_clauses.append("jt_cond.row_idx > 1")
+
+            # 一般過濾條件
+            if item:
+                where_clauses.append("rda.document_type = 1")
+                where_clauses.append("rda.attribute->>'$.itemType' LIKE %s")
+                params.append(f"%{item}%")
+            elif conditions_filter:
+                # 有搜條件，強制指示書
+                where_clauses.append("rda.document_type = 0")
+
+            if specific:
+                where_clauses.append("jt_prog.spec_name LIKE %s")
+                params.append(f"%{specific}%")
+
+            if code:
+                where_clauses.append("jt_prog.program_code LIKE %s")
+                params.append(f"%{code}%")
+
+            if machine:
+                where_clauses.append("jt_mach.machine_code = %s")
+                params.append(machine)
+
+            # 組合 Where
+            where_sql = "WHERE " + " AND ".join(where_clauses)
+
+            # ===================================================
+            # 執行 Query
+            # ===================================================
+            count_sql = f"SELECT COUNT(*) as total {from_clause} {where_sql}"
+            cur.execute(count_sql, params)
+            total_count = cur.fetchone()['total']
+
+            data_sql = f"{select_clause} {from_clause} {where_sql} LIMIT %s OFFSET %s"
+            cur.execute(data_sql, params + [page_size, (page - 1) * page_size])
             rows = cur.fetchall()
 
-            # -------------------------------------------------------
-            # F. 組裝回傳資料
-            # -------------------------------------------------------
-            items = []
+            # --- 後處理 ---
             for row in rows:
-                (token, doc_type, attr_json, meta_json, spec_code, spec_name, prog_code, cond_text) = row
+                cond_dict = {}
                 
-                # 解析 Attribute
-                attr = attr_json if isinstance(attr_json, dict) else (json.loads(attr_json) if attr_json else {})
-                meta = meta_json if isinstance(meta_json, dict) else (json.loads(meta_json) if meta_json else {})
+                # 只有在需要展開時，這裡才會有值
+                if row.get('condition_row_json') and row.get('raw_content_text'):
+                    try:
+                        # 這裡的 raw_content_text 已經修正為 rbc_cond (條件表)
+                        full_table = json.loads(row['raw_content_text'])
+                        headers = full_table[0] if len(full_table) > 0 else []
+                        curr_row_data = json.loads(row['condition_row_json'])
+                        
+                        is_match = True
+                        for idx, h in enumerate(headers):
+                            val = curr_row_data[idx] if idx < len(curr_row_data) else ""
+                            cond_dict[h] = val
+                            # 動態條件過濾
+                            if h in conditions_filter and conditions_filter[h] not in str(val):
+                                is_match = False
+                        
+                        if not is_match: continue
 
-                # 1. 處理機台名稱顯示
-                display_machine = ""
-                if doc_type == 1: # Spec
-                    # Spec: machineName 在 metadata 中
-                    display_machine = meta.get("machineName") or meta.get("machine") or ""
-                else: # Instruction
-                    # Instruction: 機台在 attribute.machines (Array)
-                    # 我們嘗試找出符合搜尋條件的機台，若沒搜尋機台，則列出全部或第一個
-                    machines_list = attr.get("machines") or []
-                    match_m = None
-                    if machine_code:
-                        match_m = next((m for m in machines_list if m.get("code") == machine_code), None)
-                    
-                    if match_m:
-                        display_machine = match_m.get("name") or match_m.get("code")
-                    elif machines_list:
-                        # 沒搜機台時，顯示第一個，或標示多個
-                        first = machines_list[0]
-                        display_machine = first.get("name") or first.get("code")
-                        if len(machines_list) > 1:
-                            display_machine += "..."
+                    except Exception as e:
+                        print(f"Parse Condition Error: {e}")
 
-                # 2. 處理條件欄位 (Conditions)
-                conditions_map = {}
-                if doc_type == 0 and cond_text: # Instruction 才有條件表
-                     # 解析 [["Header".,.], ["Val"...]]
-                     conditions_map = _parse_condition_table_text(cond_text)
-
-                # 3. 處理 Spec Name (題目要求 Instruction 也要顯示 specName 而非 applyProject)
-                # 我們已經從 JSON_TABLE (p.specName) 拿到了，直接用即可
-                display_spec_name = spec_name 
-
-                items.append({
-                    "document_token": token,
-                    "document_type": doc_type,
-                    "specific_name": display_spec_name, # 適用工程 (顯示名稱)
-                    "machine_code": display_machine,    # 機台 (顯示名稱)
-                    "item_code": attr.get("itemType") if doc_type == 1 else "", # 品目 (Spec only)
-                    "program_code": prog_code,
-                    "spec_code": spec_code,
-                    "conditions": conditions_map        # 動態條件 Mapping
+                results.append({
+                    "content_id": row['content_id'], 
+                    "document_name": row['document_name'],
+                    "version": row['document_version'],
+                    "process": row['process_name'],
+                    "machine": row['machine_code'],
+                    "program_code": row['program_code'],
+                    "item": json.loads(row['attribute']).get('itemType', '') if row['attribute'] else '',
+                    "conditions": cond_dict,
+                    "document_token": row['document_token']
                 })
 
-            return send_response(200, False, "查詢成功", {
-                "total": total,
-                "page": page,
-                "page_size": page_size,
-                "condition_headers": machine_condition_headers,
-                "items": items,
-            })
+        return send_response(200, True, "搜尋成功", {
+            "items": results,
+            "total": total_count,
+            "page": page,
+            "pageSize": page_size,
+            "totalPages": math.ceil(total_count / page_size)
+        })
 
     except Exception as e:
-        print("ERROR:", e)
-        return send_response(500, True, "查詢失敗", {"message": str(e)})
+        import traceback
+        traceback.print_exc()
+        return send_response(500, False, f"搜尋發生錯誤: {str(e)}", {})
     
-    
-@bp.get("/parameters/<document_token>/blocks")
-def get_parameter_blocks(document_token):
-    """
-    STEP 4：取得被選中的配方的參數表。
-    """
-    step_type = _parse_int(request.args.get("step_type"), 2) or 2
-
+# ==========================================
+# 2. 取得單一 Block 內容 (Step 4)
+# ==========================================
+@bp.get("/block/<content_id>")
+def get_block_by_id(content_id):
     try:
         with db() as (conn, cur):
-            # 只取 sub_no = 0 的那一格當作主製程參數 table
-            cur.execute("""
-                SELECT content_json
-                FROM rms_block_content
-                WHERE document_token = %s
-                  AND step_type = %s
-                  AND sub_no = 0
-                ORDER BY tier_no
-                LIMIT 1
-            """, (document_token, step_type))
-            row = cur.fetchone()
+            # 1. 只撈 content_text
+            cur.execute("SELECT content_text FROM rms_block_content WHERE content_id = %s", (content_id,))
+            result = cur.fetchone()
 
-        if not row:
-            return send_response(200, False, "查無此文件的參數表", {
-                "rows": []
-            })
+        # 2. 防呆：如果資料庫找不到這筆 ID，先 return，不然下面的 result[0] 會報錯
+        if not result:
+            return send_response(400, False, "查無此參數區塊", {"rows": []})
+        
+        # 3. 解析 JSON (如果 content_text 是空字串或 None，就回傳空陣列)
+        # 這裡將 key 命名為 "rows" 是為了配合前端 ParametersSearch.vue 的寫法
+        rows = json.loads(result[0]) if result[0] else []
 
-        content_json_str = row[0]
-        if not content_json_str:
-            return send_response(200, False, "此章節沒有 content_json", {
-                "rows": []
-            })
-
-        try:
-            doc = json.loads(content_json_str)
-        except Exception:
-            return send_response(500, True, "JSON 解析失敗", {
-                "rows": [],
-                "message": "content_json 不是合法 JSON，請檢查資料。"
-            })
-
-        table = _find_first_table(doc)
-        if table is None:
-            return send_response(200, False, "此章節內沒有找到表格", {
-                "rows": []
-            })
-
-        rows_out = []
-        row_nodes = table.get("content") or []
-        if len(row_nodes) <= 1:
-            return send_response(200, False, "參數表沒有資料列", {
-                "rows": []
-            })
-
-        data_rows = row_nodes[1:]
-
-        column_keys = [
-            "tank_name",   # 槽體名稱
-            "param_name",  # 參數名稱
-            "spec_upper",  # 規格上限
-            "op_upper",    # 操作上限
-            "center",      # 中值
-            "op_lower",    # 操作下限
-            "spec_lower",  # 規格下限
-            "unit",        # 單位
-            "down_flag",   # 參數下放
-            "remark",      # 說明
-        ]
-
-        for rnode in data_rows:
-            if rnode.get("type") != "tableRow":
-                continue
-            cells = (rnode.get("content") or [])
-            row_dict = {}
-
-            for idx, cell in enumerate(cells):
-                if idx >= len(column_keys):
-                    break
-                key = column_keys[idx]
-                text = _extract_text_from_node(cell)
-                row_dict[key] = text
-
-            for k in column_keys:
-                row_dict.setdefault(k, "")
-
-            if not any(row_dict.values()):
-                continue
-
-            rows_out.append(row_dict)
-
-        return send_response(200, False, "取得參數表成功", {
-            "rows": rows_out
-        })
-
+        return send_response(200, True, "取得成功", {"rows": rows})
+        
     except Exception as e:
-        print("ERROR in /parameters/<token>/blocks:", e)
-        return send_response(500, True, "取得參數表失敗", {
-            "rows": [],
-            "message": f"資料庫錯誤: {e}"
-        })
-
+        return send_response(500, False, f"資料庫錯誤: {e}", {})

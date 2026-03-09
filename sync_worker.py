@@ -40,5 +40,18 @@ def sync_loop(interval_seconds: int = 1200):
 
 
 if __name__ == "__main__":
-    # 單獨跑這個檔案，用來手動測試 worker 用
-    sync_loop(1200)
+    # # 單獨跑這個檔案，用來手動測試 worker 用
+    # sync_loop(1200)
+
+    try:
+        resp = sync_eip()   # 這裡直接呼叫你的 view function
+        try:
+            data = resp.get_json()
+        except Exception:
+            # 避免非 JSON 時卡住
+            data = getattr(resp, "data", None)
+            if isinstance(data, (bytes, bytearray)):
+                data = data.decode("utf-8", errors="ignore")
+        print("[sync_eip worker] result:", data)
+    except Exception as e:
+        print("[sync_eip worker] ERROR:", e)

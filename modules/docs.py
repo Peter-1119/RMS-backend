@@ -1,6 +1,7 @@
 # modules/docs.py
 from __future__ import annotations
-import datetime, os, uuid, re, json
+import datetime, os, uuid, re, json, math
+from datetime import timezone, timedelta
 from decimal import Decimal
 
 # Flask's send_file must be explicitly imported
@@ -18,6 +19,37 @@ bp = Blueprint("docs", __name__)
 LOCK_STATUS_SET = {"審核中", "已簽核", "作廢", "否決", "退回申請者"}
 STATUS_MAP = {"審核中": 1, "正常結案": 2, "作廢": 3, "否決": 4, "退回申請者": 5}
 
+TZ_TW = timezone(timedelta(hours=8))
+
+def db_data_fetch(sql, fetch_one = False):
+    try:
+        with db() as (_, cur):
+            cur.execute(sql)
+            return cur.fetchall() if not fetch_one else cur.fetchone(), "Success"
+    
+    except Exception as e:
+        return [], e
+
+def db_update(sql):
+    try:
+        with db() as (conn, cur):
+            cur.execute(sql)
+            conn.commit()
+        return "Success"
+
+    except Exception as e:
+        print(f"Error result: {e}")
+        return "Failed"
+
+def odb_data_fetch(sql):
+    try:
+        with odb() as cur:
+            cur.execute(sql)
+            return cur.fetchall(), "Success"
+    
+    except Exception as e:
+        return [], e
+
 # ---- Attributes ------------------------------------------------
 @bp.post("/init")
 def init_doc():
@@ -25,11 +57,7 @@ def init_doc():
     doc_type = int(body.get("document_type", 0))
     token = new_token()
     with db() as (conn, cur):
-        cur.execute("""
-          INSERT INTO rms_document_attributes
-          (document_type, EIP_id, status, document_token, document_version, issue_date)
-          VALUES (%s,%s,%s,%s,1.00,NOW())
-        """, (doc_type, None, 0, token))
+        cur.execute("INSERT INTO rms_document_attributes (document_type, EIP_id, status, document_token, document_version, issue_date) VALUES (%s,%s,%s,%s,1.00,NOW())", (doc_type, None, 0, token))
     return jsonify({"success": True, "token": token})
 
 @bp.get("/get-personnel")
@@ -92,7 +120,7 @@ def save_draft_all():
     form  = body.get("form") or {}
     block_requests = body.get("blockRequests") or []
     param_requests = body.get("paramRequests") or []
-    refs          = body.get("references") or {}
+    refs           = body.get("references") or {}
 
     # 🔒 先檢查是否已經在 EIP 產生正式狀態
     # 注意：如果是新建、第一次儲存，token 可能還查不到 document_id，is_document_locked 會回 False
@@ -128,12 +156,7 @@ def save_draft_all():
 
         # --- 1.1 upsert attributes（跟 save_attributes 幾乎一樣） ---
         cur.execute("""
-          UPDATE rms_document_attributes
-          SET document_type=%s, previous_document_token=%s,
-              document_id=%s, document_name=%s, document_version=%s,
-              attribute=%s, department=%s, author_id=%s, author=%s,
-              approver=%s, confirmer=%s, change_reason=%s, change_summary=%s, purpose=%s,
-              issue_date=NOW()
+          UPDATE rms_document_attributes SET document_type=%s, previous_document_token=%s, status=1, document_id=%s, document_name=%s, document_version=%s, attribute=%s, department=%s, author_id=%s, author=%s, approver=%s, confirmer=%s, change_reason=%s, change_summary=%s, purpose=%s, issue_date=NOW()
           WHERE document_token=%s
         """, (f["document_type"], f["prev_token"],
               f["doc_id"], f["doc_name"], f["doc_ver"],
@@ -143,12 +166,9 @@ def save_draft_all():
 
         if cur.rowcount == 0:
             cur.execute("""
-              INSERT INTO rms_document_attributes
-              (document_type, EIP_id, status, document_token, previous_document_token,
-               document_id, document_name, document_version, attribute, department,
-               author_id, author, approver, confirmer, issue_date, change_reason, change_summary, purpose)
+              INSERT INTO rms_document_attributes (document_type, EIP_id, status, document_token, previous_document_token, document_id, document_name, document_version, attribute, department, author_id, author, approver, confirmer, issue_date, change_reason, change_summary, purpose)
               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),%s,%s,%s)
-            """, (f["document_type"], None, 0, token, f["prev_token"],
+            """, (f["document_type"], None, 1, token, f["prev_token"],
                   f["doc_id"], f["doc_name"], f["doc_ver"], f["attr_json"], f["dept"],
                   f["author_id"], f["author"], f["approver"], f["confirmer"],
                   f["chg_reason"], f["chg_summary"], f["purpose"]))
@@ -574,19 +594,19 @@ def load_snapshot_draft_all(token):
 
     # ---------- 先抓 snapshot row ----------
     with db(dict_cursor=True) as (conn, cur):
-        where = ["document_token = %s"]
+        where = ["rds.document_token = %s"]
         params = [token]
 
         if rms_id:
             # 如果有帶 rms_id，就鎖定在這張 RMS 單的 snapshot
-            where.append("rms_id = %s")
+            where.append("rds.rms_id = %s")
             params.append(rms_id)
 
         where_sql = " AND ".join(where)
 
         cur.execute(f"""
-            SELECT *
-            FROM rms_document_snapshots
+            SELECT rdsp.document_row, rdsp.blocks_rows, rdsp.references_rows FROM rms_document_snapshot_payloads AS rdsp
+            JOIN rms_document_snapshots AS rds ON rds.snapshot_id = rdsp.snapshot_id
             WHERE {where_sql}
             ORDER BY created_at DESC
             LIMIT 1
@@ -857,202 +877,9 @@ def create_revision():
     })
 
 # ----- EIP Process ----- #
-
-def apply_snapshot_to_main_db(snap_row, oracle_row):
-    """
-    snap_row: 來自 rms_document_snapshots 的一列（只有 meta，有 snapshot_id）
-    oracle_row: 來自 Oracle.RMS_DCC2EIP 的一列
-    """
-    token   = snap_row["document_token"]
-    rms_id  = snap_row["rms_id"]
-    snap_id = snap_row["snapshot_id"]
-
-    # 🔹 從 payload table 撈 JSON
-    payload     = _load_snapshot_payload(snap_id)
-    doc_snap    = payload["document_row"]     or {}
-    blocks_snap = payload["blocks_rows"]      or []
-    refs_snap   = payload["references_rows"]  or []
-
-    # 解析 Oracle 欄位（依你實際欄位順序調整 index）
-    RMS_ID          = oracle_row[0]
-    RMS_DCCNO       = oracle_row[1]
-    RMS_VER         = float(oracle_row[2] or snap_row["document_version"] or 1.0)
-    RMS_DCCNAME     = oracle_row[3]
-    RMS_INSDT       = oracle_row[4]
-    EIPNO           = oracle_row[5]
-    EIP_USER        = oracle_row[6]
-    EIP_CREATEDT    = oracle_row[7]
-    EIP_STATUS_STR  = (oracle_row[8] or "").strip()
-    DECISION_USER   = oracle_row[9]
-    DECISION_COMMENT= oracle_row[10]
-
-    status_int = STATUS_MAP.get(EIP_STATUS_STR, 2)  # 找不到就當正常結案
-
-    with db(dict_cursor=True) as (conn, cur):
-        # 1) 用 snapshot 的 document_row 回寫大部分欄位，再疊 Oracle 資訊
-        cur.execute("""
-            UPDATE rms_document_attributes
-            SET document_type   = %s,
-                EIP_id          = %s,
-                status          = %s,
-                document_id     = %s,
-                document_name   = %s,
-                document_version= %s,
-                attribute       = %s,
-                department      = %s,
-                author_id       = %s,
-                author          = %s,
-                approver        = %s,
-                confirmer       = %s,
-                rejecter        = %s,
-                issue_date      = %s,
-                change_reason   = %s,
-                change_summary  = %s,
-                reject_reason   = %s,
-                purpose         = %s
-            WHERE document_token = %s
-        """, (
-            doc_snap.get("document_type"),
-            EIPNO,                             # EIP_id
-            status_int,                        # status
-            RMS_DCCNO or doc_snap.get("document_id"),
-            RMS_DCCNAME or doc_snap.get("document_name"),
-            RMS_VER,
-            jdump(_normalize_metadata(doc_snap.get("attribute"))),
-            doc_snap.get("department"),
-            doc_snap.get("author_id"),
-            doc_snap.get("author"),
-            doc_snap.get("approver"),
-            doc_snap.get("confirmer"),
-            DECISION_USER or doc_snap.get("rejecter"),
-            EIP_CREATEDT or RMS_INSDT or doc_snap.get("issue_date"),
-            doc_snap.get("change_reason"),
-            doc_snap.get("change_summary"),
-            DECISION_COMMENT or doc_snap.get("reject_reason"),
-            doc_snap.get("purpose"),
-            token,
-        ))
-
-        # 2) 先刪掉現在主表的 blocks / refs，再用 snapshot 重灌
-        cur.execute("DELETE FROM rms_block_content WHERE document_token=%s", (token,))
-        cur.execute("DELETE FROM rms_references WHERE document_token=%s", (token,))
-
-        # 2-1) 還原 blocks
-        if blocks_snap:
-            ins_blk = """
-              INSERT INTO rms_block_content
-              (content_id, document_token, step_type, tier_no, sub_no, content_type,
-               header_text, header_json, content_text, content_json, files, metadata,
-               created_at, updated_at)
-              VALUES
-              (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            """
-            for b in blocks_snap:
-                cur.execute(ins_blk, (
-                    b.get("content_id") or new_token(),
-                    b.get("document_token") or token,
-                    b.get("step_type"),
-                    b.get("tier_no"),
-                    b.get("sub_no"),
-                    b.get("content_type"),
-                    b.get("header_text"),
-                    jdump(_normalize_metadata(b.get("header_json"))),
-                    b.get("content_text"),
-                    jdump(_normalize_metadata(b.get("content_json"))),
-                    jdump(_normalize_metadata(b.get("files"))),
-                    jdump(_normalize_metadata(b.get("metadata"))),
-                    b.get("created_at") or datetime.datetime.now(),
-                    b.get("updated_at") or datetime.datetime.now(),
-                ))
-
-        # 2-2) 還原 references
-        if refs_snap:
-            ins_ref = """
-              INSERT INTO rms_references
-              (id, document_token, refer_type, refer_document, refer_document_name, created_at)
-              VALUES (%s,%s,%s,%s,%s,%s)
-            """
-            for r in refs_snap:
-                cur.execute(ins_ref, (
-                    r.get("id"),
-                    r.get("document_token") or token,
-                    r.get("refer_type"),
-                    r.get("refer_document"),
-                    r.get("refer_document_name"),
-                    r.get("created_at") or datetime.datetime.now(),
-                ))
-
-        # 3) 更新 snapshot 本身狀態（這裡留著也沒關係，等一下會整批刪掉）
-        cur.execute("""
-            UPDATE rms_document_snapshots
-            SET sync_status = 2, synced_at = NOW()
-            WHERE document_token = %s AND rms_id <> %s AND sync_status = 0
-        """, (token, rms_id))
-
-        cur.execute("""
-            UPDATE rms_document_snapshots
-            SET sync_status = 1, synced_at = NOW()
-            WHERE snapshot_id = %s
-        """, (snap_row["snapshot_id"],))
-
-        conn.commit()
-
-def _apply_reject_status_to_main_attributes(snap_row, oracle_row):
-    token = snap_row["document_token"]
-
-    RMS_DCCNO       = oracle_row[1]
-    RMS_VER         = oracle_row[2]
-    RMS_DCCNAME     = oracle_row[3]
-    DECISION_USER   = oracle_row[9]
-    DECISION_COMMENT= oracle_row[10]
-
-    with db(dict_cursor=True) as (conn, cur):
-        cur.execute("""
-            UPDATE rms_document_attributes
-            SET rejecter        = %s,
-                reject_reason   = %s,
-                document_id     = COALESCE(%s, document_id),
-                document_name   = COALESCE(%s, document_name),
-                document_version= COALESCE(%s, document_version)
-            WHERE document_token = %s
-        """, (
-            DECISION_USER,
-            DECISION_COMMENT,
-            RMS_DCCNO,
-            RMS_DCCNAME,
-            RMS_VER,
-            token,
-        ))
-        conn.commit()
-
-def _load_snapshot_payload(snapshot_id: int):
-    """
-    依 snapshot_id 從 rms_document_snapshot_payloads 撈出
-    document_row / blocks_rows / references_rows。
-    回傳 dict：{"document_row": dict, "blocks_rows": list, "references_rows": list}
-    """
-    with db(dict_cursor=True) as (conn, cur):
-        cur.execute("""
-            SELECT document_row, blocks_rows, references_rows
-            FROM rms_document_snapshot_payloads
-            WHERE snapshot_id = %s
-        """, (snapshot_id,))
-        row = cur.fetchone()
-
-    if not row:
-        raise RuntimeError(f"snapshot payload not found for snapshot_id={snapshot_id}")
-
-    # MySQL JSON type 會直接給 dict/list；為安全起見，用 _normalize_metadata / jload 再處理一次
-    doc_row   = _normalize_metadata(row.get("document_row"))   or {}
-    blocks_rs = _normalize_metadata(row.get("blocks_rows"))    or []
-    refs_rs   = _normalize_metadata(row.get("references_rows")) or []
-
-    return {
-        "document_row":   doc_row,
-        "blocks_rows":    blocks_rs,
-        "references_rows": refs_rs,
-    }
-
+# ----------------------------------------------------
+# 輔助函數：處理 Oracle 端 RMS_DCC2EIP 的 RMS_ID 欄位
+# ----------------------------------------------------
 def _normalize_metadata(raw):
     """
     確保 metadata 是 dict/list，而不是被 double-JSON 的字串。
@@ -1074,374 +901,239 @@ def _normalize_metadata(raw):
         v = parsed
     return v
 
-def _rebind_mcr_program_codes(cur, latest_token: str):
-    """
-    重新把 MCR 的程式碼 (program_code) 綁到最新版本的 document_token 上。
+placeholder = lambda x: ','.join(['%s'] * len(x))
+list2SqlList = lambda l: "','".join(l)
+def _data_compilation(status, rows, docs_filter = None):
+    data, delete_id_list = {}, []
+    for row in rows:
+        if row[8] in status and (docs_filter == None or f"{row[1]} {row[2]}" not in docs_filter):
+            if data.get(row[1]) == None:
+                data[row[1]] = {"rms_id": row[0], "doc_version": row[2], "doc_name": row[3], "eip_no": row[5], "eip_createdt": row[7], "decision_user": row[9], "decision_comment": row[10]}
+            else:
+                delete_id_list.append(row[0])
+    return data, delete_id_list
 
-    規則：
-      - 從最新版本該文件的 rms_block_content.metadata 中找出
-        kind = "mcr-parameter" 的資料
-      - 取出所有 programs[].programCode
-      - 在 rms_program_code 中用這些 program_code 更新 document_token = latest_token, status = 1
-    """
-    # 1) 把這份文件所有 block 的 metadata 抓出來
-    cur.execute("""
-        SELECT metadata
-        FROM rms_block_content
-        WHERE document_token = %s
-          AND metadata IS NOT NULL
-    """, (latest_token,))
-    rows = cur.fetchall() or []
-
-    program_codes = set()
-
-    for r in rows:
-        meta = _normalize_metadata(r.get("metadata"))
-        if not isinstance(meta, dict):
-            continue
-        if meta.get("kind") != "mcr-parameter":
-            continue
-
-        for p in meta.get("programs") or []:
-            code = (p.get("programCode") or "").strip()
-            if code:
-                program_codes.add(code)
-
-    if not program_codes:
-        return  # 沒有任何程式碼要綁定
-
-    placeholders = ",".join(["%s"] * len(program_codes))
+ATTRIBUTE_ORDER = ["document_type", "EIP_id", "status", "document_token", "previous_document_token", "document_id", "document_name", "document_version", "attribute", "department", "author_id", "author", "approver", "confirmer", "rejecter", "issue_date", "change_reason", "change_summary", "reject_reason", "purpose"]
+BLOCK_CONTENT_ORDER = ["content_id", "document_token", "step_type", "tier_no", "sub_no", "content_type", "header_text", "header_json", "content_text", "content_json", "files", "metadata", "created_at", "updated_at"]
+REFERENCE_ORDER = ["document_token", "refer_type", "refer_document", "refer_document_name", "created_at"]
+def apply_snapshots_to_main_db(signed_docs):
+    rms_id_map = {info["rms_id"]: info for info in signed_docs.values()}
+    signed_rms_id_list = list(rms_id_map.keys())
     sql = f"""
-        UPDATE rms_program_code
-        SET document_token = %s,
-            status = 1
-        WHERE program_code IN ({placeholders})
+        SELECT rds.rms_id, rds.document_token, rdsp.document_row, rdsp.blocks_rows, rdsp.references_rows, rdsp.program_codes_rows FROM rms_document_snapshots AS rds 
+        JOIN rms_document_snapshot_payloads AS rdsp ON rds.snapshot_id = rdsp.snapshot_id
+        WHERE rds.rms_id IN ({placeholder(signed_rms_id_list)})
     """
-    params = [latest_token] + list(program_codes)
-    cur.execute(sql, params)
 
-def _row_ts(row):
-    """
-    Oracle row 的時間欄位：
-      - 優先 EIP_CREATEDT (idx=7)
-      - 退而求其次 RMS_INSDT (idx=4)
-    """
-    return row[7] or row[4] or datetime.datetime.min
+    # 用來存放 executemany 的參數列表
+    attr_params_list = []
+    block_params_list = []
+    ref_params_list = []
+    program_codes_params_list = []
+
+    parse_func = lambda r: json.dumps(r) if isinstance(r, dict) else r
+    try:
+        with db(dict_cursor = True) as (conn, cur):
+            cur.execute(sql, signed_rms_id_list)
+            rows = cur.fetchall()
+
+            for row in rows:
+                oracle_info = rms_id_map.get(row["rms_id"], {})
+                doc_snap = json.loads(row["document_row"]) or {}
+                blocks_snap = json.loads(row["blocks_rows"]) or []
+                refs_snap = json.loads(row["references_rows"]) or []
+                codes_snap = json.loads(row["program_codes_rows"]) or []
+
+                doc_snap = {**doc_snap, "EIP_id": oracle_info.get("eip_no"), "status": 2, "issue_date": oracle_info.get("eip_createdt")}
+
+                attr_params_list.append([parse_func(doc_snap.get(key)) for key in ATTRIBUTE_ORDER])
+                for b in blocks_snap:
+                    b_ = {**b, "created_at": oracle_info.get("eip_createdt")}
+                    block_params_list.append([parse_func(b_[key]) for key in BLOCK_CONTENT_ORDER])
+                for r in refs_snap:
+                    r_ = {**r, "created_at": oracle_info.get("eip_createdt")}
+                    ref_params_list.append([parse_func(r_[key]) for key in REFERENCE_ORDER])
+                program_codes_params_list = [[doc_snap["document_token"], code] for code in codes_snap]
+
+            if attr_params_list:
+                cols = ",".join(ATTRIBUTE_ORDER)
+                sql_insert_attr = f"INSERT INTO rms_document_attributes ({cols}) VALUES ({placeholder(ATTRIBUTE_ORDER)})"
+                cur.executemany(sql_insert_attr, attr_params_list)
+
+                if block_params_list:
+                    cols = ",".join(BLOCK_CONTENT_ORDER)
+                    sql_insert_block = f"INSERT INTO rms_block_content ({cols}) VALUES ({placeholder(BLOCK_CONTENT_ORDER)})"
+                    cur.executemany(sql_insert_block, block_params_list)
+
+                if ref_params_list:
+                    cols = ",".join(REFERENCE_ORDER)
+                    sql_insert_ref = f"INSERT INTO rms_references ({cols}) VALUES ({placeholder(REFERENCE_ORDER)})"
+                    cur.executemany(sql_insert_ref, ref_params_list)
+
+                if program_codes_params_list:
+                    sql_update_code = "UPDATE rms_program_code SET document_token = %s, status = 1 WHERE program_code = %s"
+                    cur.executemany(sql_update_code, program_codes_params_list)
+
+            conn.commit()
+        return "Success"
+
+    except Exception as e:
+        print(f"Error in apply_snapshots_to_main_db: {e}")
+        return "Failed"
 
 @bp.post("/sync-eip")
 def sync_eip():
     """
-    EIP 同步（簡化版邏輯）：
+    Docstring for sync_eip_
+        sync_eip API - Process
+            1. 處理已簽核文件
+            -- 1.1 (Oracle) 取得"簽核成功"的文件
+            -- 1.2 (MySQL)  刪除 other document attribute drafts which is the same version, and previous version contents & references, signed draft (連動刪除 content block, references, program code)
+            -- 1.3 (MySQL)  將簽核成功(簽核成功)文件資料利用 snapshots 進行回溯 & update issue_date
+            -- 1.4 (MySQL)  將新版(簽核成功)文件 document_token 取代舊版 document_token 的 program code (program code status = 9 release)
+            -- 1.5 (MySQL)  刪除簽核成功文件相關的 snapshots (where document_id is the same with signed document) 
+            -- 1.6 (Oracle) 更新 RMS_DCC2EIP 的 RMS_ID 為 NULL (where document_id is the same with signed document)
 
-    對每一個 document_id：
-      1) 只處理 sync_status = 0 的 snapshot（待同步）
-      2) 從 Oracle 抓出所有該文件的紀錄（EIP_STATUS IS NOT NULL）
-      3) 對每一個版本（RMS_VER）做判斷：
+            2. 處理作廢文件
+            -- 2.1 (Oracle) 取得"作廢"文件
+            -- 2.2 (MySQL)  刪除作廢文件的 snapshots
+            -- 2.3 (Oracle) 更新 RMS_DCC2EIP 的 RMS_ID 為 NULL (Only update RMS_DCC2EIP table where EIP_status = '作廢')
 
-         (A) 若該版本有「已簽核」：
-             -> 用對應 snapshot 回寫主表
-             -> 刪除該文件 + 該版本的所有 snapshots
+            3. 處理(否決, 退回申請者)文件
+            -- 3.1 (Oracle) 取得(否決, 退回申請者)文件
+            -- 3.2 (Python) 取得每份('否決', '退回申請者')的最新版以及列出舊版('否決', '退回申請者')清單 (利用 RMS_DCCNO, RMS_VER 歸類並用 EIP_CREATEDT 排序)
+            -- 3.3 (MySQL)  將最新的拒絕文件更新在該草稿資訊中
+            -- 3.4 (MySQL)  刪除舊版拒絕文件的 snapshot
+            -- 3.5 (MySQL)  更新每份最後一次被拒絕的文件 sync_status = 2 FROM rms_document_snapshots
+            -- 3.6 (Oracle) 更新 RMS_DCC2EIP 的 RMS_ID 為 NULL (Only update RMS_DCC2EIP table where EIP_status IN ('否決', '退回申請者'))
 
-         (B) 若該版本沒有「已簽核」，但有「否決 / 退回申請者」：
-             -> 找出該版本最新的一筆 否決/退回 Oracle row
-             -> 找到對應 RMS_ID 的 snapshot
-             -> 回寫退回資訊到主表
-             -> 標記這一筆 snapshot 為 sync_status = 2
-             -> 刪除同一個 document + version 下「其它 sync_status = 2 的舊退回 snapshot」
-                （保留草稿/已下載/審核中的 snapshot，不刪）
-
-         (C) 其它狀態：略過
+            4. 處理送審中文件
+            -- 4.1 (Oracle) 取得"送審中"文件
+            -- 4.2 (MySQL)  更新 rms_document_snapshots synced_at = NOW()
     """
-    pending = _get_pending_snapshots_grouped_by_doc_id()  # 只包含 sync_status=0
-    doc_ids = list(pending.keys())
+    data, info = odb_data_fetch("""SELECT RMS_ID, RMS_DCCNO, RMS_VER, RMS_DCCNAME, RMS_INSDT, EIPNO, EIP_USER, EIP_CREATEDT,
+            CASE WHEN HAS_SIGNED > 0 AND (EIP_STATUS != '已簽核' OR EIP_STATUS IS NULL) THEN '作廢' WHEN EIP_STATUS IS NOT NULL THEN EIP_STATUS ELSE EIP_STATUS END AS EIP_STATUS, DECISION_USER, DECISION_COMMENT
+        FROM (SELECT t.*, COUNT(CASE WHEN EIP_STATUS = '已簽核' THEN 1 END) OVER (PARTITION BY RMS_DCCNO, RMS_VER) AS HAS_SIGNED FROM IDBUSER.RMS_DCC2EIP t)
+        WHERE (EIP_STATUS IS NOT NULL OR HAS_SIGNED > 0) AND RMS_DCCNAME IS NOT NULL
+        ORDER BY CASE WHEN EIP_STATUS = '已簽核' THEN 0 ELSE 1 END, EIP_CREATEDT DESC"""
+    )
 
-    if not doc_ids:
-        return jsonify({"success": True, "updated": 0, "message": "no pending snapshots"})
+    if info != "Success":
+        return jsonify({"Success": False, "error": "Connect database error, please try again!"}), 500
 
-    # 1) 先挑出 EIP_STATUS IS NOT NULL 的 oracle rows
-    #    _fetch_oracle_rows_for_doc_ids 預設就只抓 EIP_STATUS IS NOT NULL
-    oracle_map = _fetch_oracle_rows_for_doc_ids(doc_ids, include_NULL=False)
+    signed_docs, signed_delete_id_list = _data_compilation(["已簽核"], data)
+    rejected_docs, rejected_delete_id_list = _data_compilation(["否決", "退回申請者"], data, docs_filter = [f"{doc_id} {doc_info['doc_version']}" for doc_id, doc_info in signed_docs.items()])
+    invalid_docs = [row[0] for row in data if row[8] == '作廢']
+    submitted_docs = [row[0] for row in data if row[8] == '審核中' and signed_docs.get(row[1]) == None]
 
-    updated = 0
+    # Process signed document data
+    signed_rms_id_list = [doc_info["rms_id"] for doc_info in signed_docs.values()]
+    if len(signed_rms_id_list) > 0:
+        sql = f"""
+            DELETE rbc FROM rms_block_content AS rbc
+            JOIN rms_document_attributes AS rda ON rbc.document_token = rda.previous_document_token
+            JOIN rms_document_snapshots AS rds ON rda.document_token = rds.document_token
+            WHERE rds.rms_id IN ('{list2SqlList(signed_rms_id_list)}')
+        """
+        db_status = db_update(sql)
+        if db_status == "Failed":
+            return jsonify({"Success": False, "error": "Step 1.2 rms_block_content previous content block delete failed"})
 
-    for doc_id, snaps in pending.items():
-        o_rows = oracle_map.get(doc_id) or []
-        if not o_rows:
-            # 這個文件在 EIP 還沒有任何有狀態的紀錄：直接跳過
-            continue
+        sql = f"""
+            DELETE rf FROM rms_references AS rf
+            JOIN rms_document_attributes AS rda ON rf.document_token = rda.previous_document_token
+            JOIN rms_document_snapshots AS rds ON rda.document_token = rds.document_token
+            WHERE rds.rms_id IN ('{list2SqlList(signed_rms_id_list)}')
+        """
+        db_status = db_update(sql)
+        if db_status == "Failed":
+            return jsonify({"Success": False, "error": "Step 1.2 rms_references previous references delete failed"})
 
-        # ---- 依版本（RMS_VER）分組 Oracle rows ----
-        by_ver = {}
-        for r in o_rows:
-            try:
-                ver = float(r[2]) if r[2] is not None else None  # RMS_VER
-            except ValueError:
-                ver = None
-            by_ver.setdefault(ver, []).append(r)
+        sql = f"""
+            DELETE rda FROM rms_document_attributes AS rda
+            JOIN rms_document_snapshots AS rds ON rds.rms_id IN ('{list2SqlList(signed_rms_id_list)}') AND rda.document_id = rds.document_id AND rda.document_version = rds.document_version
+        """
+        db_status = db_update(sql)
+        if db_status == "Failed":
+            return jsonify({"Success": False, "error": "Step 1.2 rms_document_attributes other drafts and signed draft delete failed"})
+        
+        db_status = apply_snapshots_to_main_db(signed_docs)
+        if db_status == "Failed":
+            return jsonify({"Success": False, "error": "Step 1.3 failed"})
+        
+        sql = f"""
+            UPDATE rms_program_code rpc
+            INNER JOIN (
+                SELECT rda.document_token AS new_token, rda.previous_document_token AS old_token FROM rms_document_attributes rda
+                INNER JOIN rms_document_snapshots rds ON rds.document_token = rda.document_token
+                WHERE rda.previous_document_token IS NOT NULL AND rds.rms_id IN ('{list2SqlList(signed_rms_id_list)}')
+                GROUP BY rda.document_token, rda.previous_document_token
+            ) AS NewTokenMap ON rpc.document_token = NewTokenMap.old_token
+            SET rpc.status = 9, rpc.document_token = NULL
+        """
+        db_status = db_update(sql)
+        if db_status == "Failed":
+            return jsonify({"Success": False, "error": "Step 1.4 failed"})
+        
+        sql = f"""
+            DELETE rds FROM RMS_document_snapshots AS rds
+            JOIN RMS_document_snapshots AS rds_ ON rds_.rms_id IN ('{list2SqlList(signed_rms_id_list)}') AND rds_.document_id = rds.document_id AND rds_.document_version = rds.document_version
+        """
+        db_status = db_update(sql)
+        if db_status == "Failed":
+            return jsonify({"Success": False, "error": "Step 1.5 failed"})
 
-        # 對每一個版本做處理
-        for ver, rows_for_ver in by_ver.items():
-            # 收集這個版本所有非空的 EIP_STATUS
-            statuses = {(r[8] or "").strip() for r in rows_for_ver if (r[8] or "").strip()}
+    if len(invalid_docs) > 0:
+        sql = f"DELETE rds FROM rms_document_snapshots AS rds WHERE rds.rms_id IN ('{list2SqlList(invalid_docs)}')"
+        db_update(sql)
 
-                        # ----------------------------------------------------------
-            # Case 2: 若有「已簽核」 → 正常結案，刪掉所有 snapshots
-            # ----------------------------------------------------------
-            if "已簽核" in statuses:
-                # 挑該版本中「已簽核」且最新的一筆 Oracle 紀錄
-                ver_signed_rows = [r for r in rows_for_ver if (r[8] or "").strip() == "已簽核"]
-                target_row = max(ver_signed_rows, key=_row_ts)
-                target_rms_id = target_row[0]  # RMS_ID
+        if db_status == "Failed":
+            return jsonify({"Success": False, "error": "Invalid Document Delete Failed."})
+        
+    rejected_rms_id_list = [doc_info["rms_id"] for doc_info in rejected_docs.values()]
+    if len(rejected_rms_id_list) > 0:
+        try:
+            with db() as (conn, cur):
+                sql = """
+                    UPDATE rms_document_attributes AS rda
+                    JOIN rms_document_snapshots AS rds ON rds.document_id = %s AND rda.document_token = rds.document_token
+                    SET rda.rejecter = %s, rda.reject_reason = %s
+                """
+                upd_params = [(rejected_id, rejected_info.get('decision_user', ''), rejected_info.get('decision_comment', ''),) for rejected_id, rejected_info in rejected_docs.items()]
+                cur.executemany(sql, upd_params)
 
-                # 先用 version + rms_id 做精準對應
-                snap_candidates = []
-                for s in snaps:
-                    try:
-                        s_ver = float(s.get("document_version") or 1.0)
-                    except (TypeError, ValueError):
-                        s_ver = 1.0
-
-                    if ver is not None and abs(s_ver - ver) >= 1e-6:
-                        continue
-
-                    if s.get("rms_id") == target_rms_id:
-                        snap_candidates.append(s)
-
-                # 如果真的找不到 rms_id 對應（理論上不應該發生），才退一步只看 version
-                if not snap_candidates:
-                    for s in snaps:
-                        try:
-                            s_ver = float(s.get("document_version") or 1.0)
-                        except (TypeError, ValueError):
-                            s_ver = 1.0
-                        if ver is None or abs(s_ver - ver) < 1e-6:
-                            snap_candidates.append(s)
-
-                if not snap_candidates:
-                    print("[sync-eip] no snapshot found for signed doc", doc_id, ver, target_rms_id)
-                    continue
-
-                snap = max(snap_candidates, key=lambda s: s.get("created_at") or datetime.datetime.min)
-
-
-                try:
-                    apply_snapshot_to_main_db(snap, target_row)
-                    updated += 1
-                except Exception as e:
-                    print("[sync-eip] apply snapshot failed (已簽核)", doc_id, ver, e)
-                    continue
-
-                # 注意：這裡視乎 Oracle 的 RMS_VER 是否一定存在
-                ver_value = ver if ver is not None else float(snap.get("document_version") or 1.0)
-                latest_token = snap["document_token"]
-
-                with db(dict_cursor=True) as (conn, cur):
-                    # 2-1) 刪除同一文件 + 同一版本的所有 snapshots（含剛同步那一筆）
-                    cur.execute("""
-                        DELETE FROM rms_document_snapshots
-                        WHERE document_id = %s
-                          AND ABS(document_version - %s) < 1e-6
-                    """, (doc_id, ver_value))
-
-                    # 2-2) 刪除同一文件 + 同一版本、但不是這個 token 的「草稿/未簽核」文件
-                    cur.execute("""
-                        DELETE FROM rms_document_attributes
-                        WHERE document_id = %s
-                          AND ABS(document_version - %s) < 1e-6
-                          AND document_token <> %s
-                          AND status IN (0, 1)
-                    """, (doc_id, ver_value, latest_token))
-
-                    # ------------------------------
-                    # 2-3) ⭐ 新增：簽核後舊版整理邏輯
-                    # ------------------------------
-                    # 只看「已簽核版本」(status = 2)，按版本從新到舊排
-                    cur.execute("""
-                        SELECT document_token, document_version
-                        FROM rms_document_attributes
-                        WHERE document_id = %s
-                          AND status = 2
-                        ORDER BY document_version DESC
-                    """, (doc_id,))
-                    ver_rows = cur.fetchall() or []
-
-                    if ver_rows:
-                        # 保留最新版 + 前兩版的 attributes
-                        keep_rows = ver_rows[:3]  # 最多 3 筆
-                        keep_tokens = [r["document_token"] for r in keep_rows]
-
-                        # 最新版 token（理論上就是 latest_token，但這裡再保險抓一次）
-                        latest_attr_token = keep_tokens[0]
-
-                        # 要保留 attribute 但清掉內容的舊版 token：前兩版（index 1,2）
-                        clear_tokens = [r["document_token"] for r in keep_rows[1:]]
-
-                        # 超過 2 個版本之前的舊版：整個 attributes 直接刪掉（CASCADE 掉內容）
-                        delete_attr_tokens = [r["document_token"] for r in ver_rows[3:]]
-
-                        # (a) 刪除舊版的 content / references（但保留 attributes）
-                        if clear_tokens:
-                            ph = ",".join(["%s"] * len(clear_tokens))
-                            cur.execute(f"""
-                                DELETE FROM rms_block_content
-                                WHERE document_token IN ({ph})
-                            """, clear_tokens)
-                            cur.execute(f"""
-                                DELETE FROM rms_references
-                                WHERE document_token IN ({ph})
-                            """, clear_tokens)
-
-                        # (b) 刪除比前兩版更舊的 attributes（rms_block_content / rms_references 會跟著 FK CASCADE）
-                        if delete_attr_tokens:
-                            ph = ",".join(["%s"] * len(delete_attr_tokens))
-                            cur.execute(f"""
-                                DELETE FROM rms_document_attributes
-                                WHERE document_token IN ({ph})
-                            """, delete_attr_tokens)
-
-                        # (c) 重新把 MCR 的程式號碼綁定到「最新版」的 document_token
-                        _rebind_mcr_program_codes(cur, latest_attr_token)
-
-                    conn.commit()
-
-            # ----------------------------------------------------------
-            # Case 3: 沒有已簽核，但有「否決 / 退回申請者」
-            # ----------------------------------------------------------
-            reject_rows = [
-                r for r in rows_for_ver
-                if (r[8] or "").strip() in {"否決", "退回申請者"}
-            ]
-            if not reject_rows:
-                # 此版本沒有已簽核，也沒有否決/退回 → 不處理
-                continue
-
-            # 挑出最新一筆「否決/退回」的 Oracle row（你的步驟 3：latest）
-            target_row = max(reject_rows, key=_row_ts)
-            target_rms_id = target_row[0]  # RMS_ID
-
-            # 找對應 snapshot：同 doc_id + version + rms_id
-            snap_candidates = []
-            for s in snaps:
-                try:
-                    s_ver = float(s.get("document_version") or 1.0)
-                except (TypeError, ValueError):
-                    s_ver = 1.0
-
-                if ver is not None and abs(s_ver - ver) >= 1e-6:
-                    continue
-
-                if s.get("rms_id") == target_rms_id:
-                    snap_candidates.append(s)
-
-            if not snap_candidates:
-                # 找不到對應 rms_id 的 snapshot 時，退一步只用版本 match
-                for s in snaps:
-                    try:
-                        s_ver = float(s.get("document_version") or 1.0)
-                    except (TypeError, ValueError):
-                        s_ver = 1.0
-                    if ver is None or abs(s_ver - ver) < 1e-6:
-                        snap_candidates.append(s)
-
-            if not snap_candidates:
-                print("[sync-eip] no snapshot found for rejected doc", doc_id, ver, target_rms_id)
-                continue
-
-            snap = max(snap_candidates, key=lambda s: s.get("created_at") or datetime.datetime.min)
-
-            # ★ 將 rejecter / reject reason 回寫到 attributes（你的步驟 3.2）
-            try:
-                _apply_reject_status_to_main_attributes(snap, target_row)
-                updated += 1
-            except Exception as e:
-                print("[sync-eip] apply reject-status failed", doc_id, ver, e)
-                continue
-
-            # ★ 將此 snapshot 標成 sync_status = 2，並清掉舊的退回 snapshot（同 doc+ver）
-            with db(dict_cursor=True) as (conn, cur):
-                # 3) 將對應的 rms_id 的 sync_status 改為 2（你的 3）
-                cur.execute("""
-                    UPDATE rms_document_snapshots
-                    SET sync_status = 2, synced_at = NOW()
-                    WHERE snapshot_id = %s
-                """, (snap["snapshot_id"],))
-
-                # 3.1) 刪除同一文件 + 版本下、其他 sync_status = 2 的舊退回 snapshot
-                #      （注意：不動 sync_status = 0 的草稿 / 已下載 / 審核中）
-                cur.execute("""
-                    DELETE FROM rms_document_snapshots
-                    WHERE document_id = %s
-                    AND ABS(document_version - %s) < 1e-6
-                    AND sync_status = 2
-                    AND rms_id <> %s
-                """, (
-                    doc_id,
-                    ver if ver is not None else float(snap.get("document_version") or 1.0),
-                    target_rms_id,
-                ))
+                sql = f"""
+                    DELETE target FROM rms_document_snapshots AS target
+                    INNER JOIN rms_document_snapshots AS ref ON target.document_id = ref.document_id AND target.document_version = ref.document_version
+                    WHERE ref.rms_id IN ({placeholder(rejected_rms_id_list)}) AND target.sync_status = 2 AND target.rms_id <> ref.rms_id
+                """
+                cur.execute(sql, rejected_rms_id_list)
+                cur.execute(f"UPDATE rms_document_snapshots SET sync_status = 2, synced_at = NOW() WHERE rms_id IN ({placeholder(rejected_rms_id_list)})", rejected_rms_id_list)
 
                 conn.commit()
 
-            # 「否決/退回」版本可以有多次 history，但我們只保留最新那個 sync_status=2 的 snapshot，
-            # 草稿快照留給使用者修改再送，不再處理更多
-            continue
+        except Exception as e:
+            print(f"Document Reject Process Error: {e}")
+            return jsonify({"Success": False, "error": "Document Reject Process Error."})
+        
+    if len(submitted_docs) > 0:
+        sql = f"UPDATE rms_document_snapshots SET synced_at = NOW() WHERE rms_id IN ('{list2SqlList(submitted_docs)}')"
+        db_status = db_update(sql)
 
-    return jsonify({"success": True, "updated": updated})
-
-def _get_pending_snapshots_grouped_by_doc_id():
-    """
-    回傳:
-    {
-      "WMD001": [snap_row1, snap_row2, ...],
-      "WMD002": [...],
-    }
-    僅抓 sync_status = 0 的 snapshot。
-    這裡只需要 meta，不讀 payload。
-    """
-    with db(dict_cursor=True) as (conn, cur):
-        cur.execute("""
-            SELECT snapshot_id, document_token, rms_id,
-                   document_id, document_version, document_name,
-                   created_by, created_at, sync_status
-            FROM rms_document_snapshots
-            WHERE sync_status = 0
-        """)
-        rows = cur.fetchall() or []
-
-    by_doc = {}
-    for r in rows:
-        doc_id = (r.get("document_id") or "").strip()
-        if not doc_id:
-            continue
-        by_doc.setdefault(doc_id, []).append(r)
-    return by_doc
-
-def _fetch_oracle_rows_for_doc_ids(doc_ids, include_NULL = False):
-    """
-    doc_ids: list[str]
-    回傳 mapping: doc_id -> [oracle_row1, oracle_row2, ...]
-    """
-    if not doc_ids:
-        return {}
-
-    placeholders = ",".join([f":{i+1}" for i in range(len(doc_ids))])
-    sql = f"""
-        SELECT RMS_ID, RMS_DCCNO, RMS_VER, RMS_DCCNAME, RMS_INSDT, EIPNO, EIP_USER, EIP_CREATEDT, EIP_STATUS, DECISION_USER, DECISION_COMMENT
-        FROM IDBUSER.RMS_DCC2EIP WHERE RMS_DCCNO IN ({placeholders})
-    """
-
-    if not include_NULL:
-        sql += " AND EIP_STATUS IS NOT NULL"
-
-    with odb() as cur_o:
-        cur_o.execute(sql, doc_ids)
-        rows = cur_o.fetchall() or []
-
-    by_doc = {}
-    for r in rows:
-        doc_id = (r[1] or "").strip()  # RMS_DCCNO
-        by_doc.setdefault(doc_id, []).append(r)
-    return by_doc
+        if db_status == "Failed":
+            return jsonify({"Success": False, "error": "Submitted Document update Failed."})
+        
+    odb_update_list = signed_rms_id_list + signed_delete_id_list + invalid_docs + rejected_rms_id_list + rejected_delete_id_list + submitted_docs
+    if len(odb_update_list) > 0:
+        try:
+            with odb() as cur_o:
+                sql = f"UPDATE IDBUSER.RMS_DCC2EIP SET RMS_DCCNAME = NULL WHERE RMS_ID IN ('{list2SqlList(odb_update_list)}')"
+                cur_o.execute(sql)
+                cur_o.connection.commit()
+        
+        except Exception as e:
+            print(f"Oracle rms_id Update Process Error: {e}")
+            return jsonify({"Success": False, "error": "Oracle rms_id Update Process Error."})
 
 # ----- Draft Function ----- #
 
@@ -1456,996 +1148,186 @@ def clear_doc_id():
         return send_response(400, False, "missing token")
 
     with db() as (conn, cur):
-        cur.execute("""
-          UPDATE rms_document_attributes
-          SET document_id=NULL
-          WHERE document_token=%s
-        """, (token,))
+        cur.execute(f"UPDATE rms_document_attributes SET document_id = NULL WHERE document_token='{token}'")
+
     return jsonify({"success": True})
 
-@bp.get("/drafts")
+@bp.get("drafts")
 def list_drafts():
-    """
-    Query params:
-      - user_id      (required):  要查的作者/使用者 id -> 對應 DB 欄位 author_id
-      - status       (optional):  預設 0 當作草稿；如需查核/發佈可改值
-      - keyword      (optional):  針對 document_name、document_id 模糊查詢
-      - page         (optional):  預設 1
-      - page_size    (optional):  預設 20
-      - sort         (optional):  排序欄位，允許: issue_date, document_version, document_name
-      - order        (optional):  asc/desc，預設 desc
-    Response:
-      {
-        "success": true,
-        "items": [
-          {
-            "documentToken": "...",
-            "documentName": "...",
-            "documentVersion": 1.20,
-            "author": "...",
-            "authorId": "...",
-            "issueDate": "2025-11-04T18:00:00",
-            "documentId": "WMH250"          # 方便前端顯示（可拿掉）
-          }
-        ],
-        "total": 123,
-        "page": 1,
-        "pageSize": 20
-      }
-    """
-    user_id   = request.args.get("user_id")
-    if not user_id:
-        return jsonify({"success": False, "error": "user_id is required"}), 400
+    user_id = request.args.get("userId", "")
+    keyword = request.args.get("keyword", "")
+    page = int(request.args.get("page", 1))
+    pageSize = int(request.args.get("pageSize", 10))
+    getPages = request.args.get("getPages", False)
 
-    # defaults
-    try:
-        status    = int(request.args.get("status", 0))
-    except ValueError:
-        return jsonify({"success": False, "error": "status must be int"}), 400
+    if len(keyword) > 0:
+        keyword = f" AND document_id LIKE '%{keyword}%' AND document_name LIKE '%{keyword}%' AND author = '%{keyword}%' AND author_id = %{keyword}%"
 
-    keyword   = (request.args.get("keyword") or "").strip()
-    try:
-        page      = max(1, int(request.args.get("page", 1)))
-        page_size = min(100, max(1, int(request.args.get("page_size", 20))))
-    except ValueError:
-        return jsonify({"success": False, "error": "page/page_size must be int"}), 400
+    target = "COUNT(*)" if getPages else "document_type, document_token, document_name, document_version, document_id, author, author_id, issue_date"
+    
+    sql = f"SELECT {target} FROM rms_document_attributes WHERE (status = 1 OR status = 0) AND author_id = '{user_id}' {keyword} ORDER BY issue_date "
 
-    sort_map  = {
-        "issue_date": "issue_date",
-        "document_version": "document_version",
-        "document_name": "document_name",
-    }
-    sort_key  = request.args.get("sort", "issue_date").lower()
-    order     = request.args.get("order", "desc").lower()
-    sort_col  = sort_map.get(sort_key, "issue_date")
-    order_sql = "DESC" if order not in ("asc", "ASC") else "ASC"
+    data, info = db_data_fetch(sql if getPages else sql + f"LIMIT {pageSize} OFFSET {(page - 1) * pageSize}")
 
-    offset = (page - 1) * page_size
+    if info != "Success":
+        return send_response(500, True, "查詢失敗", {"message": "資料庫查詢失敗，請重新嘗試"})
+    
+    if getPages:
+        return send_response(200, True, "查詢成功", {"pages": math.ceil(data[0][0] / pageSize)})
 
-    base_where = ["author_id = %s", "status = %s"]
-    params = [user_id, status]
+    items = []
+    for item in data:
+        dt = item[7].replace(tzinfo=TZ_TW)
+        items.append({
+            "documentType": item[0],
+            "documentToken": item[1],
+            "documentName": item[2],
+            "documentVersion": item[3],
+            "documentId": item[4],
+            "author": item[5],
+            "authorId": item[6],
+            "issueDate": dt.isoformat(),
+        })
 
-    if keyword:
-        base_where.append("(document_name LIKE %s OR document_id LIKE %s)")
-        like_kw = f"%{keyword}%"
-        params.extend([like_kw, like_kw])
-
-    where_sql = " AND ".join(base_where)
-
-    count_sql = f"""
-      SELECT COUNT(*) AS cnt
-      FROM rms_document_attributes
-      WHERE {where_sql}
-    """
-
-    data_sql = f"""
-      SELECT
-        document_type, document_token, document_name, document_version, author, author_id, issue_date, document_id
-      FROM rms_document_attributes
-      WHERE {where_sql}
-      ORDER BY {sort_col} {order_sql}
-      LIMIT %s OFFSET %s
-    """
-
-    with db(dict_cursor=True) as (conn, cur):
-        # total count
-        cur.execute(count_sql, params)
-        total = int(cur.fetchone()["cnt"])
-
-        # page data
-        cur.execute(data_sql, params + [page_size, offset])
-        rows = cur.fetchall() or []
-
-    def to_item(row):
-        # issue_date 轉 ISO（沒有就 None）
-        iso_date = None
-        if row.get("issue_date"):
-            try:
-                iso_date = row["issue_date"].isoformat(timespec="seconds")
-            except Exception:
-                iso_date = str(row["issue_date"])
-
-        # 回傳前端需要的 camelCase
-        return {
-            "documentType": row["document_type"],
-            "documentToken": row["document_token"],
-            "documentName": row["document_name"],
-            "documentVersion": float(row["document_version"]) if row["document_version"] is not None else None,
-            "author": row["author"],
-            "authorId": row["author_id"],
-            "issueDate": iso_date,
-            "documentId": row.get("document_id"),
-        }
-
-    items = [to_item(r) for r in rows]
-
-    return jsonify({
-        "success": True,
-        "items": items,
-        "total": total,
-        "page": page,
-        "pageSize": page_size,
-    })
+    return send_response(200, True, "查詢成功", {"items": items})
 
 @bp.delete("/<document_token>")
 def delete_draft(document_token):
-    """
-    Delete a draft by its document_token.
-    Only rows with status = 0 (draft) can be deleted.
-
-    Path:
-      DELETE /docs/<document_token>
-
-    Response:
-      200 { success: True, deleted: 1 }
-      404 { success: False, error: "not found" }              # no such token
-      409 { success: False, error: "not a draft" }            # exists but status != 0
-    """
     token = (document_token or "").strip()
-    if not token:
+    if len(token) == 0:
         return jsonify({"success": False, "error": "document_token is required"}), 400
-
-    with db(dict_cursor=True) as (conn, cur):
-        # Is there a record?
-        cur.execute("SELECT status FROM rms_document_attributes WHERE document_token=%s", (token,))
-        row = cur.fetchone()
-
-        if not row:
-            return jsonify({"success": False, "error": "not found"}), 404
-
-        # Only allow deleting drafts
-        if int(row.get("status", 1)) != 0:
-            return jsonify({"success": False, "error": "not a draft"}), 409
-
-        # Delete
-        cur.execute("DELETE FROM rms_document_attributes WHERE document_token=%s AND status=0", (token,))
-        conn.commit()
-        deleted = cur.rowcount or 0
-
-    # (Optional) clean temp files if you keep any by token under BASE_DIR
+    
     try:
-        # Example: remove /docxTemp/<token>.docx if you create such files.
-        # from pathlib import Path
-        # p = Path(BASE_DIR) / f"{token}.docx"
-        # if p.exists():
-        #     p.unlink()
-        pass
-    except Exception:
-        # Non-fatal: ignore file cleanup errors
-        pass
+        with db() as (conn, cur):
+            cur.execute(f"DELETE FROM rms_document_attributes WHERE document_token = '{document_token}' AND status = 1")
+            conn.commit()
+            deleted = cur.rowcount or 0
+
+    except Exception as e:
+        print(f"Error result: {e}")
+        return jsonify({"success": False, "error": "資料庫操作失敗，請重新嘗試"}), 500
 
     return jsonify({"success": True, "deleted": deleted}), 200
 
 # ----- Document Search ----- #
 
-def _build_keyword_predicate(keyword: str):
-    """
-    Returns (sql_snippet, params) for robust keyword search.
-    - Matches: document_name, author, document_id (LIKE)
-    - Also matches document_version:
-        * if keyword is numeric (int/float), add exact equality on document_version
-        * always also add LIKE(cast(document_version as char)) for partial text matches
-    """
-    if not keyword:
-        return "", []
-
-    likes = []
-    params = []
-
-    # name / id / author LIKE
-    likes.append("document_name LIKE %s")
-    params.append(f"%{keyword}%")
-    likes.append("document_id LIKE %s")
-    params.append(f"%{keyword}%")
-    likes.append("author LIKE %s")
-    params.append(f"%{keyword}%")
-
-    # version: support numeric equality + textual LIKE
-    numeric = None
-    try:
-        numeric = float(keyword)
-    except Exception:
-        pass
-
-    # MySQL: CAST(document_version AS CHAR) for LIKE
-    likes.append("CAST(document_version AS CHAR) LIKE %s")
-    params.append(f"%{keyword}%")
-
-    eq = []
-    if numeric is not None:
-        eq.append("document_version = %s")
-        params.append(numeric)
-
-    # Combine
-    if eq:
-        where_piece = "(" + " OR ".join(likes + eq) + ")"
-    else:
-        where_piece = "(" + " OR ".join(likes) + ")"
-    return where_piece, params
-
-def _parse_doc_types(s: str | None) -> list[str] | None:
-    """
-    Accepts:
-      - None / ""  -> no filtering
-      - single or comma list: "Instruction", "Specification", or mix
-    Returns a normalized list using DB values: ["Instruction", "Specification"].
-    Raises ValueError if any entry is invalid.
-    """
-    if s is None or str(s).strip() == "":
-        return None
-
-    allowed = {
-        "instruction": 0,
-        "specification": 1,
-    }
-    out = []
-    for part in str(s).split(","):
-        key = part.strip().lower()
-        if not key:
-            continue
-        if key not in allowed:
-            raise ValueError("document_type must be in {Instruction, Specification}")
-        out.append(allowed[key])
-    if not out:
-        return None
-    return out
-
-def _parse_statuses(s: str) -> list[int]:
-    if s is None or str(s).strip() == "":
-        raise ValueError("status is required")
-    out = []
-    for part in str(s).split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            out.append(int(part))
-        except ValueError:
-            raise ValueError(f"invalid status: {part}")
-    if not out:
-        raise ValueError("status is required")
-    return out
-
-def _list_documents_impl(
-    *,
-    user_id: str | None,         # allow None for "all" search
-    statuses: list[int],
-    keyword: str = "",
-    page: int = 1,
-    page_size: int = 20,
-    sort_key: str = "issue_date",
-    order: str = "desc",
-    doc_types: list[str] | None = None,
-    scope: str = "mine",         # "mine" | "all"
-    document_id: str | None = None,   # 新增但暫時只有 /documents /submitted 等用到
-):
-    sort_map = {
-        "issue_date": "issue_date",
-        "document_version": "document_version",
-        "document_name": "document_name",
-    }
-    sort_col = sort_map.get((sort_key or "issue_date").lower(), "issue_date")
-    order_sql = "DESC" if (order or "desc").lower() not in ("asc", "ASC") else "ASC"
-
-    where = []
-    params = []
-
-    # scope
-    if scope == "mine":
-        if not user_id:
-            raise ValueError("user_id is required for scope=mine")
-        where.append("author_id = %s")
-        params.append(user_id)
-
-    # 依 document_id 過濾（可選）
-    if document_id:
-        where.append("document_id = %s")
-        params.append(document_id)
-
-    # statuses (required)
-    where.append(f"status IN ({', '.join(['%s'] * len(statuses))})")
-    params.extend(statuses)
-
-    # doc types (optional)
-    if doc_types:
-        where.append(f"document_type IN ({', '.join(['%s'] * len(doc_types))})")
-        params.extend(doc_types)
-
-    # robust keyword
-    kw_sql, kw_params = _build_keyword_predicate(keyword)
-    if kw_sql:
-        where.append(kw_sql)
-        params.extend(kw_params)
-
-    where_sql = " AND ".join(where) if where else "1=1"
-    offset = (page - 1) * page_size
-
-    count_sql = f"""
-      SELECT COUNT(*) AS cnt
-      FROM rms_document_attributes
-      WHERE {where_sql}
-    """
-    data_sql = f"""
-      SELECT
-        document_type,
-        document_token,
-        document_name,
-        document_version,
-        author,
-        author_id,
-        issue_date,
-        document_id,
-        status,
-        rejecter,
-        reject_reason
-      FROM rms_document_attributes
-      WHERE {where_sql}
-      ORDER BY {sort_col} {order_sql}
-      LIMIT %s OFFSET %s
-    """
-
-    with db(dict_cursor=True) as (_, cur):
-        cur.execute(count_sql, params)
-        total = int(cur.fetchone()["cnt"])
-
-        cur.execute(data_sql, params + [page_size, offset])
-        rows = cur.fetchall() or []
-
-    def to_item(r):
-        iso_date = None
-        if r.get("issue_date"):
-            try:
-                iso_date = r["issue_date"].isoformat(timespec="seconds")
-            except Exception:
-                iso_date = str(r["issue_date"])
-        return {
-            "documentType": r["document_type"],
-            "documentToken": r["document_token"],
-            "documentName": r["document_name"],
-            "documentVersion": float(r["document_version"]) if r["document_version"] is not None else None,
-            "author": r["author"],
-            "authorId": r["author_id"],
-            "issueDate": iso_date,
-            "documentId": r.get("document_id"),
-            "status": r.get("status"),
-            "rejecter": r.get("rejecter"),
-            "rejectReason": r.get("reject_reason"),
-        }
-
-    return {
-        "success": True,
-        "items": [to_item(r) for r in rows],
-        "total": total,
-        "page": page,
-        "pageSize": page_size,
-    }
-
-@bp.get("/all")
-def list_all_documents():
-    # statuses required (same as /documents)
-    try:
-        statuses = _parse_statuses(request.args.get("status"))
-    except ValueError as e:
-        return jsonify({"success": False, "error": str(e)}), 400
-
-    keyword = (request.args.get("keyword") or "").strip()
-    try:
-        page      = max(1, int(request.args.get("page", 1)))
-        page_size = min(100, max(1, int(request.args.get("page_size", 20))))
-    except ValueError:
-        return jsonify({"success": False, "error": "page/page_size must be int"}), 400
-
-    sort_key = (request.args.get("sort") or "issue_date")
-    order    = (request.args.get("order") or "desc")
-
-    # ---- 決定排序欄位 ----
-    sort_map = {
-        "issue_date": "issue_date",
-        "document_version": "document_version",
-        "document_name": "document_name",
-    }
-    sort_col = sort_map.get((sort_key or "issue_date").lower(), "issue_date")
-    order_sql = "DESC" if (order or "desc").lower() not in ("asc", "ASC") else "ASC"
-
-    # ---- WHERE 條件：這裡沒有 author_id 限制，因為是 all ----
-    where = []
-    params = []
-
-    # statuses（必填）
-    where.append(f"status IN ({', '.join(['%s'] * len(statuses))})")
-    params.extend(statuses)
-
-    # keyword
-    kw_sql, kw_params = _build_keyword_predicate(keyword)
-    if kw_sql:
-        where.append(kw_sql)
-        params.extend(kw_params)
-
-    where_sql = " AND ".join(where) if where else "1=1"
-    offset = (page - 1) * page_size
-
-    # 1) total = 不同 document_id 的數量（在同樣的 where 條件下）
-    count_sql = f"""
-      SELECT COUNT(*) AS cnt
-      FROM (
-        SELECT DISTINCT document_id
-        FROM rms_document_attributes
-        WHERE {where_sql}
-      ) AS t
-    """
-
-    # 2) data = 每個 document_id 的「document_version 最大」那一筆
-    data_sql = f"""
-      SELECT
-        a.document_type,
-        a.document_token,
-        a.document_name,
-        a.document_version,
-        a.author,
-        a.author_id,
-        a.issue_date,
-        a.document_id,
-        a.status,
-        a.rejecter,
-        a.reject_reason
-      FROM (
-        SELECT
-          document_type,
-          document_token,
-          document_name,
-          document_version,
-          author,
-          author_id,
-          issue_date,
-          document_id,
-          status,
-          rejecter,
-          reject_reason,
-          ROW_NUMBER() OVER (
-            PARTITION BY document_id
-            ORDER BY document_version DESC
-          ) AS rn
-        FROM rms_document_attributes
-        WHERE {where_sql}
-      ) AS a
-      WHERE a.rn = 1
-      ORDER BY a.{sort_col} {order_sql}
-      LIMIT %s OFFSET %s
-    """
-
-    with db(dict_cursor=True) as (_, cur):
-        cur.execute(count_sql, params)
-        total = int(cur.fetchone()["cnt"])
-
-        cur.execute(data_sql, params + [page_size, offset])
-        rows = cur.fetchall() or []
-
-    def to_item(r):
-        iso_date = None
-        if r.get("issue_date"):
-            try:
-                iso_date = r["issue_date"].isoformat(timespec="seconds")
-            except Exception:
-                iso_date = str(r["issue_date"])
-        return {
-            "documentType": r["document_type"],
-            "documentToken": r["document_token"],
-            "documentName": r["document_name"],
-            "documentVersion": float(r["document_version"]) if r["document_version"] is not None else None,
-            "author": r["author"],
-            "authorId": r["author_id"],
-            "issueDate": iso_date,
-            "documentId": r.get("document_id"),
-            "status": r.get("status"),
-            "rejecter": r.get("rejecter"),
-            "rejectReason": r.get("reject_reason"),
-        }
-
-    return jsonify({
-        "success": True,
-        "items": [to_item(r) for r in rows],
-        "total": total,
-        "page": page,
-        "pageSize": page_size,
-    }), 200
-
 @bp.get("/passed")
 def list_passed():
-    # 固定 status = 2 (通過/已簽核)
-    user_id = request.args.get("user_id")
-    if not user_id:
-        return jsonify({"success": False, "error": "user_id is required"}), 400
+    user_id = request.args.get("userId", "")
+    document_type = request.args.get("documentType", "")
+    keyword = request.args.get("keyword", "")
+    page = int(request.args.get("page", 1))
+    pageSize = int(request.args.get("pageSize", 10))
+    getPages = request.args.get("getPages", False)
 
-    # document_type: optional ("Instruction", "Specification"), comma-separated ok
-    try:
-        doc_types = _parse_doc_types(request.args.get("document_type"))
-    except ValueError as e:
-        return jsonify({"success": False, "error": str(e)}), 400
+    if len(keyword) > 0:
+        keyword = f" AND document_id LIKE '%{keyword}%' AND document_name LIKE '%{keyword}%' AND author = '%{keyword}%' AND author_id = %{keyword}%"
 
-    keyword = (request.args.get("keyword") or "").strip()
-    try:
-        page      = max(1, int(request.args.get("page", 1)))
-        page_size = min(100, max(1, int(request.args.get("page_size", 20))))
-    except ValueError:
-        return jsonify({"success": False, "error": "page/page_size must be int"}), 400
+    if len(user_id) > 0:
+        user_id = f" AND author_id = '{user_id}'"
 
-    sort_key = (request.args.get("sort") or "issue_date")
-    order    = (request.args.get("order") or "desc")
+    if len(document_type) > 0:
+        document_type = f" AND document_type = {document_type}"
 
-    # ---- 決定排序欄位 ----
-    sort_map = {
-        "issue_date": "issue_date",
-        "document_version": "document_version",
-        "document_name": "document_name",
-    }
-    sort_col = sort_map.get((sort_key or "issue_date").lower(), "issue_date")
-    order_sql = "DESC" if (order or "desc").lower() not in ("asc", "ASC") else "ASC"
+    target = "COUNT(*)" if getPages else "document_type, document_token, document_name, document_version, document_id, author, author_id, issue_date"
 
-    # ---- where：author + status=2 + optional type + keyword ----
-    where = ["author_id = %s", "status = 2"]
-    params = [user_id]
-
-    if doc_types:
-        where.append(f"document_type IN ({', '.join(['%s'] * len(doc_types))})")
-        params.extend(doc_types)
-
-    kw_sql, kw_params = _build_keyword_predicate(keyword)
-    if kw_sql:
-        where.append(kw_sql)
-        params.extend(kw_params)
-
-    where_sql = " AND ".join(where) if where else "1=1"
-    offset = (page - 1) * page_size
-
-    # 1) total = 不同 document_id 數量
-    count_sql = f"""
-      SELECT COUNT(*) AS cnt
-      FROM (
-        SELECT DISTINCT document_id
-        FROM rms_document_attributes
-        WHERE {where_sql}
-      ) AS t
+    sql = f"""
+        WITH RankedDocuments AS (
+            SELECT *, ROW_NUMBER() OVER ( PARTITION BY document_id ORDER BY issue_date DESC, document_version DESC ) as rn FROM rms_document_attributes WHERE status = 2
+        )
+        SELECT {target} FROM RankedDocuments
+        WHERE rn = 1 {document_type} {user_id} {keyword} ORDER BY issue_date
     """
 
-    # 2) data = 每個 document_id 的最新版本那一筆
-    data_sql = f"""
-      SELECT
-        a.document_type,
-        a.document_token,
-        a.document_name,
-        a.document_version,
-        a.author,
-        a.author_id,
-        a.issue_date,
-        a.document_id,
-        a.status,
-        a.rejecter,
-        a.reject_reason
-      FROM (
-        SELECT
-          document_type,
-          document_token,
-          document_name,
-          document_version,
-          author,
-          author_id,
-          issue_date,
-          document_id,
-          status,
-          rejecter,
-          reject_reason,
-          ROW_NUMBER() OVER (
-            PARTITION BY document_id
-            ORDER BY document_version DESC
-          ) AS rn
-        FROM rms_document_attributes
-        WHERE {where_sql}
-      ) AS a
-      WHERE a.rn = 1
-      ORDER BY a.{sort_col} {order_sql}
-      LIMIT %s OFFSET %s
-    """
+    data, info = db_data_fetch(sql if getPages else sql + f"LIMIT {pageSize} OFFSET {(page - 1) * pageSize}")
 
-    with db(dict_cursor=True) as (_, cur):
-        cur.execute(count_sql, params)
-        total = int(cur.fetchone()["cnt"])
-
-        cur.execute(data_sql, params + [page_size, offset])
-        rows = cur.fetchall() or []
-
-    for index, r in enumerate(rows):
-        print(f"{index}: {r}")
-
-    def to_item(r):
-        iso_date = None
-        if r.get("issue_date"):
-            try:
-                iso_date = r["issue_date"].isoformat(timespec="seconds")
-            except Exception:
-                iso_date = str(r["issue_date"])
-        return {
-            "documentType": r["document_type"],
-            "documentToken": r["document_token"],
-            "documentName": r["document_name"],
-            "documentVersion": float(r["document_version"]) if r["document_version"] is not None else None,
-            "author": r["author"],
-            "authorId": r["author_id"],
-            "issueDate": iso_date,
-            "documentId": r.get("document_id"),
-            "status": r.get("status"),
-            "rejecter": r.get("rejecter"),
-            "rejectReason": r.get("reject_reason"),
-        }
-
-    return jsonify({
-        "success": True,
-        "items": [to_item(r) for r in rows],
-        "total": total,
-        "page": page,
-        "pageSize": page_size,
-    }), 200
-
-@bp.get("/documents")
-def list_documents():
-    user_id = request.args.get("user_id")
-    if not user_id:
-        return jsonify({"success": False, "error": "user_id is required"}), 400
-
-    try:
-        statuses = _parse_statuses(request.args.get("status"))
-    except ValueError as e:
-        return jsonify({"success": False, "error": str(e)}), 400
-
-    keyword = (request.args.get("keyword") or "").strip()
-    try:
-        page      = max(1, int(request.args.get("page", 1)))
-        page_size = min(100, max(1, int(request.args.get("page_size", 20))))
-    except ValueError:
-        return jsonify({"success": False, "error": "page/page_size must be int"}), 400
-
-    sort_key = (request.args.get("sort") or "issue_date")
-    order    = (request.args.get("order") or "desc")
-
-    data = _list_documents_impl(
-        user_id=user_id,
-        statuses=statuses,
-        keyword=keyword,
-        page=page,
-        page_size=page_size,
-        sort_key=sort_key,
-        order=order,
-        scope="mine",
-    )
-    return jsonify(data), 200
-
-def _collect_submitted_items_for_user(user_id: str, keyword: str, sort_key: str, order: str):
-    """
-    回傳尚在 EIP 審核流程中的文件：
-      - 來源：rms_document_snapshots.sync_status = 0（尚未被 sync_eip 結案/退回）
-      - Oracle：保留 EIP_STATUS in ('審核中', NULL) 的最新那一筆紀錄（NULL 視為「已下載 / 尚未更新」）
-      - 僅保留 author_id = user_id 的文件
-    """
-    pending = _get_pending_snapshots_grouped_by_doc_id()
-    if not pending:
-        return []
-
-    doc_ids = list(pending.keys())
-    oracle_map = _fetch_oracle_rows_for_doc_ids(doc_ids, include_NULL = True)
-
-    candidate_snaps = []  # (snap_row, oracle_row)
-
-    for doc_id, snaps in pending.items():
-        o_rows = oracle_map.get(doc_id) or []
-        if not o_rows:
-            continue
-
-        # ---- 依 document_version 選出「最新 snapshot」 ----
-        latest_snap_by_ver = {}
-        for s in snaps:
-            try:
-                v = float(s.get("document_version") or 1.0)
-            except (TypeError, ValueError):
-                v = 1.0
-            key = v
-            cur_ts = s.get("created_at") or datetime.datetime.min
-            if key not in latest_snap_by_ver:
-                latest_snap_by_ver[key] = s
-            else:
-                old_ts = latest_snap_by_ver[key].get("created_at") or datetime.datetime.min
-                if cur_ts > old_ts:
-                    latest_snap_by_ver[key] = s
-
-        for snap in latest_snap_by_ver.values():
-            snap_ver = float(snap.get("document_version") or 1.0)
-
-            # 用版本對應到 Oracle rows
-            candidates = []
-            for r in o_rows:
-                try:
-                    r_ver = float(r[2]) if r[2] is not None else snap_ver  # RMS_VER
-
-                except ValueError:
-                    r_ver = snap_ver
-
-                if abs(r_ver - snap_ver) < 1e-6:
-                    candidates.append(r)
-
-            if not candidates:
-                continue
-
-            for r in candidates:
-                eip_status = (r[8] or "").strip()
-                if eip_status not in {"", "審核中"}:
-                    continue
-
-                candidate_snaps.append((snap, r))
-
-    if not candidate_snaps:
-        return []
-
-    # 撈出這些 snapshot 對應的 attributes
-    tokens = list({snap["document_token"] for (snap, _) in candidate_snaps})
-    attrs_map = {}
-    if tokens:
-        placeholders = ", ".join(["%s"] * len(tokens))
-        with db(dict_cursor=True) as (conn, cur):
-            cur.execute(f"""
-                SELECT document_token, document_type, document_id, document_name,
-                       document_version, author, author_id, issue_date
-                FROM rms_document_attributes
-                WHERE document_token IN ({placeholders})
-            """, tokens)
-            for r in (cur.fetchall() or []):
-                attrs_map[r["document_token"]] = r
+    if info != "Success":
+        return send_response(500, True, "查詢失敗", {"message": "資料庫查詢失敗，請重新嘗試"})
+    
+    if getPages:
+        return send_response(200, True, "查詢成功", {"pages": math.ceil(data[0][0] / pageSize)})
 
     items = []
-    kw = (keyword or "").strip()
-    kw_lower = kw.lower()
-
-    for snap, o_row in candidate_snaps:
-        token = snap["document_token"]
-        attr = attrs_map.get(token)
-        if not attr:
-            continue
-
-        if attr.get("author_id") != user_id:
-            continue
-
-        # keyword：名稱 / 編號
-        if kw_lower:
-            name = (attr.get("document_name") or "").lower()
-            docid = (attr.get("document_id") or "").lower()
-            if kw_lower not in name and kw_lower not in docid:
-                continue
-
-        issue_date = attr.get("issue_date")
-        if issue_date is not None:
-            try:
-                issue_iso = issue_date.isoformat(timespec="seconds")
-            except Exception:
-                issue_iso = str(issue_date)
-        else:
-            issue_iso = None
-
-        eip_status = (o_row[8] or "").strip()
-        rms_id = o_row[0]  # "RMS_ID"
-
+    for item in data:
         items.append({
-            "documentType": attr.get("document_type"),
-            "documentToken": token,
-            "documentName": attr.get("document_name"),
-            "documentVersion": float(attr.get("document_version") or 1.0),
-            "author": attr.get("author"),
-            "authorId": attr.get("author_id"),
-            "issueDate": issue_iso,
-            "documentId": attr.get("document_id"),
-            # 給前端用：
-            "rmsId": rms_id,
-            "eipStatus": eip_status or "已下載",  # 前端顯示好看一點
+            "documentType": item[0],
+            "documentToken": item[1],
+            "documentName": item[2],
+            "documentVersion": item[3],
+            "documentId": item[4],
+            "author": item[5],
+            "authorId": item[6],
+            "issueDate": item[7],
         })
 
-    # 排序
-    order = (order or "desc").lower()
-    reverse = (order != "asc")
+    return send_response(200, True, "查詢成功", {"items": items})
 
-    def sort_key_fn(x):
-        if sort_key == "document_name":
-            return (x.get("documentName") or "").lower()
-        if sort_key == "document_version":
-            return x.get("documentVersion") or 0.0
-        if sort_key == "document_id":
-            return (x.get("documentId") or "").lower()
-        # default: issue_date
-        return x.get("issueDate") or ""
-
-    items.sort(key=sort_key_fn, reverse=reverse)
-    return items
-
-@bp.get("/submitted")
-def list_submitted():
-    """
-    已送審：
-      - 只顯示 EIP_STATUS in ('審核中', '已下載') 的文件
-      - 資料來源：snapshot + Oracle + attributes
-    """
+@bp.get("/submitted-and-rejected")
+def list_submitted_and_rejected():
     user_id = request.args.get("user_id")
-    if not user_id:
-        return jsonify({"success": False, "error": "user_id is required"}), 400
+    keyword = request.args.get("keyword", "")
+    page = int(request.args.get("page", 1))
+    pageSize = int(request.args.get("pageSize", 10))
+    getPages = request.args.get("getPages", False)
 
-    keyword = (request.args.get("keyword") or "").strip()
-    try:
-        page      = max(1, int(request.args.get("page", 1)))
-        page_size = min(100, max(1, int(request.args.get("page_size", 20))))
-    except ValueError:
-        return jsonify({"success": False, "error": "page/page_size must be int"}), 400
+    if len(keyword) > 0:
+        keyword = f"AND a.document_id LIKE '%{keyword}%' AND a.document_name LIKE '%{keyword}%'"
 
-    sort_key = (request.args.get("sort") or "issue_date")
-    order    = (request.args.get("order") or "desc")
+    target = "COUNT(*)" if getPages else "a.document_type, a.document_token, a.document_name, a.document_version, a.document_id, a.author, a.author_id, s.created_at, a.rejecter, a.reject_reason, s.rms_id"
 
-    items = _collect_submitted_items_for_user(
-        user_id=user_id,
-        keyword=keyword,
-        sort_key=sort_key,
-        order=order,
-    )
-
-    total = len(items)
-    start = (page - 1) * page_size
-    end   = start + page_size
-    page_items = items[start:end]
-
-    return jsonify({
-        "success": True,
-        "items": page_items,
-        "total": total,
-        "page": page,
-        "pageSize": page_size,
-    }), 200
-
-@bp.get("/rejected")
-def list_rejected():
+    sql = f"""
+        SELECT {target} FROM rms_document_attributes AS a
+        JOIN rms_document_snapshots AS s ON a.document_token = s.document_token
+        WHERE a.author_id = '{user_id}' {keyword} ORDER BY s.created_at ASC
     """
-    已退回：
-      - 來源：rms_document_snapshots.sync_status = 2（只看這個表，不再管 Oracle）
-      - join rms_document_attributes 取得作者 / 退回人 / 理由等
-      - 僅顯示屬於本人 (author_id = user_id) 的文件
-      - 回傳格式與 /submitted 的 items 結構一致，多補 rejecter / rejectReason
+    data, info = db_data_fetch(sql if getPages else sql + f"LIMIT {pageSize} OFFSET {(page - 1) * pageSize}")
+
+    if info != "Success":
+        return send_response(500, True, "查詢失敗", {"message": "MySQL 資料庫查詢失敗，請重新嘗試"})
+    
+    if getPages:
+        return send_response(200, True, "查詢成功", {"pages": math.ceil(data[0][0] / pageSize)})
+    
+    search_id = "','".join([item[10] for item in data])
+    sql = f"""
+        SELECT RMS_ID, EIP_CREATEDT, EIP_STATUS, DECISION_USER, DECISION_COMMENT FROM IDBUSER.RMS_DCC2EIP
+        WHERE RMS_ID IN ('{search_id}')
     """
-    user_id = request.args.get("user_id")
-    if not user_id:
-        return jsonify({"success": False, "error": "user_id is required"}), 400
+    data_status, info = odb_data_fetch(sql)
 
-    keyword = (request.args.get("keyword") or "").strip()
-    try:
-        page      = max(1, int(request.args.get("page", 1)))
-        page_size = min(100, max(1, int(request.args.get("page_size", 20))))
-    except ValueError:
-        return jsonify({"success": False, "error": "page/page_size must be int"}), 400
+    if info != "Success":
+        return send_response(500, True, "查詢失敗", {"message": "Oracle 資料庫查詢失敗，請重新嘗試"})
+    
+    data_status = {item[0]: {"issueDate": item[1], "eipStatus": item[2], "rejecter": item[3], "rejectReason": item[4]} for item in data_status}
 
-    sort_key = (request.args.get("sort") or "issue_date")
-    order    = (request.args.get("order") or "desc").lower()
-    order_sql = "DESC" if order != "asc" else "ASC"
+    items = []
+    for item in data:
+        issueDate, eipStatus, rejecter, rejectReason = item[7], "已下載", "", ""
+        if data_status.get(item[10]) == None:
+            eipStatus = "同步失敗"
+        
+        elif data_status[item[10]].get("eipStatus") != None:
+            eipStatus = data_status[item[10]].get("eipStatus", "已下載")
+            rejecter = data_status[item[10]].get("rejecter")
+            rejectReason = data_status[item[10]].get("rejectReason")
+            issueDate = data_status[item[10]].get("issueDate")
 
-    # 和 submitted 一樣支援的 sort 欄位，再額外多一個 rejecter
-    sort_map = {
-        "issue_date":        "a.issue_date",
-        "document_version":  "a.document_version",
-        "document_name":     "a.document_name",
-        "document_id":       "a.document_id",
-        "rejecter":          "a.rejecter",
-    }
-    sort_col = sort_map.get(sort_key, "a.issue_date")
+        items.append({
+            "documentType": item[0],
+            "documentToken": item[1],
+            "documentName": item[2],
+            "documentVersion": item[3],
+            "documentId": item[4],
+            "author": item[5],
+            "authorId": item[6],
+            "issueDate": issueDate,
+            "eipStatus": eipStatus,
+            "rejecter": rejecter,
+            "rejectReason": rejectReason,
+            "rmsId": item[10],
+        })
 
-    # 只看 sync_status = 2（已退回），只看自己
-    where = ["s.sync_status = 2", "a.author_id = %s"]
-    params = [user_id]
-
-    # keyword：和 /submitted 類似，先鎖在名稱 / 編號；你原本多加了退回者/理由也可以保留
-    if keyword:
-        like_kw = f"%{keyword}%"
-        where.append("""
-          (
-            a.document_name LIKE %s OR
-            a.document_id   LIKE %s OR
-            a.rejecter      LIKE %s OR
-            a.reject_reason LIKE %s
-          )
-        """)
-        params.extend([like_kw, like_kw, like_kw, like_kw])
-
-    where_sql = " AND ".join(where)
-    offset = (page - 1) * page_size
-
-    # 只從 snapshots(sync_status = 2) + attributes 撈，不碰 Oracle
-    count_sql = f"""
-      SELECT COUNT(*) AS cnt
-      FROM rms_document_snapshots s
-      JOIN rms_document_attributes a ON a.document_token = s.document_token
-      WHERE {where_sql}
-    """
-    data_sql = f"""
-        SELECT
-            a.document_type,
-            a.document_token,
-            a.document_name,
-            a.document_version,
-            a.author,
-            a.author_id,
-            a.issue_date,
-            a.document_id,
-            a.rejecter,
-            a.reject_reason,
-            s.rms_id
-        FROM rms_document_snapshots s
-        JOIN rms_document_attributes a ON a.document_token = s.document_token
-        WHERE {where_sql}
-        ORDER BY {sort_col} {order_sql}
-        LIMIT %s OFFSET %s
-    """
-
-    with db(dict_cursor=True) as (_, cur):
-        cur.execute(count_sql, params)
-        total = int(cur.fetchone()["cnt"])
-
-        cur.execute(data_sql, params + [page_size, offset])
-        rows = cur.fetchall() or []
-
-    def to_item(r):
-        # issueDate：先沿用 issue_date，跟 submitted 一樣格式
-        iso_date = None
-        if r.get("issue_date"):
-            try:
-                iso_date = r["issue_date"].isoformat(timespec="seconds")
-            except Exception:
-                iso_date = str(r["issue_date"])
-
-        return {
-            # === 完全對齊 /submitted 的欄位 ===
-            "documentType":    r["document_type"],
-            "documentToken":   r["document_token"],
-            "documentName":    r["document_name"],
-            "documentVersion": float(r["document_version"]) if r["document_version"] is not None else None,
-            "author":          r["author"],
-            "authorId":        r["author_id"],
-            "issueDate":       iso_date,
-            "documentId":      r.get("document_id"),
-            "rmsId":           r.get("rms_id"),
-
-            # eipStatus：給一個固定值，方便前端如果要共用元件
-            "eipStatus":       "已退回",
-
-            # === 已退回專屬的欄位 ===
-            "rejecter":        r.get("rejecter"),
-            "rejectReason":    r.get("reject_reason"),
-        }
-
-    return jsonify({
-        "success": True,
-        "items": [to_item(r) for r in rows],
-        "total": total,
-        "page": page,
-        "pageSize": page_size,
-    }), 200
+    return send_response(200, True, "查詢成功", {"items": items})
 
 def _build_doc_payload_from_token(token: str) -> dict:
     """
@@ -2503,13 +1385,8 @@ def _build_doc_payload_from_token(token: str) -> dict:
 
         # ---------- 2) content：只有「目前這份」的 blocks + 參數 ----------
         cur.execute("""
-            SELECT step_type, tier_no, sub_no, content_type,
-                   header_text, header_json,
-                   content_text, content_json,
-                   files, metadata
-            FROM rms_block_content
-            WHERE document_token=%s
-            ORDER BY step_type ASC, tier_no ASC, sub_no ASC
+            SELECT step_type, tier_no, sub_no, content_type, header_text, header_json, content_text, content_json, files, metadata FROM rms_block_content
+            WHERE document_token=%s ORDER BY step_type ASC, tier_no ASC, sub_no ASC
         """, (token,))
         rows = cur.fetchall() or []
 
@@ -2567,12 +1444,7 @@ def _build_doc_payload_from_token(token: str) -> dict:
             contents.append(param_groups[t])
 
         # ---------- 3) references ----------
-        cur.execute("""
-            SELECT refer_type, refer_document, refer_document_name
-            FROM rms_references
-            WHERE document_token=%s
-            ORDER BY refer_type ASC, id ASC
-        """, (token,))
+        cur.execute("SELECT refer_type, refer_document, refer_document_name FROM rms_references WHERE document_token=%s ORDER BY refer_type ASC, id ASC", (token,))
         ref_rows = cur.fetchall() or []
         references = [
             {
@@ -2684,14 +1556,11 @@ def create_snapshot_and_oracle_row(token: str, rms_id: str, user_emp_no: str):
     """
     1) 從 MySQL 撈出目前 token 的 document_row / blocks_rows / references_rows
     2) 先在 Oracle.IDBUSER.RMS_DCC2EIP 新增 RMS_* 一筆
-    3) 再寫入 sfdb.rms_document_snapshots (meta) + rms_document_snapshot_payloads (JSON)
+    3) 再寫入 sfdb4070.rms_document_snapshots (meta) + rms_document_snapshot_payloads (JSON)
     """
     # --- 1) 讀 MySQL 現況（只讀，不動資料） ---
     with db(dict_cursor=True) as (conn, cur):
-        cur.execute("""
-            SELECT * FROM rms_document_attributes
-            WHERE document_token=%s
-        """, (token,))
+        cur.execute(" SELECT * FROM rms_document_attributes WHERE document_token=%s", (token,))
         doc_row = cur.fetchone()
         if not doc_row:
             raise RuntimeError(f"document_token {token} not found for snapshot")
@@ -2701,54 +1570,42 @@ def create_snapshot_and_oracle_row(token: str, rms_id: str, user_emp_no: str):
         doc_name = doc_row.get("document_name") or ""
         issue_dt = doc_row.get("issue_date") or datetime.datetime.now()
 
-        cur.execute("""
-            SELECT * FROM rms_block_content WHERE document_token=%s
-            ORDER BY step_type, tier_no, sub_no
-        """, (token,))
+        cur.execute("SELECT * FROM rms_block_content WHERE document_token=%s", (token,))
         blocks_rows = cur.fetchall() or []
 
-        cur.execute("""
-            SELECT * FROM rms_references WHERE document_token=%s
-            ORDER BY refer_type, id
-        """, (token,))
+        cur.execute("SELECT * FROM rms_references WHERE document_token=%s", (token,))
         ref_rows = cur.fetchall() or []
+
+        cur.execute("SELECT DISTINCT jt.program_code FROM rms_block_content AS t JOIN JSON_TABLE(t.metadata, '$.programs[*]' COLUMNS(program_code VARCHAR(15) PATH '$.programCode')) AS jt WHERE document_token = %s", (token, ))
+        program_codes_rows = cur.fetchall() or []
 
     # --- 2) 先寫 Oracle.RMS_DCC2EIP ---
     with odb() as cur_o:
-        cur_o.execute("""
-            INSERT INTO IDBUSER.RMS_DCC2EIP (RMS_ID, RMS_DCCNO, RMS_VER, RMS_DCCNAME, RMS_INSDT)
-            VALUES (:1, :2, :3, :4, :5)
-        """, (rms_id, doc_id, doc_ver, doc_name, issue_dt))
+        cur_o.execute("INSERT INTO IDBUSER.RMS_DCC2EIP (RMS_ID, RMS_DCCNO, RMS_VER, RMS_DCCNAME, RMS_INSDT) VALUES (:1, :2, :3, :4, :5)", (rms_id, doc_id, doc_ver, doc_name, issue_dt))
         cur_o.connection.commit()
 
     # --- 3) 再寫 MySQL snapshot（meta + payload 分兩張表） ---
-    doc_row_json = _normalize_for_json(doc_row)
-    blocks_json  = _normalize_for_json(blocks_rows)
-    refs_json    = _normalize_for_json(ref_rows)
+    doc_row_json  = _normalize_for_json(doc_row)
+    blocks_json   = _normalize_for_json(blocks_rows)
+    refs_json     = _normalize_for_json(ref_rows)
+    programs_json = [info['program_code'] for info in program_codes_rows]
 
     try:
-        doc_row_str = jdump(doc_row_json)
-        blocks_str  = jdump(blocks_json)
-        refs_str    = jdump(refs_json)
+        doc_row_str     = jdump(doc_row_json)
+        blocks_str      = jdump(blocks_json)
+        refs_str        = jdump(refs_json)
+        programs_str    = jdump(programs_json)
     except TypeError as e:
         print("[snapshot DEBUG] json dump failed:", e)
         raise
 
     with db(dict_cursor=True) as (conn, cur):
         # 3-1) 先插入輕量的 snapshots（拿到 snapshot_id）
-        cur.execute("""
-            INSERT INTO rms_document_snapshots
-            (document_token, rms_id, document_id, document_version, document_name, created_by)
-            VALUES (%s,%s,%s,%s,%s,%s)
-        """, (token, rms_id, doc_id, doc_ver, doc_name, user_emp_no))
+        cur.execute("INSERT INTO rms_document_snapshots (document_token, rms_id, document_id, document_version, document_name, created_by) VALUES (%s,%s,%s,%s,%s,%s)", (token, rms_id, doc_id, doc_ver, doc_name, user_emp_no))
         snapshot_id = cur.lastrowid
 
         # 3-2) 再插入 payload
-        cur.execute("""
-            INSERT INTO rms_document_snapshot_payloads
-            (snapshot_id, document_row, blocks_rows, references_rows)
-            VALUES (%s,%s,%s,%s)
-        """, (snapshot_id, doc_row_str, blocks_str, refs_str))
+        cur.execute("INSERT INTO rms_document_snapshot_payloads (snapshot_id, document_row, blocks_rows, references_rows, program_codes_rows) VALUES (%s,%s,%s,%s,%s)", (snapshot_id, doc_row_str, blocks_str, refs_str, programs_str))
 
         conn.commit()
 
@@ -2848,6 +1705,7 @@ def _update_attributes_from_latest_attr(token, latest_attr):
         ))
         conn.commit()
 
+# Generate word file for user
 @bp.post("/generate/word")
 def generate_word():
     """
@@ -2892,11 +1750,7 @@ def generate_word():
 
         # 4) 計算/更新 document_id + documentKey（只看最新那一版）
         with db(dict_cursor=True) as (conn, cur):
-            cur.execute("""
-                SELECT document_type, document_id, document_version, attribute, author_id, document_name
-                FROM rms_document_attributes
-                WHERE document_token=%s
-            """, (token,))
+            cur.execute("SELECT document_type, document_id, document_version, attribute, author_id, document_name FROM rms_document_attributes WHERE document_token=%s", (token,))
             r = cur.fetchone()
             if not r:
                 return send_response(404, False, "document not found")
@@ -2922,23 +1776,16 @@ def generate_word():
 
             # 4.1 生成 RMS_ID / documentKey
             rms_id = make_rms_id()
-            attr_json["documentKey"] = rms_id
 
-            cur.execute("""
-                UPDATE rms_document_attributes
-                SET document_id=%s, attribute=%s
-                WHERE document_token=%s
-            """, (doc_id, jdump(attr_json), token))
+            cur.execute("UPDATE rms_document_attributes SET document_id=%s WHERE document_token=%s", (doc_id, token))
             conn.commit()
 
         # 5) 把 docID & documentKey 塞回「最新版 attribute」（在 payload 上）
         latest_attr["documentID"] = doc_id or ""
-        latest_attr["documentKey"] = rms_id
 
         # 如果你還有想讓前端回收的 data，也可以同步更新：
         if data["attribute"]:
             data["attribute"][-1]["documentID"] = doc_id or ""
-            data["attribute"][-1]["documentKey"] = rms_id
 
         # 5.5) 暫存內容（寫回 rms_document_attributes）
         _update_attributes_from_latest_attr(token, latest_attr)
@@ -2956,11 +1803,7 @@ def generate_word():
             create_snapshot_and_oracle_row(token=token, rms_id=rms_id, user_emp_no=author_id or "UNKNOWN")
         except Exception as e:
             print("[generate_word] create_snapshot_and_oracle_row FAILED:", e)
-            return send_response(
-                500,
-                False,
-                f"EIP 建檔 / 歷史快照失敗，請聯絡系統管理員。詳細訊息：{e}"
-            )
+            return send_response(500, False, f"EIP 建檔 / 歷史快照失敗，請聯絡系統管理員。詳細訊息：{e}")
 
         # 8) Oracle + snapshot 都成功後，才產生 Word
         out_path = os.path.join(BASE_DIR, f"{doc_name}.docx")
@@ -2992,6 +1835,7 @@ def generate_word():
             mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         )
 
+# Document preview in final step (for user to check content fill)
 @bp.post("/preview/docx")
 def preview_docx():
     """
@@ -3095,10 +1939,14 @@ def _build_payload_for_docx_from_snapshot(snap_row):
     token   = snap_row["document_token"]
     snap_id = snap_row["snapshot_id"]
 
-    payload   = _load_snapshot_payload(snap_id)
-    doc_row   = payload["document_row"]
-    blocks_rs = payload["blocks_rows"]
-    refs_rs   = payload["references_rows"]
+    row, info = db_data_fetch(f"SELECT document_row, blocks_rows, references_rows FROM rms_document_snapshot_payloads WHERE snapshot_id = '{snap_id}'", fetch_one = True)
+
+    if info != "Success":
+        raise RuntimeError(f"snapshot payload not found for snapshot_id={snap_id}")
+    
+    doc_row   = _normalize_metadata(row[0]) or {}
+    blocks_rs = _normalize_metadata(row[1]) or []
+    refs_rs   = _normalize_metadata(row[2]) or []
 
     # ---------- 1.1 歷史版本（已經是 yyyy/mm/dd，就保留你現在的實作） ----------
     attrs: list[dict] = []
@@ -3279,6 +2127,7 @@ def _build_payload_for_docx_from_snapshot(snap_row):
         "reference": references,
     }
 
+# Document preview in signed document
 @bp.get("/preview/<token>")
 def preview_docx_from_snapshot(token):
     rms_id = request.args.get("rms_id")
@@ -3374,54 +2223,28 @@ def allocate_program_code():
         # conn.start_transaction()
 
         # 1) 先看有沒有舊的釋放號碼可以重用（status=9）
-        cur.execute("""
-            SELECT id, serial_no, program_code
-            FROM rms_program_code
-            WHERE spec_code = %s AND status = 9
-            ORDER BY serial_no ASC
-            LIMIT 1
-            FOR UPDATE
-        """, (spec_code,))
+        cur.execute("SELECT id, serial_no, program_code FROM rms_program_code WHERE spec_code = %s AND status = 9 ORDER BY serial_no ASC LIMIT 1 FOR UPDATE", (spec_code,))
         row = cur.fetchone()
 
         if row:
             # 重用舊號碼，改成 reserved 狀態
-            cur.execute("""
-                UPDATE rms_program_code
-                SET status = 0,
-                    document_token = %s
-                WHERE id = %s
-            """, (document_token, row["id"]))
+            cur.execute("UPDATE rms_program_code SET status = 0, document_token = %s WHERE id = %s", (document_token, row["id"]))
             # 這裡可以不寫 conn.commit()，交給 db() 做
             serial = row["serial_no"]
             program_code = row["program_code"]
         else:
             # 2) 沒有可重用 → 取最大 serial_no + 1
-            cur.execute("""
-                SELECT MAX(serial_no) AS max_serial
-                FROM rms_program_code
-                WHERE spec_code = %s
-                FOR UPDATE
-            """, (spec_code,))
+            cur.execute("SELECT MAX(serial_no) AS max_serial FROM rms_program_code WHERE spec_code = %s FOR UPDATE", (spec_code,))
             r = cur.fetchone()
             max_serial = r["max_serial"] or 0
             serial = max_serial + 1
             program_code = f"{prefix}{serial:03d}"
 
             # 寫入資料表
-            cur.execute("""
-                INSERT INTO rms_program_code
-                    (spec_code, serial_no, program_code, document_token, status)
-                VALUES (%s, %s, %s, %s, 0)
-            """, (spec_code, serial, program_code, document_token))
+            cur.execute("INSERT INTO rms_program_code (spec_code, serial_no, program_code, document_token, status) VALUES (%s, %s, %s, %s, 0)", (spec_code, serial, program_code, document_token))
             # 一樣可以不用手動 conn.commit()
 
-    data = {
-        "specCode": spec_code,
-        "programCode": program_code,
-        "prefix": prefix,
-        "serial": serial,
-    }
+    data = {"specCode": spec_code, "programCode": program_code, "prefix": prefix, "serial": serial,}
     return send_response(200, True, "程式號碼配號成功", data)
 
 @bp.post("/program-codes/release")
@@ -3437,12 +2260,7 @@ def release_program_code():
         return send_response(400, False, "programCode 為必填", None)
 
     with db(dict_cursor=True) as (conn, cur):
-        cur.execute("""
-            UPDATE rms_program_code
-            SET status = 9, document_token = NULL
-            WHERE program_code = %s
-        """, (program_code,))
-        # 你也可以檢查 rowcount 判斷有沒有真的更新到
+        cur.execute("UPDATE rms_program_code SET status = 9, document_token = NULL WHERE program_code = %s", (program_code,))
         conn.commit()
 
     return send_response(200, True, "程式號碼已釋放", {"programCode": program_code})
@@ -3461,520 +2279,302 @@ def release_program_codes_by_document():
         return send_response(400, False, "document_token 為必填", None)
 
     with db(dict_cursor=True) as (conn, cur):
-        cur.execute("""
-            UPDATE rms_program_code
-            SET status = 9, document_token = NULL
-            WHERE document_token = %s AND status = 0
-        """, (document_token,))
+        cur.execute("UPDATE rms_program_code SET status = 9, document_token = NULL WHERE document_token = %s AND status = 0", (document_token,))
         conn.commit()
 
     return send_response(200, True, "程式號碼已釋放", {"document_token": document_token})
 
 # ===== helper function ===== #
-def _nz(s):
-    return (s or "").strip()
+# @bp.post("/parameters/copy-spec-source")
+# def copy_spec_source_mcr():
+#     """
+#     處理需求 7: 從 Specification Document 複製參數
+#     """
+#     body = request.get_json(silent=True) or {}
+#     program_code = (body.get("program_code") or "").strip()
 
-def _load_machine_pms_signature(machine_code: str) -> set[str]:
-    """
-    從 Oracle 撈出目前機台的 PMS baseline，轉成一個 set 用來比對。
-    key: f"{slot_name}|{parameter_desc}({unit})"
-    這樣才會跟文件 content_text 的「槽體 / 管理項目」對得起來。
-    """
-    sig = set()
-    if not machine_code:
-        return sig
+#     if not program_code:
+#         return send_response(400, False, "請輸入程式代碼", None)
 
-    with odb() as cur:
-        cur.execute(
-            """
-            SELECT
-                TRIM(SLOT_NAME)      AS SLOT_NAME,
-                TRIM(PARAMETER_DESC) AS PARAMETER_DESC,
-                TRIM(UNIT)           AS UNIT
-            FROM IDBUSER.RMS_FLEX_PMS
-            WHERE MACHINE_CODE = :c
-              AND NVL(PARAM_COMPARE, 'N') = 'Y'
-              AND NVL(SET_ATTRIBUTE, 'N') = 'Y'
-            ORDER BY SLOT_NAME, PARAMETER_DESC
-            """,
-            c=machine_code
-        )
-        rows = cur.fetchall()
+#     try:
+#         # -------------------------------------------------------
+#         # STEP 1: 找出對應的 Source Block [需求 7 & 7.4]
+#         # -------------------------------------------------------
+#         with db() as (conn, cur):
+#             sql = """
+#             SELECT 
+#                 bc.content_json,
+#                 bc.content_text,  -- 用於解析當下的 PMS 結構
+#                 bc.metadata,
+#                 d.document_token
+#             FROM sfdb4070.rms_block_content bc
+#             JOIN sfdb4070.rms_document_attributes d ON d.document_token = bc.document_token
+#             WHERE d.status = 2            -- [需求 7] status = 2 (已簽核)
+#               AND d.document_type = 1     -- [需求 7] document_type = 1 (Spec Doc)
+#               AND bc.step_type = 5        -- [需求 7.4] step_type = 5
+#               AND bc.sub_no = 0           -- [需求 7.4] sub_no = 0
+#               AND JSON_UNQUOTE(JSON_EXTRACT(bc.metadata, '$.kind')) = 'mcr-parameter'
+#               AND JSON_SEARCH(bc.metadata, 'one', %s, NULL, '$.programs[*].programCode') IS NOT NULL
+#             LIMIT 1
+#             """
+#             cur.execute(sql, (program_code,))
+#             row = cur.fetchone()
 
-    for slot_name, parameter_desc, unit in rows or []:
-        slot  = _nz(slot_name)
-        pdesc = _nz(parameter_desc)
-        u     = _nz(unit)
+#             if not row:
+#                 return send_response(200, False, "查無此代碼或文件不符合複製條件 (需為已簽核規格書)", None)
 
-        # 這裡和 get_machine_pms_parameters_set_attribute 完全一樣
-        mgmt = f"{pdesc}({u})" if u else f"{pdesc}()"
-        if slot or mgmt:
-            sig.add(f"{slot}|{mgmt}")
-    return sig
+#             content_json_str, content_text_str, meta_str, doc_token = row
+            
+#             meta = json.loads(meta_str) if meta_str else {}
+#             machine_code = meta.get("machine") or ""
+#             group_code = meta.get("machineGroup") or ""
 
-def _load_machine_condition_signature(machine_code: str) -> set[str]:
-    """
-    從 MySQL 撈出目前機台的 Condition baseline，轉成一個 set 用來比對。
-    key: condition_name  → 對應到文件 condition table header。
-    """
-    sig = set()
-    if not machine_code:
-        return sig
+#             if not machine_code:
+#                 return send_response(200, False, "來源資料異常：無機台資訊", None)
 
-    with db() as (conn, cur):
-        cur.execute(
-            """
-            SELECT DISTINCT
-                t1.condition_name
-            FROM rms_conditions t1
-            INNER JOIN rms_condition_groups t2
-                ON t1.condition_id = t2.condition_id
-            INNER JOIN rms_group_machines t3
-                ON t2.group_id = t3.group_id AND t2.condition_id = t3.condition_id
-            WHERE t3.machine_id = %s
-            """,
-            (machine_code,)
-        )
-        rows = cur.fetchall()
+#             # -------------------------------------------------------
+#             # STEP 2: [需求 7.1 & 7.3] PMS 比對
+#             # -------------------------------------------------------
+            
+#             # 2.1 取得 Oracle 目前最新的 PMS
+#             # [需求 7.1] PARAM_COMPARE='Y' AND SET_ATTRIBUTE='Y'
+#             current_pms_signature = set()
+#             try:
+#                 with odb() as ora:
+#                     ora.execute("""
+#                         SELECT TRIM(SLOT_NAME), TRIM(PARAMETER_DESC)
+#                         FROM IDBUSER.RMS_FLEX_PMS
+#                         WHERE MACHINE_CODE = :m 
+#                           AND NVL(PARAM_COMPARE, 'N') = 'Y' 
+#                           AND NVL(SET_ATTRIBUTE, 'N') = 'Y'
+#                     """, {"m": machine_code})
+#                     for r in ora.fetchall():
+#                         # [需求 7.3] 比較 SLOT_NAME 與 PARAMETER_DESC
+#                         current_pms_signature.add((r[0], r[1]))
+#             except Exception as e:
+#                 print(f"[PMS Check] Oracle Error: {e}")
+#                 return send_response(400, False, "PMS 驗證失敗：無法連接 MES", None)
 
-    for (cname,) in rows or []:
-        name = _nz(cname)
-        if name:
-            sig.add(name)
-    return sig
+#             # 2.2 解析 Source Block 的 PMS 結構 (從 content_text)
+#             source_pms_signature = set()
+#             try:
+#                 # content_text 格式範例: [["Slot","Param",...], ["SlotA","ParamA",...]]
+#                 text_arr = json.loads(content_text_str) if content_text_str else []
+                
+#                 # 跳過 Header (第一列)
+#                 if len(text_arr) > 1:
+#                     for row_data in text_arr[1:]:
+#                         if len(row_data) >= 2:
+#                             slot = str(row_data[0]).strip()
+#                             # 需注意：前端表格中的 Parameter Desc 可能包含 "(單位)"
+#                             # 如果 Oracle 的 DESC 沒有單位，這裡比對會失敗。
+#                             # 建議：先嘗試比對 Slot Name，這最準確且不易受單位顯示影響
+#                             # [需求 7.3] 若要嚴格比對 Desc，需確保格式一致
+#                             # 這裡我們先採用 Slot Name 比對作為主要依據，因為這是硬體結構
+#                             if slot:
+#                                 source_pms_signature.add(slot)
+#             except Exception as e:
+#                 print(f"[PMS Check] Parse JSON Error: {e}")
 
-def _parse_2d_from_text(text: str):
-    """
-    content_text 裡存的是像：
-    [
-      ["槽體","管理項目",...],
-      ["剝膜1","上噴關槽()", ...],
-      ...
-    ]
-    這裡把它轉成 Python list[list[str]]，不合法就回 []
-    """
-    if not text:
-        return []
-    try:
-        data = json.loads(text)
-        if isinstance(data, list):
-            return data
-        return []
-    except Exception:
-        return []
+#             # 2.3 執行比對
+#             # 為了避免單位括號造成的誤判，我們這裡主要比對 Slot 是否一致
+#             current_slots = {k[0] for k in current_pms_signature}
+            
+#             # 如果 Slot 集合不一致，視為 PMS 變更
+#             if source_pms_signature != current_slots:
+#                  return send_response(200, False, "PMS版本不符", {
+#                     "message": f"機台 PMS 設定已變更，無法複製。\n(來源 Slot 與目前 MES 設定不符)"
+#                 })
 
-def _build_doc_pms_signature_from_text(param_text: str) -> set[str]:
-    """
-    從參數表 content_text 取出「槽體 + 管理項目」組合當作文件當時的 PMS Signature。
-    依你說的：用 content_text 的 [:,0:2] 就夠了（第一列是 header，從第二列開始）。
-    """
-    sig = set()
-    table = _parse_2d_from_text(param_text)
-    if len(table) <= 1:
-        return sig
+#             # -------------------------------------------------------
+#             # STEP 3: 回傳資料
+#             # -------------------------------------------------------
+#             return send_response(200, True, "複製成功", {
+#                 "blocks": {
+#                     "content_json": json.loads(content_json_str) if content_json_str else None,
+#                     "machine": machine_code,
+#                     "machineGroup": group_code,
+#                     # 注意：我們不回傳 programCode，因為前端要自己配新的 (需求 7.5)
+#                 }
+#             })
 
-    # 跳過 header (第 0 列)，從第 1 列開始
-    for row in table[1:]:
-        if not isinstance(row, list) or len(row) < 2:
-            continue
-        tank = _nz(row[0])
-        param = _nz(row[1])
-        if tank or param:
-            sig.add(f"{tank}|{param}")
-    return sig
-
-def _build_doc_condition_signature_from_text(cond_text: str) -> set[str]:
-    """
-    從條件表 content_text 取出 header 第一列的 [1:-1] 當作文件當時的 Condition Signature。
-    例如：
-      [["條件名稱","鍍銅厚度"], ["1","10"]]
-    => header = ["條件名稱","鍍銅厚度"]
-       => 取 header[1:] = ["鍍銅厚度"]
-    """
-    sig = set()
-    table = _parse_2d_from_text(cond_text)
-    if not table:
-        return sig
-
-    header = table[0]
-    if not isinstance(header, list) or len(header) <= 1:
-        return sig
-
-    # 這邊依照你講的 [1:-1] 或 [1:] 都可以，看你要不要排除最後一欄
-    # 我先採用 [1:]（通常最後也會是條件），如果你最後一欄是特別欄位，就改成 header[1:-1]
-    for col in header[1:]:
-        name = _nz(col)
-        if name:
-            sig.add(name)
-    return sig
-
-@bp.post("/parameters/copy-source")
-def copy_source_mcr():
-    """
-    功能：從已簽核的 Instruction 文件中複製參數與條件表。
-    限制：
-    1. program_code 必須存在。
-    2. 來源文件的機台必須與 base_machine_code 具有相同的 PMS Slot 設置 (Oracle)。
-    3. 來源文件的機台必須與 base_machine_code 具有相同的 Condition Signature (MySQL)。
-    4. ✅ 新增：來源文件當時的 PMS / Condition 內容必須與「目前 baseline」相同
-              （避免複製到已經過期的規格）。
-    """
-    body = request.get_json(silent=True) or {}
-    program_code = (body.get("program_code") or "").strip()
-    base_machine_code = (body.get("base_machine_code") or "").strip()
-
-    if not program_code or not base_machine_code:
-        return send_response(400, False, "缺少必要參數", {"message": "請提供程式代碼與 Base Machine Code"})
-
-    # print(f"[DEBUG] copy_source_mcr start: program={program_code}, base={base_machine_code}")
-
-    # ==========================================
-    # STEP 1: 找出所有 "PMS 相容" 的機台 (Oracle)
-    # ==========================================
-    pms_compatible_machines = set()
-    try:
-        with odb() as cur:
-            sql = """
-            WITH target_slots AS (
-                SELECT SLOT_NAME FROM IDBUSER.RMS_FLEX_PMS WHERE MACHINE_CODE = :base_code
-            ),
-            target_count AS ( SELECT COUNT(*) as cnt FROM target_slots ),
-            candidates AS (
-                SELECT MACHINE_CODE, SLOT_NAME FROM IDBUSER.RMS_FLEX_PMS
-            )
-            SELECT DISTINCT A.MACHINE_CODE
-            FROM IDBUSER.RMS_SYS_MACHINE A
-            JOIN target_count tc ON 1=1
-            WHERE A.ENABLED = 'Y' AND A.EQM_ID <> 'NA'
-            AND (
-                (tc.cnt > 0 
-                 AND EXISTS (SELECT 1 FROM candidates c WHERE c.MACHINE_CODE = A.MACHINE_CODE)
-                 AND NOT EXISTS (
-                    SELECT 1 FROM target_slots ts 
-                    WHERE NOT EXISTS (SELECT 1 FROM candidates c WHERE c.MACHINE_CODE = A.MACHINE_CODE AND c.SLOT_NAME = ts.SLOT_NAME)
-                 )
-                 AND NOT EXISTS (
-                    SELECT 1 FROM candidates c 
-                    WHERE c.MACHINE_CODE = A.MACHINE_CODE 
-                    AND NOT EXISTS (SELECT 1 FROM target_slots ts WHERE ts.SLOT_NAME = c.SLOT_NAME)
-                 )
-                )
-                OR
-                (tc.cnt = 0 AND NOT EXISTS (SELECT 1 FROM candidates c WHERE c.MACHINE_CODE = A.MACHINE_CODE))
-            )
-            """
-            cur.execute(sql, {"base_code": base_machine_code})
-            rows = cur.fetchall()
-            pms_compatible_machines = {row[0] for row in rows}
-            pms_compatible_machines.add(base_machine_code)
-
-    except Exception as e:
-        print(f"[ERROR] Oracle PMS check failed: {e}")
-        return send_response(400, False, "PMS 資料比對失敗", {"message": "無法驗證機台 PMS 相容性"})
-
-    # ==========================================
-    # STEP 2: 找出 "Condition 相容" 的機台 (MySQL)
-    # ==========================================
-    final_compatible_machines = []
-    if not pms_compatible_machines:
-        final_compatible_machines = [base_machine_code]
-    else:
-        try:
-            with db() as (conn, cur):
-                pms_list = list(pms_compatible_machines)
-                union_parts = [f"SELECT '{m}' as m_code" for m in pms_list]
-                union_sql = " UNION ALL ".join(union_parts)
-
-                sql = f"""
-                WITH input_machines AS (
-                    {union_sql}
-                ),
-                machine_sigs AS (
-                    SELECT 
-                        im.m_code,
-                        (
-                            SELECT GROUP_CONCAT(rgm.condition_id ORDER BY rgm.condition_id SEPARATOR ',')
-                            FROM sfdb.rms_group_machines rgm
-                            WHERE rgm.machine_id = im.m_code
-                        ) as sig
-                    FROM input_machines im
-                ),
-                base_sig AS (
-                    SELECT sig FROM machine_sigs WHERE m_code = %s
-                )
-                SELECT ms.m_code
-                FROM machine_sigs ms
-                JOIN base_sig bs ON (ms.sig IS NULL AND bs.sig IS NULL) OR (ms.sig = bs.sig)
-                """
-                cur.execute(sql, (base_machine_code,))
-                rows = cur.fetchall()
-                final_compatible_machines = [r[0] for r in rows]
-
-        except Exception as e:
-            print(f"[ERROR] MySQL Condition check failed: {e}")
-            final_compatible_machines = [base_machine_code]
-
-    # print(f"[DEBUG] Allowed machines: {final_compatible_machines}")
-
-    # ==========================================
-    # STEP 3: 查詢已簽核文件 (Source Document)
-    #      + ✅ 新增「文件內容 vs baseline」比對
-    # ==========================================
-    try:
-        with db() as (conn, cur):
-            sql = """
-            SELECT 
-                bc.document_token,
-                d.attribute,
-                bc.content_text      AS param_text,
-                bc.content_json      AS param_json,
-                (
-                    SELECT sub.content_text 
-                    FROM sfdb.rms_block_content sub 
-                    WHERE sub.document_token = bc.document_token 
-                      AND sub.step_type = 2 
-                      AND sub.sub_no = 1 
-                    LIMIT 1
-                ) as cond_text,
-                (
-                    SELECT sub.content_json 
-                    FROM sfdb.rms_block_content sub 
-                    WHERE sub.document_token = bc.document_token 
-                      AND sub.step_type = 2 
-                      AND sub.sub_no = 1 
-                    LIMIT 1
-                ) as cond_json,
-                bc.metadata
-            FROM sfdb.rms_block_content bc
-            JOIN sfdb.rms_document_attributes d ON d.document_token = bc.document_token
-            WHERE d.status = 2
-              AND d.document_type = 0
-              AND bc.step_type = 2
-              AND bc.sub_no = 0
-              AND JSON_UNQUOTE(JSON_EXTRACT(bc.metadata, '$.kind')) = 'mcr-parameter'
-              AND JSON_SEARCH(bc.metadata, 'one', %s, NULL, '$.programs[*].programCode') IS NOT NULL
-            ORDER BY d.issue_date DESC
-            """
-
-            cur.execute(sql, (program_code,))
-            candidates = cur.fetchall()
-
-            target_param_json = None
-            target_cond_json = None
-            target_programs = []
-            found_valid_doc = False
-
-            # 預先算好「base machine 的 baseline signature」，如果你要用 base 做比較也可以；
-            # 這裡我會用「文件裡實際使用的那台 machine」當 baseline。
-            # base_pms_sig  = _load_machine_pms_signature(base_machine_code)
-            # base_cond_sig = _load_machine_condition_signature(base_machine_code)
-
-            for row in candidates:
-                (doc_token, attr_str, param_text, param_json_str, cond_text, cond_json_str, meta_str) = row
-
-                # 解析 Attribute 取得這份文件所掛的 machine 清單
-                try:
-                    attr = json.loads(attr_str) if attr_str else {}
-                    doc_machines = attr.get("machines", [])
-                    doc_machine_codes = {m.get("code") for m in doc_machines if m.get("code")}
-                except Exception as e:
-                    print(f"[WARN] parse attribute failed for {doc_token}: {e}")
-                    continue
-
-                # 只接受「文件使用的機台」裡，至少有一台在 final_compatible_machines 名單內
-                compatible_in_doc = doc_machine_codes.intersection(set(final_compatible_machines))
-                if not compatible_in_doc:
-                    continue
-
-                # ✅ 選一台「文件實際使用 + 與 baseline 相容」的機台當作 baseline 比對標的
-                #    （這裡簡單選第一個，你也可以改成 if base_machine_code in compatible_in_doc 優先用 base）
-                doc_machine_for_compare = None
-                if base_machine_code in compatible_in_doc:
-                    doc_machine_for_compare = base_machine_code
-                else:
-                    doc_machine_for_compare = next(iter(compatible_in_doc))
-
-                # ------- 3.1 撈目前 baseline（這台機台）的 signature -------
-                current_pms_sig  = _load_machine_pms_signature(doc_machine_for_compare)
-                current_cond_sig = _load_machine_condition_signature(doc_machine_for_compare)
-
-                # ------- 3.2 從文件內容抽出當時的 signature -------
-                doc_pms_sig  = _build_doc_pms_signature_from_text(param_text or "")
-                doc_cond_sig = _build_doc_condition_signature_from_text(cond_text or "")
-
-                # ------- 3.3 做比對 -------
-                # ------- 3.3 做比對 + DEBUG -------
-                if current_pms_sig != doc_pms_sig or current_cond_sig != doc_cond_sig:
-                    # print(f"[DEBUG] doc {doc_token} skipped: PMS/Cond signature not matched.")
-                    # print(f"[DEBUG]   machine_for_compare = {doc_machine_for_compare}")
-
-                    # print(f"[DEBUG]   PMS current size = {len(current_pms_sig)}, doc size = {len(doc_pms_sig)}")
-                    only_in_current_pms = list(current_pms_sig - doc_pms_sig)[:10]
-                    only_in_doc_pms     = list(doc_pms_sig - current_pms_sig)[:10]
-                    # print(f"[DEBUG]   PMS only_in_current (first 10): {only_in_current_pms}")
-                    # print(f"[DEBUG]   PMS only_in_doc     (first 10): {only_in_doc_pms}")
-
-                    # print(f"[DEBUG]   COND current size = {len(current_cond_sig)}, doc size = {len(doc_cond_sig)}")
-                    only_in_current_cond = list(current_cond_sig - doc_cond_sig)[:10]
-                    only_in_doc_cond     = list(doc_cond_sig - current_cond_sig)[:10]
-                    # print(f"[DEBUG]   COND only_in_current (first 10): {only_in_current_cond}")
-                    # print(f"[DEBUG]   COND only_in_doc     (first 10): {only_in_doc_cond}")
-
-                    continue
-
-                # ------- 3.4 通過比對 → 這份文件才是合法來源 -------
-                found_valid_doc = True
-                try:
-                    target_param_json = json.loads(param_json_str) if param_json_str else None
-                except Exception:
-                    target_param_json = None
-
-                try:
-                    target_cond_json = json.loads(cond_json_str) if cond_json_str else None
-                except Exception:
-                    target_cond_json = None
-
-                try:
-                    meta = json.loads(meta_str) if meta_str else {}
-                    target_programs = meta.get("programs") or []
-                except Exception as e:
-                    print(f"[WARN] Parse metadata failed: {e}")
-                    target_programs = []
-
-                # print(f"[DEBUG] Found compatible + up-to-date doc: {doc_token}, machines: {compatible_in_doc}")
-                break
-
-            if not found_valid_doc:
-                return send_response(200, False, "條件參數不同無法複製", {
-                    "message": "雖有此程式代碼，但來源文件的 PMS/條件內容已與目前 baseline 不一致，無法複製。"
-                })
-
-            return send_response(200, True, "複製成功", {
-                "blocks": {
-                    "param_json": target_param_json,
-                    "cond_json": target_cond_json,
-                    "source_programs": target_programs
-                }
-            })
-
-    except Exception as e:
-        print(f"[ERROR] Fetch doc failed: {e}")
-        return send_response(500, False, "系統錯誤", {"message": str(e)})
+#     except Exception as e:
+#         print(f"[ERROR] copy_spec_source: {e}")
+#         return send_response(500, False, "系統錯誤", {"message": str(e)})
 
 @bp.post("/parameters/copy-spec-source")
 def copy_spec_source_mcr():
     """
-    處理需求 7: 從 Specification Document 複製參數
+        1. 查找有無該 program code 的 document (沒有直接回傳查無資料)
+        2. 取得文檔中的參數以及目前最新的參數
+        3. 比對製造參數"相同"以及"不同"的處理 (若機台未交集且最新參數與過去文檔參數有所不同 => 回傳製造參數不一致)
+        4. 新增/刪減 PMS 點位與條件參數 => 回傳 {"param_json", "source_programs", "add_params", "del_params"}
+            param_json format: list<list<str>>
+            source_programs format: json
+            add_params format: list<str>
+            del_params format: list<str>
     """
     body = request.get_json(silent=True) or {}
     program_code = (body.get("program_code") or "").strip()
+    machines = body.get("machines")
 
     if not program_code:
         return send_response(400, False, "請輸入程式代碼", None)
 
+    program_code = program_code.split("-")[-1] if "-" in program_code else program_code
+
+     # Query program code from code table
     try:
-        # -------------------------------------------------------
-        # STEP 1: 找出對應的 Source Block [需求 7 & 7.4]
-        # -------------------------------------------------------
+        sql = f"""
+            SELECT rbc.content_text, rbc.metadata FROM rms_program_code AS rpc
+            JOIN rms_block_content AS rbc ON rbc.document_token = rpc.document_token
+            WHERE rpc.program_code = '{program_code}' AND JSON_CONTAINS(rbc.metadata->'$.programs', JSON_OBJECT('programCode', '{program_code}'));
+        """
         with db() as (conn, cur):
-            sql = """
-            SELECT 
-                bc.content_json,
-                bc.content_text,  -- 用於解析當下的 PMS 結構
-                bc.metadata,
-                d.document_token
-            FROM sfdb.rms_block_content bc
-            JOIN sfdb.rms_document_attributes d ON d.document_token = bc.document_token
-            WHERE d.status = 2            -- [需求 7] status = 2 (已簽核)
-              AND d.document_type = 1     -- [需求 7] document_type = 1 (Spec Doc)
-              AND bc.step_type = 5        -- [需求 7.4] step_type = 5
-              AND bc.sub_no = 0           -- [需求 7.4] sub_no = 0
-              AND JSON_UNQUOTE(JSON_EXTRACT(bc.metadata, '$.kind')) = 'mcr-parameter'
-              AND JSON_SEARCH(bc.metadata, 'one', %s, NULL, '$.programs[*].programCode') IS NOT NULL
-            LIMIT 1
-            """
-            cur.execute(sql, (program_code,))
-            row = cur.fetchone()
-
-            if not row:
-                return send_response(200, False, "查無此代碼或文件不符合複製條件 (需為已簽核規格書)", None)
-
-            content_json_str, content_text_str, meta_str, doc_token = row
-            
-            meta = json.loads(meta_str) if meta_str else {}
-            machine_code = meta.get("machine") or ""
-            group_code = meta.get("machineGroup") or ""
-
-            if not machine_code:
-                return send_response(200, False, "來源資料異常：無機台資訊", None)
-
-            # -------------------------------------------------------
-            # STEP 2: [需求 7.1 & 7.3] PMS 比對
-            # -------------------------------------------------------
-            
-            # 2.1 取得 Oracle 目前最新的 PMS
-            # [需求 7.1] PARAM_COMPARE='Y' AND SET_ATTRIBUTE='Y'
-            current_pms_signature = set()
-            try:
-                with odb() as ora:
-                    ora.execute("""
-                        SELECT TRIM(SLOT_NAME), TRIM(PARAMETER_DESC)
-                        FROM IDBUSER.RMS_FLEX_PMS
-                        WHERE MACHINE_CODE = :m 
-                          AND NVL(PARAM_COMPARE, 'N') = 'Y' 
-                          AND NVL(SET_ATTRIBUTE, 'N') = 'Y'
-                    """, {"m": machine_code})
-                    for r in ora.fetchall():
-                        # [需求 7.3] 比較 SLOT_NAME 與 PARAMETER_DESC
-                        current_pms_signature.add((r[0], r[1]))
-            except Exception as e:
-                print(f"[PMS Check] Oracle Error: {e}")
-                return send_response(400, False, "PMS 驗證失敗：無法連接 MES", None)
-
-            # 2.2 解析 Source Block 的 PMS 結構 (從 content_text)
-            source_pms_signature = set()
-            try:
-                # content_text 格式範例: [["Slot","Param",...], ["SlotA","ParamA",...]]
-                text_arr = json.loads(content_text_str) if content_text_str else []
-                
-                # 跳過 Header (第一列)
-                if len(text_arr) > 1:
-                    for row_data in text_arr[1:]:
-                        if len(row_data) >= 2:
-                            slot = str(row_data[0]).strip()
-                            # 需注意：前端表格中的 Parameter Desc 可能包含 "(單位)"
-                            # 如果 Oracle 的 DESC 沒有單位，這裡比對會失敗。
-                            # 建議：先嘗試比對 Slot Name，這最準確且不易受單位顯示影響
-                            # [需求 7.3] 若要嚴格比對 Desc，需確保格式一致
-                            # 這裡我們先採用 Slot Name 比對作為主要依據，因為這是硬體結構
-                            if slot:
-                                source_pms_signature.add(slot)
-            except Exception as e:
-                print(f"[PMS Check] Parse JSON Error: {e}")
-
-            # 2.3 執行比對
-            # 為了避免單位括號造成的誤判，我們這裡主要比對 Slot 是否一致
-            current_slots = {k[0] for k in current_pms_signature}
-            
-            # 如果 Slot 集合不一致，視為 PMS 變更
-            if source_pms_signature != current_slots:
-                 return send_response(200, False, "PMS版本不符", {
-                    "message": f"機台 PMS 設定已變更，無法複製。\n(來源 Slot 與目前 MES 設定不符)"
-                })
-
-            # -------------------------------------------------------
-            # STEP 3: 回傳資料
-            # -------------------------------------------------------
-            return send_response(200, True, "複製成功", {
-                "blocks": {
-                    "content_json": json.loads(content_json_str) if content_json_str else None,
-                    "machine": machine_code,
-                    "machineGroup": group_code,
-                    # 注意：我們不回傳 programCode，因為前端要自己配新的 (需求 7.5)
-                }
-            })
+            cur.execute(sql)
+            content_info = cur.fetchone()
 
     except Exception as e:
-        print(f"[ERROR] copy_spec_source: {e}")
+        print("查詢 program code 失敗。")
         return send_response(500, False, "系統錯誤", {"message": str(e)})
+    
+    if content_info == None or len(content_info) == 0:
+        return send_response(401, True, "查無參數代碼", {"message": "資料庫無該參數代碼對應的已簽核文件"})
+    
+    table_info = content_info[0]
+    document_machines = json.loads(content_info[1]).get("machines")
+    intersection_machines = list(set(machines) & set(document_machines))
+    base_machine = intersection_machines[0] if intersection_machines else machines[0]
+
+    # 2-1. Fetch latest PMS data from document PMS data
+    machine_slots = []
+    try:
+        with odb(db_alias = "machine_db") as cur:
+            cur.execute(f"SELECT SLOT_NAME, PARAMETER_DESC, UNIT, SET_ATTRIBUTE FROM SAJET.FLEX_PMS WHERE MACHINE_CODE = '{base_machine}' AND PARAM_COMPARE = 'Y' AND SET_ATTRIBUTE = 'Y' ORDER BY PMS_ID")
+            machine_slots = cur.fetchall()
+    except Exception as e:
+        return send_response(500, False, "系統錯誤", {"message": info})
+    
+    target_pms_header = ['項次', '槽體', '管理項目', '規格下限(OOS-)', '操作下限(OOC-)', '設定值', '操作上限(OOC+)', '規格上限(OOS+)', '參數下放', '說明']
+    target_pms_slots = set([f"{slot_info[0]}-{slot_info[1]}" + ("(%s)" % slot_info[2] if slot_info[2] != None and len(slot_info[2]) > 0 else "") for slot_info in machine_slots])
+    
+    source_pms_table = json.loads(table_info)
+
+    source_pms_slots = {f"{slot_info[1]}-{slot_info[2]}": slot_info for slot_info in source_pms_table[1:]}
+    add_pms = target_pms_slots - set(source_pms_slots.keys())
+    del_pms = set(source_pms_slots.keys()) - target_pms_slots
+
+    if (not intersection_machines and (add_pms or del_pms)):
+        print("機台不符合: 此機台條件參數與查詢代碼不符")
+        return send_response(402, True, "機台不符合", {"message": "此機台製造參數與查詢代碼不符"})
+    
+    # 4. Match PMS parameter
+    target_pms_rows = [target_pms_header]
+    for index, slot_info in enumerate(machine_slots):
+        slot_key = f"{slot_info[0]}-{slot_info[1]}" + ("(%s)" % slot_info[2] if slot_info[2] != None and len(slot_info[2]) > 0 else "")
+        unit = "(%s)" % slot_info[2] if slot_info[2] != None and len(slot_info[2]) > 0 else ""
+        rowData = [f"{index}", slot_info[0], slot_info[1] + unit, "", "", "", "", "", "Y", ""] if source_pms_slots.get(slot_key) == None else [f"{index + 1}"] + source_pms_slots.get(slot_key)[1:]
+        target_pms_rows.append(rowData)
+        
+    info = {"param_array": target_pms_rows, "metadata": content_info[1], "add_params": list(add_pms), "del_params": list(del_pms)}
+    return send_response(200, True, "複製成功", {"blocks": info})
+    
+PMS_PREFIX = "(NVL(PARAM_COMPARE, 'N') = 'Y' AND NVL(SET_ATTRIBUTE, 'N') = 'Y')"
+@bp.post("/parameters/copy-source")
+def copy_source_mcr():
+    '''
+        1. 查找有無該 program code 的 document (沒有直接回傳查無資料)
+        2. 取得文檔中的參數以及目前最新的參數
+        3. 比對條件參數"相同"以及"不同"的處理 (若機台未交集且最新參數與過去文檔參數有所不同 => 回傳條件參數不一致)
+        4. 比對製造參數"相同"以及"不同"的處理 (若機台未交集且最新參數與過去文檔參數有所不同 => 回傳製造參數不一致)
+        5. 新增/刪減 PMS 點位與條件參數 => 回傳 {"param_json", "cond_json", "source_programs", "add_params", "del_params", "add_conds", "del_conds"}
+            param_json format: list<list<str>>
+            cond_json format: list<list<str>>
+            source_programs format: json
+            add_params format: list<str>
+            del_params format: list<str>
+            add_conds format: list<str>
+            del_conds format: list<str>
+    '''
+    body = request.get_json(silent=True) or {}
+    program_code = body.get("program_code")
+    machines = body.get("machines")
+    
+    # Query program code from code table
+    try:
+        sql = f"SELECT rda.document_token, rda.attribute FROM rms_program_code rpc JOIN rms_document_attributes rda ON rda.document_token = rpc.document_token WHERE rda.status = 2 AND rpc.program_code = '{program_code}'"
+        with db() as (conn, cur):
+            cur.execute(sql)
+            document_info = cur.fetchone()
+
+    except Exception as e:
+        print("查詢 program code 失敗。")
+        return send_response(500, False, "系統錯誤", {"message": str(e)})
+    
+    if len(document_info) == 0:
+        return send_response(200, True, "查無參數代碼", {"message": "資料庫無該參數代碼對應的已簽核文件"})
+    
+    document_token = document_info[0]
+    document_machines = json.loads(document_info[1]).get("machines")
+    intersection_machines = list(set(machines) & set(document_machines))
+    base_machine = intersection_machines[0] if intersection_machines else machines[0]
+
+    # 2-1. Fetch latest PMS data from document PMS data
+    machine_slots, info = odb_data_fetch(f"SELECT SLOT_NAME, PARAMETER_DESC, UNIT FROM IDBUSER.RMS_FLEX_PMS WHERE MACHINE_CODE = '{base_machine}' AND {PMS_PREFIX} ORDER BY PMS_ID")
+    if info != "Success":
+        return send_response(500, False, "系統錯誤", {"message": info})
+    
+    target_pms_header = ['槽體', '管理項目', '規格下限(OOS-)', '操作下限(OOC-)', '設定值', '操作上限(OOC+)', '規格上限(OOS+)', '參數下放', '說明']
+    target_pms_slots = set([f"{slot_info[0]}-{slot_info[1]}" + ("(%s)" % slot_info[2] if slot_info[2] != None and len(slot_info[2]) > 0 else "") for slot_info in machine_slots])
+    
+    # 2-2. Fetch latest condition data from database
+    sql = f"SELECT rc.condition_name FROM rms_conditions AS rc JOIN rms_group_machines AS rgm ON rc.condition_id = rgm.condition_id WHERE rgm.machine_id = '{base_machine}' ORDER BY rc.condition_id"
+    condition_info, info = db_data_fetch(sql)
+    
+    if info != "Success":
+        return send_response(500, False, "系統錯誤", {"message": f"MySQL Condition 查詢失敗: {info}"})
+    
+    target_cond_header = ['條件名稱'] + [c[0] for c in condition_info]
+    
+    # 2-3. Fetch record condition and PMS data from document
+    sql = f"SELECT rbc.sub_no, rbc.content_text, rbc.metadata FROM rms_block_content AS rbc JOIN JSON_TABLE(rbc.metadata, '$.programs[*]' COLUMNS(program_code VARCHAR(15) PATH '$.programCode')) AS jt where rbc.document_token = '{document_token}' AND jt.program_code = '{program_code}'"
+    table_info, info = db_data_fetch(sql)
+    
+    if info != "Success" or not table_info:
+        return send_response(500, False, "系統錯誤", {"message": "找不到對應的參數區塊內容"})
+    
+    source_cond_table = json.loads([info[1] for info in table_info if info[0] == 1][0])
+    source_pms_table = json.loads([info[1] for info in table_info if info[0] == 0][0])
+    source_programs = json.loads(table_info[0][2])
+
+    source_cond_header_index = {cond: index for index, cond in enumerate(source_cond_table[0])}
+    add_conds = set(target_cond_header) - set(source_cond_table[0])
+    del_conds = set(source_cond_table[0]) - set(target_cond_header)
+    source_pms_slots = {f"{slot_info[0]}-{slot_info[1]}": slot_info for slot_info in source_pms_table[1:]}
+    add_pms = target_pms_slots - set(source_pms_slots.keys())
+    del_pms = set(source_pms_slots.keys()) - target_pms_slots
+
+    if (not intersection_machines and (add_conds or del_conds or add_pms or del_pms)):
+        print("機台不符合: 此機台條件參數與查詢代碼不符")
+        return send_response(200, True, "機台不符合", {"message": "此機台製造參數與查詢代碼不符"})
+    
+    # 3. Match condition parameter
+    new_cond_table = [target_cond_header]
+    for row in source_cond_table[1:]:
+        rowData = []
+        for target_cond in target_cond_header:
+            value = "" if source_cond_header_index.get(target_cond) == None else row[source_cond_header_index[target_cond]]
+            rowData.append(value)
+        new_cond_table.append(rowData)
+    
+    # 4. Match PMS parameter
+    target_pms_rows = [target_pms_header]
+    for slot_info in machine_slots:
+        slot_key = f"{slot_info[0]}-{slot_info[1]}" + ("(%s)" % slot_info[2] if slot_info[2] != None and len(slot_info[2]) > 0 else "")
+        unit = "(%s)" % slot_info[2] if slot_info[2] != None and len(slot_info[2]) > 0 else ""
+        rowData = [slot_info[0], slot_info[1] + unit, "", "", "", "", "", "Y", ""] if source_pms_slots.get(slot_key) == None else source_pms_slots.get(slot_key)
+        target_pms_rows.append(rowData)
+        
+    info = {"param_json": target_pms_rows, "cond_json": new_cond_table, "source_programs": source_programs, "add_params": list(add_pms), "del_params": list(del_pms), "add_conds": list(add_conds), "del_conds": list(del_conds)}
+    return send_response(200, True, "複製成功", {"blocks": info})
     

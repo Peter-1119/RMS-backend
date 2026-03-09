@@ -1,10 +1,11 @@
-import json, re
+import json, re, os, base64
+import hashlib
 from datetime import datetime
 from enum import Enum
 
 from docx import Document
-from docx.shared import Cm, Pt, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.shared import Cm, Pt, RGBColor, Inches
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
 from docx.enum.table import WD_ALIGN_VERTICAL
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
@@ -52,10 +53,6 @@ def clear_paragraph(p):
     # 保險一點也可以把底層 element 都清掉
     for r in p.runs:
         r._element.getparent().remove(r._element)
-
-from docx.shared import Pt, RGBColor
-from docx.oxml import OxmlElement
-from docx.oxml.ns import qn
 
 def add_simple_field(paragraph, instr, font_size=None, hidden=False, color=None):
     """
@@ -213,16 +210,28 @@ def _compose_value(set_txt, upper_txt, lower_txt):
     s = _to_float_or_none(set_txt)
     u = _to_float_or_none(upper_txt)
     l = _to_float_or_none(lower_txt)
-    if s == None or u == None or l == None:
-        return ""
 
-    s_sd = _calc_significant_digits(set_txt)
+    if u == None and l == None:
+        return ""
+    
+    elif u == None:
+        return f"≥{l}"
+
+    elif l == None:
+        return f"≤{u}"
+
+    elif s == None:
+        return f"{lower_txt}~{upper_txt}"
+    
+    elif set_txt == upper_txt and set_txt == lower_txt:
+        return set_txt
+
     u_sd = _calc_significant_digits(upper_txt)
     l_sd = _calc_significant_digits(lower_txt)
-
+    s_sd = _calc_significant_digits(set_txt)
     plus = round(u - s, max(s_sd, u_sd)) if s_sd + u_sd != 0 else int(u - s)
     minus = round(s - l, max(s_sd, l_sd)) if s_sd + l_sd != 0 else int(s - l)
-    return f"+{plus}/-{minus}\n({lower_txt}~{upper_txt})"
+    return f"-{minus}/+{plus}\n({lower_txt}~{upper_txt})"
 
 def set_style_fonts(style, latin="Arial", east_asia="標楷體"):
     """
@@ -289,13 +298,8 @@ def replace_in_footer(footer, title_mapping):
         for cell in row.cells:
             for p in cell.paragraphs:
                 update_p(p, title_mapping)
-    # p = footer.paragraphs[0]
-    # full_text = p.runs[0].text
-    # if title_mapping.get(full_text) != None:
-    #     p.runs[0].text = title_mapping[full_text]
 
 def replace_in_header(header, title_mapping):
-    # tables in header
     for row in header.tables[0].rows:
         for cell in row.cells:
             for p in cell.paragraphs:
@@ -348,6 +352,8 @@ def set_docx_table_cell_text(cell_node, text, color = COLOR_DICT["#000"], vCente
 
     if center:
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    else:
+        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
     return p
 
@@ -450,7 +456,7 @@ def _build_span_grid(rows_data, rowCount, colCount):
 
     return grid
 
-def _fill_docx_cell_from_tiptap(docx_cell, cell_data, COLOR_DICT):
+def _fill_docx_cell_from_tiptap(docx_cell, cell_data, COLOR_DICT, center = True):
     """
     把 TipTap 的 cell_data 內容寫進 python-docx 的 cell
     保留你原本的 dropdown / paragraph / image 邏輯
@@ -460,15 +466,10 @@ def _fill_docx_cell_from_tiptap(docx_cell, cell_data, COLOR_DICT):
 
     # 清掉 cell 內原本的空段落
     docx_cell.text = ""
+    docx_cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
 
     if dropdownValue:
-        p = set_docx_table_cell_text(
-            docx_cell,
-            dropdownValue,
-            color=COLOR_DICT.get(attr.get("dropdownColor")),
-            vCenter=True,
-            center=True,
-        )
+        p = set_docx_table_cell_text(docx_cell, dropdownValue, color=COLOR_DICT.get(attr.get("dropdownColor")), vCenter=True, center=center)
         p.paragraph_format.keep_together = True
         return
 
@@ -482,7 +483,10 @@ def _fill_docx_cell_from_tiptap(docx_cell, cell_data, COLOR_DICT):
         # 第一個 paragraph 用現有的，之後用 add_paragraph
         p = docx_cell.paragraphs[0] if first_para and docx_cell.paragraphs else docx_cell.add_paragraph()
         first_para = False
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        if center:
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        else:
+            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
         for text_item in item.get("content", []) or []:
             if text_item.get("type") == "text":
@@ -494,7 +498,8 @@ def _fill_docx_cell_from_tiptap(docx_cell, cell_data, COLOR_DICT):
                     color_key = marks[0].get("attrs", {}).get("color")
                     if color_key in COLOR_DICT:
                         run.font.color.rgb = COLOR_DICT[color_key]
-                    run.underline = True
+                        if COLOR_DICT[color_key] == RGBColor(0, 0, 255):
+                            run.underline = True
 
             elif text_item.get("type") == "image":
                 src = text_item["attrs"]["src"].split("/", 3)[-1]
@@ -627,6 +632,8 @@ def create_docx_table(cell, json_table_data):
     SlotColIndex = None if "槽體" not in headers else headers.index('槽體')
     lastSlotName = None
     lastSlotRow = None if SlotColIndex == None else 1
+    last_col_merges = []
+    # print(f"rows_data: {rows_data}")
 
     # Now write each data row (skip row0 because it was header)
     for rowIndex, row_data in enumerate(rows_data):
@@ -654,6 +661,23 @@ def create_docx_table(cell, json_table_data):
 
         # Fill the new row respecting col_map
         for colIndex, (tag, dataIndex, dstIndex) in enumerate(col_map):
+            # [NEW 2] 檢查是否為最後一欄，並讀取 rowspan
+            # 只有當前欄位是最後一欄時才處理
+            if colIndex == len(col_map) - 1:
+                # 確保 dataIndex 在範圍內 (避免前端資料結構異常導致 crash)
+                if dataIndex < len(row_cells_json):
+                    curr_json = row_cells_json[dataIndex]
+                    attrs = curr_json.get("attrs", {})
+                    # 取得 rowspan，預設為 1
+                    r_span = int(attrs.get("rowspan", 1) or 1)
+                    
+                    if r_span > 1:
+                        # 記錄合併資訊: (開始列, 結束列, 目標欄位索引)
+                        # rowIndex 對應 table.rows 的 index (因為 table 有 header 且 rows_data 有 header，剛好對齊)
+                        start_r = rowIndex
+                        end_r = rowIndex + r_span - 1
+                        last_col_merges.append((start_r, end_r, dstIndex))
+                        
             if tag == "SPECPAIR":
                 p = set_docx_table_cell_text(row.cells[colIndex + 0], texts[idx_set], color = colors[idx_set], vCenter = True, center = True)
                 p.paragraph_format.keep_together = True
@@ -686,8 +710,10 @@ def create_docx_table(cell, json_table_data):
                     lastSlotRow = rowIndex
 
             else:
-                p = set_docx_table_cell_text(row.cells[dstIndex], texts[dataIndex], color = colors[dataIndex], vCenter = True, center = True)
-                p.paragraph_format.keep_together = True
+                # 一般欄位寫入 (包含最後一欄的文字寫入)
+                if dataIndex < len(texts):
+                    p = set_docx_table_cell_text(row.cells[dstIndex], texts[dataIndex], color = colors[dataIndex], vCenter = True, center = True)
+                    p.paragraph_format.keep_together = True
 
         lastSlotName = SlotName
 
@@ -701,7 +727,353 @@ def create_docx_table(cell, json_table_data):
         B = table.cell(rowIndex, SlotColIndex)
         A.merge(B)
 
+    # [NEW 3] 執行最後一欄的合併
+    # 這一步放在最後，避免干擾前面的文字寫入
+    for start_r, end_r, col_idx in last_col_merges:
+        try:
+            # 防呆：確保結束列沒有超出表格範圍
+            if end_r < len(table.rows):
+                cell_start = table.cell(start_r, col_idx)
+                cell_end = table.cell(end_r, col_idx)
+                cell_start.merge(cell_end)
+        except Exception as e:
+            print(f"Error merging last column cells ({start_r}-{end_r}): {e}")
+
     return
+
+def prevent_table_break(table):
+    """
+    設定表格盡量不跨頁 (Keep with next)。
+    若表格長度超過一頁，Word 仍會強制換頁 (符合需求)。
+    """
+    # 1. 設定每一列 (Row) 內部的內容不要斷開 (Allow row to break across pages = False)
+    for row in table.rows:
+        tr = row._tr
+        trPr = tr.get_or_add_trPr()
+        # 設定 <w:cantSplit>
+        cantSplit = trPr.find(qn('w:cantSplit'))
+        if cantSplit is None:
+            cantSplit = OxmlElement('w:cantSplit')
+            # 將 cantSplit 設為 on，表示「禁止」列內容跨頁
+            cantSplit.set(qn('w:val'), 'on') 
+            trPr.append(cantSplit)
+
+    # 2. 設定「列與列之間」黏在一起 (Keep with next)
+    # 邏輯：除了「最後一列」之外，每一列裡面的每一個段落都要設定 keep_with_next = True
+    # 這樣 Row 1 會黏 Row 2, Row 2 黏 Row 3... 直到表格結束
+    for row in table.rows[:-1]: # 排除最後一列
+        for cell in row.cells:
+            for paragraph in cell.paragraphs:
+                paragraph.paragraph_format.keep_with_next = True
+
+def create_parameter_table(cell, condition_content, parameter_content, info):
+    if (condition_content == None or len(condition_content) == 0) and (parameter_content == None or len(parameter_content) == 0):
+        return
+    
+    # print(f"condition_content: {condition_content}")
+    # print(f"prarmeter_content: {parameter_content}")
+    
+    programCode = '、'.join([p["programCode"] for p in info['programs']])
+    machines_name = '、'.join([m['name'] for m in info['machines']])
+    info_N_rows = 2 if info["step_type"] == 2 else 3
+
+    table = None
+    if condition_content != None and len(condition_content) != 0:
+        tableNode = condition_content
+        rows_data = [row for row in tableNode['content'][0]['content'] if row.get("type") == "tableRow"]
+        cols = len(rows_data[0]['content'])
+
+        table = cell.add_table(rows = info_N_rows + len(rows_data) + 1, cols = cols)
+        table.style = 'Table Grid'
+        table.autofit = False
+        table.allow_autofit = False
+
+        total_width = cell.width - Cm(0.2)
+
+        first_col_width = Inches(1)
+        other_col_width = (total_width - first_col_width) // (cols - 1)
+        first_col_width = int(total_width - (other_col_width * (cols - 1)))
+
+        for row in table.rows:
+            row.allow_row_break_across_pages = False
+
+        for c in range(len(table.columns)):
+            table.columns[c].width = first_col_width if c == 0 else other_col_width
+            for table_cell in table.columns[c].cells:
+                table_cell.width = first_col_width if c == 0 else other_col_width
+
+        set_docx_table_cell_text(table.cell(0, 0), "程式代碼", center = True)
+        table.cell(0, 1).merge(table.cell(0, cols - 1))
+        set_docx_table_cell_text(table.cell(0, 1), programCode)
+        set_docx_table_cell_text(table.cell(1, 0), "機台名稱", center = True)
+        table.cell(1, 1).merge(table.cell(1, cols - 1))
+        set_docx_table_cell_text(table.cell(1, 1), machines_name)
+        set_docx_table_cell_text(table.cell(2, 0), "條件參數", center = True)
+        table.cell(2, 0).merge(table.cell(2, cols - 1))
+
+        for rowIndex, row_data in enumerate(rows_data):
+            for colIndex, col_data in enumerate(row_data['content']):
+                _fill_docx_cell_from_tiptap(table.cell(rowIndex + 3, colIndex), col_data, COLOR_DICT)
+
+        prevent_table_break(table)
+
+    write_info = (table == None)
+    if parameter_content != None and len(parameter_content) != 0:
+        tableNode = parameter_content
+        rows_data = [row for row in tableNode['content'][0]['content'] if row.get("type") == "tableRow"]
+        cols = len(rows_data[0]['content']) - 2
+
+        if condition_content != None and len(condition_content) != 0:
+            p_to_remove = cell.paragraphs[-1]._element  
+            p_to_remove.getparent().remove(p_to_remove)
+        
+        table = cell.add_table(rows = info_N_rows + len(rows_data) + 1 if write_info else len(rows_data) + 1, cols = cols)
+        table.style = 'Table Grid'
+        table.autofit = False
+        table.allow_autofit = False
+
+        total_width = cell.width - Cm(0.2)
+
+        first_col_width = Inches(1)
+        other_col_width = (total_width - first_col_width) // (cols - 1)
+        first_col_width = int(total_width - (other_col_width * (cols - 1)))
+
+        for row in table.rows:
+            row.allow_row_break_across_pages = False
+
+        for c in range(len(table.columns)):
+            table.columns[c].width = first_col_width if c == 0 else other_col_width
+            for table_cell in table.columns[c].cells:
+                table_cell.width = first_col_width if c == 0 else other_col_width
+
+        if write_info:
+            set_docx_table_cell_text(table.cell(0, 0), "程式代碼", center = True)
+            table.cell(0, 1).merge(table.cell(0, cols - 1))
+            set_docx_table_cell_text(table.cell(0, 1), programCode)
+            set_docx_table_cell_text(table.cell(1, 0), "機台名稱", center = True)
+            table.cell(1, 1).merge(table.cell(1, cols - 1))
+            set_docx_table_cell_text(table.cell(1, 1), machines_name)
+            if info["step_type"] == 5:
+                set_docx_table_cell_text(table.cell(2, 0), "流程順序", center = True)
+                table.cell(2, 1).merge(table.cell(2, cols - 1))
+                set_docx_table_cell_text(table.cell(2, 1), "、".join([f"第{order}次" for order in info["processOrder"]]))
+
+        if info["step_type"] == 2:
+            set_docx_table_cell_text(table.cell(2 if write_info else 0, 0), "製造參數", center = True)
+            table.cell(2 if write_info else 0, 0).merge(table.cell(2 if write_info else 0, cols - 1))
+        else:
+            set_docx_table_cell_text(table.cell(3 if write_info else 0, 0), "製造參數", center = True)
+            table.cell(3 if write_info else 0, 0).merge(table.cell(3 if write_info else 0, cols - 1))
+
+        headers = _header_texts(rows_data[0]['content'])
+        pos = _find_spec_header_indices(headers)
+
+         # ---------- SPEC TABLE TRANSFORMATION ----------
+        # Determine insertion position = the smallest index among the five headers
+        insert_at = min(pos.values())
+        # The set of indices to remove (the five spec headers)
+        spec_idx_set = set(pos[h] for h in SPEC_HDRS)
+
+        # Build new header sequence: copy original headers left->right, but when we hit insert_at, insert ["規格值","操作值"] once and skip all five spec columns.
+        new_header_titles = []
+        col_map = []  # For non-spec columns: holds original index; for inserted pair: ('SPECPAIR', None)
+        for index, header in enumerate(headers):
+            # Replace SPEC column to calculated results
+            if index == insert_at:
+                col_map.append(("SPECPAIR", None, None))
+                new_header_titles += ["設定值", "操作值", "規格值"]
+
+            # Skip SPEC column expect first replaced one
+            elif index in spec_idx_set:
+                continue
+
+            # Keep origin headers, if not SPEC column
+            else:
+                col_map.append(("COPY", index, len(new_header_titles)))
+                new_header_titles.append(header)
+        
+        # Write new header row
+        for j, title in enumerate(new_header_titles):
+            table.cell(info_N_rows + 1 if write_info else 1, j).text = title
+            set_run_node_text_font_style(table.cell(info_N_rows + 1 if write_info else 1, j).paragraphs[0].runs[0])
+            table.cell(info_N_rows + 1 if write_info else 1, j).paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+            table.cell(info_N_rows + 1 if write_info else 1, j).vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+
+        # Prepare a reverse map for quick lookup
+        idx_reg_upper = pos["規格上限(OOS+)"]
+        idx_reg_lower = pos["規格下限(OOS-)"]
+        idx_opr_upper = pos["操作上限(OOC+)"]
+        idx_opr_lower = pos["操作下限(OOC-)"]
+        idx_set = pos["設定值"]
+
+        NumColIndex = None if "項次" not in headers else headers.index('項次')
+        previousNum = None if NumColIndex == None else 1
+
+        ExplainColIndex = None if "說明" not in headers else headers.index('說明')
+
+        SlotColIndex = None if "槽體" not in headers else headers.index('槽體')
+        lastSlotName = None
+        lastSlotRow = None if SlotColIndex == None else 2
+        lastSlotRow = lastSlotRow + info_N_rows if write_info else lastSlotRow
+
+        for rowIndex, row_data in enumerate(rows_data):
+            if rowIndex == 0:
+                continue
+
+            row = table.rows[rowIndex + info_N_rows + 1 if write_info else rowIndex + 1]
+            row.allow_row_break_across_pages = False
+            row_cells_json = [c for c in row_data.get("content", []) if c.get("type") in ["customTableCell", "tableCell", "tableHeader"]]
+
+            # Pre-extract text & color for all original columns (so we can reference easily)
+            texts, colors = [], []
+            for orig_idx, cjson in enumerate(row_cells_json):
+                t, col = _extract_text_and_color_from_cell_json(cjson, COLOR_DICT)
+                texts.append(t)
+                colors.append(col)
+
+            SlotName = texts[SlotColIndex]
+
+            # Compose spec/oper values + color flags
+            spec_val = _compose_value(texts[idx_set], texts[idx_reg_upper], texts[idx_reg_lower])
+            oper_val = _compose_value(texts[idx_set], texts[idx_opr_upper], texts[idx_opr_lower])
+            spec_is_red = COLOR_DICT['blue'] if (colors[idx_reg_upper] == COLOR_BLUE) or (colors[idx_reg_lower] == COLOR_BLUE) else COLOR_DICT['#000']
+            oper_is_red = COLOR_DICT['blue'] if (colors[idx_opr_upper] == COLOR_BLUE) or (colors[idx_opr_lower] == COLOR_BLUE) else COLOR_DICT['#000']
+
+            rowIndex = rowIndex + info_N_rows + 1 if write_info else rowIndex + 1
+
+            # Fill the new row respecting col_map
+            for colIndex, (tag, dataIndex, dstIndex) in enumerate(col_map):
+                if tag == "SPECPAIR":
+                    p = set_docx_table_cell_text(row.cells[colIndex + 0], texts[idx_set], color = colors[idx_set], vCenter = True, center = True)
+                    p.paragraph_format.keep_together = True
+                    p = set_docx_table_cell_text(row.cells[colIndex + 1], oper_val, color = oper_is_red, vCenter = True, center = True)
+                    p.paragraph_format.keep_together = True
+                    p = set_docx_table_cell_text(row.cells[colIndex + 2], spec_val, color = spec_is_red, vCenter = True, center = True)
+                    p.paragraph_format.keep_together = True
+
+                elif NumColIndex != None and dataIndex == NumColIndex:
+                    if SlotName != lastSlotName:
+                        p = set_docx_table_cell_text(row.cells[dstIndex], str(previousNum), color = colors[dataIndex], vCenter = True, center = True)
+                        p.paragraph_format.keep_together = True
+                        previousNum += 1
+
+                        if lastSlotName != None and lastSlotRow != rowIndex - 1:
+                            A = table.cell(lastSlotRow, dstIndex)
+                            B = table.cell(rowIndex - 1, dstIndex)
+                            A.merge(B)
+
+                elif SlotColIndex != None and dataIndex == SlotColIndex:
+                    if SlotName != lastSlotName:
+                        p = set_docx_table_cell_text(row.cells[dstIndex], texts[dataIndex], color = colors[dataIndex], vCenter = True, center = True)
+                        p.paragraph_format.keep_together = True
+
+                        if lastSlotName != None and lastSlotRow != rowIndex - 1:
+                            A = table.cell(lastSlotRow, dstIndex)
+                            B = table.cell(rowIndex - 1, dstIndex)
+                            A.merge(B)
+
+                        lastSlotRow = rowIndex
+
+                elif ExplainColIndex != None and dataIndex == ExplainColIndex:
+                    p = _fill_docx_cell_from_tiptap(row.cells[dstIndex], row_cells_json[dataIndex], COLOR_DICT = COLOR_DICT, center = False)
+
+                else:
+                    p = set_docx_table_cell_text(row.cells[dstIndex], texts[dataIndex], color = colors[dataIndex], vCenter = True, center = True)
+                    p.paragraph_format.keep_together = True
+
+            lastSlotName = SlotName
+
+        if lastSlotName != None and rowIndex != lastSlotRow:
+            if NumColIndex != None:
+                A = table.cell(lastSlotRow, NumColIndex)
+                B = table.cell(rowIndex, NumColIndex)
+                A.merge(B)
+            
+            A = table.cell(lastSlotRow, SlotColIndex)
+            B = table.cell(rowIndex, SlotColIndex)
+            A.merge(B)
+            
+        prevent_table_break(table)
+
+def set_cell_border(cell, **kwargs):
+    """
+    設定儲存格邊框的通用函式
+    用法:
+    set_cell_border(
+        cell, 
+        top={"sz": 12, "val": "single", "color": "#FF0000", "space": "0"}, 
+        bottom={"sz": 12, "color": "#00FF00", "val": "single"},
+        start={"val": "nil"}, # start 即 left (左邊框)
+        end={"val": "nil"},   # end 即 right (右邊框)
+    )
+    """
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    
+    # 檢查 tcBorders 是否存在，不存在則建立
+    tcBorders = tcPr.first_child_found_in("w:tcBorders")
+    if tcBorders is None:
+        tcBorders = OxmlElement('w:tcBorders')
+        tcPr.append(tcBorders)
+
+    # 處理傳入的邊框設定
+    for edge in ('top', 'left', 'bottom', 'right', 'insideH', 'insideV', 'start', 'end'):
+        edge_data = kwargs.get(edge)
+        if edge_data:
+            tag = 'w:{}'.format(edge)
+
+            # 如果該邊框設定已存在，先移除舊的
+            element = tcBorders.find(qn(tag))
+            if element is not None:
+                tcBorders.remove(element)
+
+            # 建立新的邊框節點
+            border = OxmlElement(tag)
+            
+            # 設定屬性 (sz=大小, val=樣式, color=顏色, space=間距)
+            for key in ["sz", "val", "color", "space", "shadow"]:
+                if key in edge_data:
+                    border.set(qn('w:{}'.format(key)), str(edge_data[key]))
+            
+            tcBorders.append(border)
+
+def create_process_table(cell, content_data):
+    # print(f'content_data: {content_data}')
+    if content_data.get('jsonContent') == None or content_data['jsonContent'].get('content') == None or content_data['jsonContent']['content'][0]:
+        p_attr = cell.add_paragraph("NA")
+        p_attr.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        p_attr.runs[0].font.size = Pt(12)
+        return 
+    tableNode = content_data['jsonContent']['content'][0]
+    rows_data = [row for row in tableNode['content'] if row.get("type") == "tableRow"]
+    if not rows_data:
+        return []
+    table = cell.add_table(rows=len(rows_data), cols=len(rows_data[0]['content']))
+    table.width = cell.width.cm - Cm(1)
+    table.style = 'Table Grid'
+
+    for r, row_data in enumerate(rows_data):
+        for c, cell_data in enumerate(row_data['content']):
+            _fill_docx_cell_from_tiptap(table.rows[r].cells[c], cell_data, COLOR_DICT)
+
+            if cell_data['content'][0].get('content') == None:
+                set_cell_border(table.cell(r, c), left = {"val": "nil"}, top = {"val": "nil"}, right = {"val": "nil"}, bottom = {"val": "nil"})
+
+    # p_to_remove = cell.paragraphs[-1]._element  
+    # p_to_remove.getparent().remove(p_to_remove)
+
+    # table2 = cell.add_table(rows=len(rows_data), cols=len(rows_data[0]['content']) - 1)
+    # table2.width = cell.width.cm - Cm(1)
+    # table2.style = 'Table Grid'
+
+    # for r, row_data in enumerate(rows_data):
+    #     for c, cell_data in enumerate(row_data['content']):
+    #         if c == 9:
+    #             continue
+    #         _fill_docx_cell_from_tiptap(table2.rows[r].cells[c], cell_data, COLOR_DICT)
+
+    #         if cell_data['content'][0].get('content') == None:
+    #             set_cell_border(table2.cell(r, c), left = {"val": "nil"}, top = {"val": "nil"}, right = {"val": "nil"}, bottom = {"val": "nil"})
 
 def parse_json_content(parent_object, json_data, indent = None, header = False, no = None, tier=1):
     """
@@ -731,7 +1103,11 @@ def parse_json_content(parent_object, json_data, indent = None, header = False, 
             for item in block.get("content", []):
                 if item.get("type") == "text":
                     marks = item.get("marks", [])
-                    color = COLOR_DICT[marks[0].get("attrs", {"color": "#000"}).get("color")] if len(marks) > 0 else COLOR_DICT["#000"]
+                    color = COLOR_DICT["#000"]
+                    if len(marks) > 0:
+                        color_key = marks[0].get("attrs", {}).get("color")
+                        if color_key in COLOR_DICT:
+                            color = COLOR_DICT[marks[0].get("attrs", {"color": "#000"}).get("color")] if len(marks) > 0 else COLOR_DICT["#000"]
                     run = set_table_run_text(p, item.get("text", ""), color)
                     set_run_node_text_font_style(run)
                     run.font.size = Pt(12)
@@ -794,7 +1170,7 @@ def createPictures(cell, step_content_list):
                         run = p.add_run()
                         run.add_picture(f'uploads/temp/{src}', width = Cm(width / 2 - 0.5))
 
-def createTable(cell, step_content_list):
+def createTable(cell, step_content_list, info = {}):
     """Adds tables (jsonContent containing a table) for all items in the list to the cell."""
     for content_obj in step_content_list:
         for item in content_obj.get("data", []):
@@ -805,17 +1181,8 @@ def createTable(cell, step_content_list):
                     # Table is created directly in the cell, as requested, to avoid left indent.
                     create_docx_table(cell, table_block)
 
-        if content_obj.get("jsonConditionContent"):
-            table_blocks = [b for b in content_obj["jsonConditionContent"].get("content", []) if b.get("type") == "table"]
-            for table_block in table_blocks:
-                # Table is created directly in the cell, as requested, to avoid left indent.
-                create_docx_table(cell, table_block)
-        
-        if content_obj.get("jsonParameterContent"):
-            table_blocks = [b for b in content_obj["jsonParameterContent"].get("content", []) if b.get("type") == "table"]
-            for table_block in table_blocks:
-                # Table is created directly in the cell, as requested, to avoid left indent.
-                create_docx_table(cell, table_block)
+        if info.get("step_type"):
+            create_parameter_table(cell, content_obj.get("jsonConditionContent", []), content_obj.get("jsonParameterContent", []), info)
 
 def draw_instruction_content(doc, data):
     attribute = data["attribute"][-1]
@@ -830,10 +1197,13 @@ def draw_instruction_content(doc, data):
          cell.add_paragraph()
     cell.paragraphs[0].style = doc.styles["Normal"]
 
+    # Get document chapters from definition
     for (stepIndex, itemInfo) in enumerate(DOCUMENT_STEP[DOCUMENT_TYPE(documentType).name].value):
         (step, stepInfo), = itemInfo.items()
         
         # 1. Set the step title
+        if stepIndex > 0:
+            cell.add_paragraph()
         p_title = cell.paragraphs[0] if stepIndex == 0 else cell.add_paragraph()
         p_title.text = f"{stepIndex + 1}.{step}"
         p_title.runs[0].font.size = Pt(12)
@@ -867,14 +1237,44 @@ def draw_instruction_content(doc, data):
             # Process all data items across all matching step content objects
             for content_obj in step_content_list:
                 if content_obj["step_type"] == 2 or content_obj["step_type"] == 5:
-                    programCode = "NA"
-                    if len(content_obj["metadata"]['programs']) > 0:
-                        programCode = '、'.join([code["programCode"] for code in content_obj["metadata"]['programs']])
-                    p = cell.add_paragraph()
-                    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                    p.text = f"程式代碼：{programCode}"
-                    set_run_node_text_font_style(p.runs[0])
-                    createTable(cell, [content_obj])
+                    machines, processOrder = [], None
+                    if content_obj["step_type"] == 2:
+                        machines_name = attribute["attribute"]["inputMachines"].split(",")
+                        machines_code = attribute["attribute"]["machines"]
+                        machines = [{"code": code, "name": name} for code, name in zip(machines_code, machines_name)]
+                    elif content_obj["step_type"] == 5:
+                        machines_name = content_obj['metadata']['machines_name']
+                        machines_code = content_obj['metadata']['machines']
+                        machines = [{"code": code, "name": name} for code, name in zip(machines_code, machines_name)]
+                        processOrder = content_obj['metadata']['processOrder']
+                    
+                    createTable(cell, [content_obj], {"step_type": content_obj["step_type"], "programs": content_obj["metadata"]['programs'], "machines": machines, "processOrder": processOrder})
+
+                if content_obj["step_type"] == 0:
+                    item_for_helper = {"data": content_obj.get("data", []), "step": stepIndex + 1, "tier": content_obj.get("tier", 1), "sub_no": 0}
+                    createHeader(cell, [item_for_helper]) 
+                    create_process_table(cell, content_obj['data'][0])
+                    continue
+                   
+                if content_obj.get('step_type') == 1 and content_obj.get('tier') == 1:
+                    stepContent = "3.1 生產管理條件"
+                    p_attr = cell.add_paragraph(stepContent)
+                    p_attr.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                    p_attr.runs[0].font.size = Pt(12)
+                    set_run_node_text_font_style(p_attr.runs[0])
+                    p_attr.paragraph_format.left_indent = p_attr.runs[0].font.size * 2
+
+                    tiptap_content = content_obj["data"]
+                    content = "" if tiptap_content[0]['jsonHeader']['content'][0].get("content") == None else tiptap_content[0]['jsonHeader']['content'][0]["content"][0]['text']
+                    if len(content) > 0:
+                        p_attr = cell.add_paragraph(content)
+                        p_attr.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                        p_attr.runs[0].font.size = Pt(12)
+                        set_run_node_text_font_style(p_attr.runs[0])
+                        p_attr.paragraph_format.left_indent = p_attr.runs[0].font.size * 4
+                    item_for_helper = {"data": tiptap_content, "step": 3, "tier": content_obj.get("tier", 1), "sub_no": 0}
+                    createTable(cell, [item_for_helper]) 
+                    continue
 
                 for index, item_data in enumerate(content_obj.get("data", [])):
                     option = item_data.get("option")
@@ -905,6 +1305,7 @@ def draw_instruction_content(doc, data):
                     ref_p.alignment = WD_ALIGN_PARAGRAPH.LEFT
                     ref_p.paragraph_format.left_indent = ref_p.runs[0].font.size * 2
                     ref_p.paragraph_format.space_after = Pt(3)
+                    set_run_node_text_font_style(ref_p.runs[0])
 
             else:
                 stepContent = "NA" if len(stepContent) == 0 else stepContent
@@ -912,61 +1313,65 @@ def draw_instruction_content(doc, data):
                 p_attr.alignment = WD_ALIGN_PARAGRAPH.LEFT
                 p_attr.runs[0].font.size = Pt(12)
                 p_attr.paragraph_format.left_indent = p_attr.runs[0].font.size * 2
+                set_run_node_text_font_style(p_attr.runs[0])
 
-def create_word_password_hash(password):
+def generate_word_password_hash(password, spin_count=100000):
     """
-    生成 Word 用於 'Restrict Editing' 的 Legacy Hash。
+    依照 Office Open XML (OOXML) 標準產生密碼的 salt 與 hash
     """
-    if not password:
-        return None
+    # 1. 產生 16 bytes 的隨機鹽值
+    salt = os.urandom(16)
     
-    password_hash = 0
-    if len(password) > 15:
-        password = password[:15]
+    # 2. Word 規定密碼必須使用 UTF-16 LE 編碼
+    pwd_bytes = password.encode('utf-16le')
     
-    chars = [ord(c) for c in password]
-    for char_code in chars:
-        password_hash = ((password_hash >> 14) & 0x01) | ((password_hash << 1) & 0x7FFF)
-        password_hash ^= char_code
+    # 3. 初始雜湊：SHA512(salt + password)
+    hash_calc = hashlib.sha512(salt + pwd_bytes).digest()
+    
+    # 4. 進行 Spin 迭代運算 (預設 10 萬次)
+    for i in range(spin_count):
+        # 迭代器必須是 4 bytes 的 Little-Endian 格式
+        iterator = i.to_bytes(4, byteorder='little')
+        hash_calc = hashlib.sha512(iterator + hash_calc).digest()
         
-    password_hash = ((password_hash >> 14) & 0x01) | ((password_hash << 1) & 0x7FFF)
-    password_hash ^= len(password)
-    password_hash ^= 0xCE4B
+    # 5. 回傳 Base64 編碼後的字串
+    salt_b64 = base64.b64encode(salt).decode('utf-8')
+    hash_b64 = base64.b64encode(hash_calc).decode('utf-8')
     
-    return f'{password_hash:X}'
+    return salt_b64, hash_b64
 
 def enable_docx_protection(doc, password):
     """
-    直接修改 python-docx 的 document 物件，注入保護設定。
+    直接修改 python-docx 的 document 物件，注入保護設定與密碼驗證參數。
     """
-    # 1. 取得 settings 的根節點
     settings_element = doc.settings.element
 
-    # 2. 產生雜湊密碼
-    hash_value = create_word_password_hash(password)
+    # 取得符合 Word 標準的 salt 與 hash
+    salt_value, hash_value = generate_word_password_hash(password)
 
-    # 3. 建立 documentProtection 元素
-    # XML 結構: <w:documentProtection w:edit="forms" w:enforcement="1" ... />
     protection = OxmlElement('w:documentProtection')
     
-    # 設定屬性
-    protection.set(qn('w:edit'), 'forms')  # forms = 僅填寫表單 (即唯讀但允許表單)
+    # 設定保護類型
+    protection.set(qn('w:edit'), 'forms')  
     protection.set(qn('w:enforcement'), '1')
     
-    # 設定加密參數 (相容 Word 的標準參數)
+    # 設定加密參數
     protection.set(qn('w:cryptProviderType'), 'rsaAES')
     protection.set(qn('w:cryptAlgorithmClass'), 'hash')
     protection.set(qn('w:cryptAlgorithmType'), 'typeAny')
-    protection.set(qn('w:cryptAlgorithmSid'), '14')
+    protection.set(qn('w:cryptAlgorithmSid'), '14') # 14 代表 SHA-512
     protection.set(qn('w:cryptSpinCount'), '100000')
+    
+    # ★ 關鍵修正：必須同時寫入 salt 與 hash
+    protection.set(qn('w:salt'), salt_value)
     protection.set(qn('w:hash'), hash_value)
 
-    # 4. 檢查是否已經有保護標籤，若有則先移除 (避免重複)
+    # 移除舊標籤
     existing = settings_element.find(qn('w:documentProtection'))
     if existing is not None:
         settings_element.remove(existing)
 
-    # 5. 將新標籤加入 settings
+    # 寫入新標籤
     settings_element.append(protection)
 
 def fill_from_template(template_path, out_path, data, title_mapping, info_mapping):
@@ -1029,7 +1434,10 @@ def get_docx(outpath, data, template = "docx-template/example3.docx"):
         "PAGE": "1",
         "TITLE": Title,
         "DOC_NAME": Doc_name,
-        "DOC_KEY": doc_key,              # 👈 你可以在 footer 放 [DOC_KEY]
+        "PROJECT": "",
+        "ITEM_TYPE": "",
+        "STYLE_NO": "",
+        "DOC_KEY": doc_key,
     }
     if itemType is not None:
         specifications = [clean_process_name(s["name"]) for s in attribute["attribute"].get("specification")]
@@ -1037,7 +1445,7 @@ def get_docx(outpath, data, template = "docx-template/example3.docx"):
         title_mapping["ITEM_TYPE"]=  itemType
         title_mapping["STYLE_NO"] = styleNo.split("-", 1)[-1]
     else:
-        title_mapping["PROJECT"] = attribute["attribute"].get("applyProject")
+        title_mapping["PROJECT"] = attribute["attribute"].get("applyProject", "")
 
     info_mapping = {
         "REV1": "", "DATE1": "", "REASON1": "", "POINT1": "", "DEPT1": "", "APPROVER1": "", "CONFIRMER1": "", "AUTHOR1": "",

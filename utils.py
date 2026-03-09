@@ -46,7 +46,7 @@ def get_spec_codes_by_project(project: str):
 
     try:
         with db(dict_cursor=True) as (_, cur):
-            sql = f"SELECT DISTINCT spec_code FROM sfdb.rms_spec_flat WHERE project = '{project}'"
+            sql = f"SELECT DISTINCT spec_code FROM sfdb4070.rms_spec_flat WHERE project = '{project}'"
             cur.execute(sql)
             return [s["spec_code"] for s in cur.fetchall()], "Success"
     
@@ -54,31 +54,42 @@ def get_spec_codes_by_project(project: str):
         print("Project query failed: ", e)
         return [], "Project query failed"
 
-WHERE_PREFIX = "REGEXP_LIKE(p.PROCESS_NAME, '^\([LR][0-8][[:digit:]]{2}-[[:digit:]]{2}\)') AND p.PROCESS_NAME NOT LIKE '%人工%' AND sm.ENABLED = 'Y' AND sm.EQM_ID <> 'NA'"
-def get_spec_codes_by_itemType(itemType: str):
+WHERE_PREFIX = "REGEXP_LIKE(p.PROCESS_NAME, '^\([LR][0-8][[:digit:]]{2}-[A-Z]?[[:digit:]]{2}\)') AND p.PROCESS_NAME NOT LIKE '%人工%' AND sm.ENABLED = 'Y' AND sm.EQM_ID <> 'NA'"
+def get_spec_codes_by_itemType(itemType: str, specific: str):
     if itemType == None or len(itemType) == 0:
         return [], "No input item type."
     
     try:
-        with ora_cursor() as cur:
-            sql = f"""
-                SELECT DISTINCT p.PROCESS_DESC, p.PROCESS_NAME FROM IDBUSER.RMS_SYS_PROCESS p
-                JOIN IDBUSER.RMS_SYS_TERMINAL t ON p.PROCESS_ID = t.PROCESS_ID
-                JOIN IDBUSER.RMS_SYS_MACHINE sm ON t.PDLINE_ID = sm.PDLINE_ID
-                WHERE {WHERE_PREFIX} AND EXISTS (
-                    SELECT 1 FROM IDBUSER.EZFLEX_ROUTING r
-                    JOIN IDBUSER.EZFLEX_TOOL t ON r.MATNR = t.MATNR AND r.REVLV = t.REVLV AND r.VORNR = t.VORNR
-                    WHERE t.MATNR LIKE '{itemType}%' AND t.SFHNR LIKE '%-ST%' AND r.KTSCH = p.PROCESS_DESC
-                )
-            """
-            # print(f"sql: {sql}")
+        with ora_cursor(db_alias = "item_db") as cur:
+            # sql = f"""
+            #     SELECT DISTINCT p.PROCESS_DESC, p.PROCESS_NAME FROM IDBUSER.RMS_SYS_PROCESS p
+            #     JOIN IDBUSER.RMS_SYS_TERMINAL t ON p.PROCESS_ID = t.PROCESS_ID
+            #     JOIN IDBUSER.RMS_SYS_MACHINE sm ON t.PDLINE_ID = sm.PDLINE_ID
+            #     WHERE {WHERE_PREFIX} AND EXISTS (
+            #         SELECT 1 FROM IDBUSER.EZFLEX_ROUTING r
+            #         JOIN IDBUSER.EZFLEX_TOOL t ON r.MATNR = t.MATNR AND r.REVLV = t.REVLV AND r.VORNR = t.VORNR
+            #         WHERE t.MATNR LIKE '{itemType}%' AND t.SFHNR LIKE '%-ST%' AND r.KTSCH = p.PROCESS_DESC
+            #     )
+            # """
+            # sql = f"""
+            #     SELECT r.KTSCH FROM IDBUSER.EZFLEX_ROUTING r
+            #     JOIN IDBUSER.EZFLEX_TOOL t ON r.MATNR = t.MATNR AND r.REVLV = t.REVLV AND r.VORNR = t.VORNR
+            #     WHERE t.MATNR LIKE '{itemType}%' AND t.SFHNR LIKE '%-ST%'
+            # """
+            table_name = 'EZFELX."KKME_Table"'
+            sql = f"SELECT STATION FROM {table_name} WHERE ITEM LIKE '{itemType}%'"
 
             cur.execute(sql)
-            rows = cur.fetchall()
+            specs = [row[0] for row in cur.fetchall()]
+
+        if specific != None and len(specific) != 0 and specific not in specs:
+            return [], "Item type query failed"
+        elif specific != None and len(specific) != 0 and specific in specs:
+            return [specific], "Success"
 
         # specifics = [{"code": r[0], "name": r[1]} for r in rows]
         # return [{"code": r[0], "name": r[1]} for r in rows], "Success"
-        return [r[0] for r in rows], "Success"
+        return specs, "Success"
 
     except Exception as e:
         print("Item type query failed: ", e)

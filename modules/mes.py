@@ -7,6 +7,11 @@ from oracle_db import ora_cursor as odb
 from utils import *
 
 bp = Blueprint("mes", __name__)
+WHERE_PREFIX = "REGEXP_LIKE(p.PROCESS_NAME, '^\([LR][0-8][[:digit:]]{2}-[A-Z]?[[:digit:]]{2}\)') AND p.PROCESS_NAME NOT LIKE '%人工%' AND sm.ENABLED = 'Y' AND sm.EQM_ID <> 'NA'"
+# PMS_PREFIX = "(SET_POINT IS NOT NULL OR REAL_POINT IS NOT NULL) AND PARAMETER_CONTROL = 'Y' AND (SET_ATTRIBUTE <> 'Y' OR SET_ATTRIBUTE IS NULL)"
+# PMS_PREFIX = "PARAMETER_CONTROL = 'Y'"
+MANAGEMENT_PREFIX = "(SET_POINT IS NOT NULL OR REAL_POINT IS NOT NULL) AND PARAMETER_CONTROL = 'Y'"
+MANUFACTURING_PREFIX = "(PARAM_COMPARE IS NOT NULL AND PARAM_COMPARE = 'Y')"
 
 # --------- /projects ---------
 @bp.get("/projects")
@@ -17,7 +22,7 @@ def projects():
 
     # projects are stored in MySQL rms_spec_flat
     with db(dict_cursor=True) as (_, cur):
-        cur.execute("SELECT DISTINCT project FROM sfdb.rms_spec_flat")
+        cur.execute("SELECT DISTINCT project FROM sfdb4070.rms_spec_flat")
         all_projects = [r["project"] for r in cur.fetchall() if r.get("project")]
 
     out = {name: {"code": name[:3]} for name in all_projects if keyword.lower() in name.lower()}
@@ -40,7 +45,7 @@ def groups_machines():
 
     else:
         spec_map_by_project, project_info = get_spec_codes_by_project(project)
-        spec_map_by_itemType, itemType_info = get_spec_codes_by_itemType(itemType)
+        spec_map_by_itemType, itemType_info = get_spec_codes_by_itemType(itemType, specific)
 
         spec_map = None
         if project_info == "Success" and itemType_info == "Success":
@@ -64,14 +69,14 @@ def groups_machines():
 
     try:
         out = {}
-        with odb() as cur:
+        with odb(db_alias = "machine_db") as cur:
             specInfo = "" if remove_spec_info.lower() == 'true' else "p.PROCESS_DESC, p.PROCESS_NAME, "
-            select_info = f"SELECT DISTINCT {specInfo}sm.MACHINE_CODE, sm.MACHINE_DESC, sm.BUILDING, mt.MACHINE_TYPE_NAME, mt.MACHINE_TYPE_DESC FROM IDBUSER.RMS_SYS_PROCESS p"
-            join_info = """
-                JOIN IDBUSER.RMS_SYS_TERMINAL t ON p.PROCESS_ID = t.PROCESS_ID
-                JOIN IDBUSER.RMS_SYS_MACHINE sm ON t.PDLINE_ID = sm.PDLINE_ID
-                JOIN IDBUSER.RMS_SYS_MACHINE_TYPE mt ON mt.MACHINE_TYPE_ID = sm.MACHINE_TYPE_ID
-                WHERE REGEXP_LIKE(p.PROCESS_NAME, '^\([LR][0-8][[:digit:]]{2}-[[:digit:]]{2}\)') AND p.PROCESS_NAME NOT LIKE '%人工%' AND sm.ENABLED = 'Y' AND sm.EQM_ID <> 'NA'
+            select_info = f"SELECT DISTINCT {specInfo}sm.MACHINE_CODE, sm.MACHINE_DESC, sm.BUILDING, mt.MACHINE_TYPE_NAME, mt.MACHINE_TYPE_DESC FROM SAJET.SYS_PROCESS p"
+            join_info = f"""
+                JOIN SAJET.SYS_TERMINAL t ON p.PROCESS_ID = t.PROCESS_ID
+                JOIN SAJET.SYS_MACHINE sm ON t.PDLINE_ID = sm.PDLINE_ID
+                JOIN SAJET.SYS_MACHINE_TYPE mt ON mt.MACHINE_TYPE_ID = sm.MACHINE_TYPE_ID
+                WHERE {WHERE_PREFIX}
             """
             sql = select_info + join_info
             if isinstance(spec_map, list):
@@ -119,23 +124,26 @@ def spec_groups_machines():
 
     try:
         out = {}
-        with odb() as cur:
-            sql = """
-                SELECT DISTINCT p.PROCESS_DESC, p.PROCESS_NAME, sm.MACHINE_CODE, sm.MACHINE_DESC, sm.BUILDING, mt.MACHINE_TYPE_NAME, mt.MACHINE_TYPE_DESC FROM IDBUSER.RMS_SYS_PROCESS p
-                JOIN IDBUSER.RMS_SYS_TERMINAL t ON p.PROCESS_ID = t.PROCESS_ID
-                JOIN IDBUSER.RMS_SYS_MACHINE sm ON t.PDLINE_ID = sm.PDLINE_ID
-                JOIN IDBUSER.RMS_SYS_MACHINE_TYPE mt ON mt.MACHINE_TYPE_ID = sm.MACHINE_TYPE_ID
-                WHERE REGEXP_LIKE(p.PROCESS_NAME, '^\([LR][0-8][[:digit:]]{2}-[[:digit:]]{2}\)') AND p.PROCESS_NAME NOT LIKE '%人工%' AND sm.ENABLED = 'Y' AND sm.EQM_ID <> 'NA'
+        with odb(db_alias = "machine_db") as cur:
+            # sql = f"""
+            #     SELECT DISTINCT p.PROCESS_DESC, p.PROCESS_NAME, sm.MACHINE_ID, sm.MACHINE_CODE, sm.MACHINE_DESC, mt.MACHINE_TYPE_NAME, mt.MACHINE_TYPE_DESC FROM SAJET.SYS_PROCESS p
+            #     JOIN SAJET.SYS_TERMINAL t ON p.PROCESS_ID = t.PROCESS_ID
+            #     JOIN SAJET.SYS_MACHINE sm ON t.PDLINE_ID = sm.PDLINE_ID
+            #     JOIN SAJET.SYS_MACHINE_TYPE mt ON mt.MACHINE_TYPE_ID = sm.MACHINE_TYPE_ID
+            #     WHERE {WHERE_PREFIX}
+            # """
+            sql = f"""
+                SELECT DISTINCT p.PROCESS_DESC, p.PROCESS_NAME, sm.MACHINE_ID, sm.MACHINE_CODE, sm.MACHINE_DESC, mt.MACHINE_TYPE_NAME, mt.MACHINE_TYPE_DESC FROM SAJET.V_SFIS_MACHINE_PROCESS v
+                JOIN SAJET.SYS_PROCESS p ON p.PROCESS_DESC = v.PROCESS_DESC
+                JOIN SAJET.SYS_MACHINE sm ON v.MACHINE_CODE = sm.MACHINE_CODE
+                JOIN SAJET.SYS_MACHINE_TYPE mt ON mt.MACHINE_TYPE_ID = sm.MACHINE_TYPE_ID
+                WHERE sm.EQM_ID <> 'NA'
             """
-            if len(raw_specs) > 1:
-                sql += " AND p.PROCESS_DESC IN ('" + "','".join(raw_specs) + "')"
+            sql += " AND p.PROCESS_DESC IN ('" + "','".join(raw_specs) + "')"
 
-            elif len(raw_specs) == 1:
-                sql += f" AND p.PROCESS_DESC = '{raw_specs[0]}'"
-
-            cur.execute(sql)
-            for scode, sname, mcode, mname, mbuilding, gcode, gname in cur.fetchall():
-                machineInfo = {"code": mcode, "name": mname, "building": mbuilding}
+            cur.execute(f"SELECT PROCESS_DESC, MACHINE_CODE, MACHINE_DESC, MACHINE_TYPE_NAME, MACHINE_TYPE_DESC FROM ({sql}) ORDER BY MACHINE_ID")
+            for scode, mcode, mname, gcode, gname in cur.fetchall():
+                machineInfo = {"code": mcode, "name": mname}
                 if out.get(scode) == None:
                     out[scode] = {}
 
@@ -150,7 +158,40 @@ def spec_groups_machines():
 
     return send_response(200, True, "請求成功", {"specGroups": out})
 
-WHERE_PREFIX = "REGEXP_LIKE(p.PROCESS_NAME, '^\([LR][0-8][[:digit:]]{2}-[[:digit:]]{2}\)') AND p.PROCESS_NAME NOT LIKE '%人工%' AND sm.ENABLED = 'Y' AND sm.EQM_ID <> 'NA'"
+@bp.get("/spec-machines")
+def spec_machines():
+    raw_specs = request.args.getlist("specific") or request.args.getlist("specific[]")
+    
+    if len(raw_specs) == 0:
+        return send_response(400, True, "查詢失敗", {"message": "請輸入至少一個適用工程"})
+
+    try:
+        out = {}
+        with odb(db_alias = "machine_db") as cur:
+            sql = f"""
+                SELECT DISTINCT p.PROCESS_DESC, sm.MACHINE_ID, sm.MACHINE_CODE, sm.MACHINE_DESC, sm.BUILDING FROM SAJET.SYS_PROCESS p
+                JOIN SAJET.SYS_TERMINAL t ON p.PROCESS_ID = t.PROCESS_ID
+                JOIN SAJET.SYS_MACHINE sm ON t.PDLINE_ID = sm.PDLINE_ID
+                WHERE {WHERE_PREFIX}
+            """
+
+            sql += " AND p.PROCESS_DESC IN ('" + "','".join(raw_specs) + "')"
+
+            cur.execute(f"SELECT PROCESS_DESC, MACHINE_CODE, MACHINE_DESC, BUILDING FROM ({sql}) ORDER BY MACHINE_ID")
+            for scode, mcode, mname, mbuilding in cur.fetchall():
+                machineInfo = {"code": mcode, "name": mname, "building": mbuilding}
+                if out.get(scode) == None:
+                    out[scode] = []
+
+                out[scode].append(machineInfo)
+
+    except Exception as e:
+        print(f"error result: {e}")
+        return send_response(500, True, "查詢失敗", {"message": "資料庫查詢失敗，請重新嘗試"})
+
+    return send_response(200, True, "請求成功", {"specMachines": out})
+
+# Use for machine list window
 @bp.post("/filter-by-baseline")
 def filter_by_baseline():
     body       = request.get_json(silent=True) or {}
@@ -174,11 +215,9 @@ def filter_by_baseline():
         spec_map = set(spec_map_by_project)
 
         if len(spec_map) == 0:  # There is no any specification in project
-            print("1")
             return send_response(200, False, "查詢成功", {"groups": {}})
 
         elif specific != None and specific not in spec_map:  # Argument specification conflict with project
-            print("2")
             return send_response(400, False, "查詢失敗", {"message": "查詢條件互相衝突請重新確認"})
 
         spec_map = list(spec_map) if len(spec_map) > 1 else spec_map.pop()
@@ -189,16 +228,16 @@ def filter_by_baseline():
 
     same_PMS_machines = []
     try:
-        with ora_cursor() as cur:
+        with ora_cursor(db_alias = "machine_db") as cur:
             sql = f"""
-            WITH base AS (SELECT DISTINCT TRIM(SLOT_NAME) AS SLOT_NAME FROM IDBUSER.RMS_FLEX_PMS WHERE MACHINE_CODE = '{base_code}'),
+            WITH base AS (SELECT DISTINCT TRIM(SLOT_NAME) AS SLOT_NAME FROM SAJET.FLEX_PMS WHERE MACHINE_CODE = '{base_code}'),
                 base_cnt AS ( SELECT COUNT(*) AS cnt FROM base ),
-                cand AS (SELECT DISTINCT MACHINE_CODE, TRIM(SLOT_NAME) AS SLOT_NAME FROM IDBUSER.RMS_FLEX_PMS)
-            SELECT DISTINCT p.PROCESS_DESC, p.PROCESS_NAME, sm.MACHINE_CODE, sm.MACHINE_DESC, sm.BUILDING, mt.MACHINE_TYPE_NAME, mt.MACHINE_TYPE_DESC FROM IDBUSER.RMS_SYS_PROCESS p
-            JOIN IDBUSER.RMS_SYS_TERMINAL t ON p.PROCESS_ID = t.PROCESS_ID
-            JOIN IDBUSER.RMS_SYS_MACHINE sm ON t.PDLINE_ID = sm.PDLINE_ID
-            LEFT JOIN IDBUSER.RMS_SYS_MACHINE_TYPE mt ON mt.MACHINE_TYPE_ID = sm.MACHINE_TYPE_ID, base_cnt bc
-            WHERE REGEXP_LIKE(p.PROCESS_NAME, '^\([LR][0-8][[:digit:]]{{2}}-[[:digit:]]{{2}}\)') AND p.PROCESS_NAME NOT LIKE '%人工%' AND (
+                cand AS (SELECT DISTINCT MACHINE_CODE, TRIM(SLOT_NAME) AS SLOT_NAME FROM SAJET.FLEX_PMS)
+            SELECT DISTINCT p.PROCESS_DESC, p.PROCESS_NAME, sm.MACHINE_CODE, sm.MACHINE_DESC, sm.BUILDING, mt.MACHINE_TYPE_NAME, mt.MACHINE_TYPE_DESC FROM SAJET.SYS_PROCESS p
+            JOIN SAJET.SYS_TERMINAL t ON p.PROCESS_ID = t.PROCESS_ID
+            JOIN SAJET.SYS_MACHINE sm ON t.PDLINE_ID = sm.PDLINE_ID
+            LEFT JOIN SAJET.SYS_MACHINE_TYPE mt ON mt.MACHINE_TYPE_ID = sm.MACHINE_TYPE_ID, base_cnt bc
+            WHERE {WHERE_PREFIX} AND (
                 (bc.cnt = 0 AND NOT EXISTS (SELECT 1 FROM cand cx WHERE cx.MACHINE_CODE = sm.MACHINE_CODE)) OR (
                     bc.cnt > 0 AND EXISTS (SELECT 1 FROM cand cx WHERE cx.MACHINE_CODE = sm.MACHINE_CODE) AND NOT EXISTS (
                         SELECT 1 FROM cand cx WHERE cx.MACHINE_CODE = sm.MACHINE_CODE AND NOT EXISTS (SELECT 1 FROM base b WHERE b.SLOT_NAME = cx.SLOT_NAME)
@@ -206,7 +245,7 @@ def filter_by_baseline():
                         SELECT 1 FROM base b WHERE NOT EXISTS (SELECT 1 FROM cand cx WHERE cx.MACHINE_CODE = sm.MACHINE_CODE AND cx.SLOT_NAME = b.SLOT_NAME)
                     )
                 )
-            ) AND sm.EQM_ID <> 'NA' AND sm.ENABLED = 'Y'
+            )
             """
 
             if isinstance(spec_map, list):
@@ -234,7 +273,7 @@ def filter_by_baseline():
             WITH candidates AS (SELECT '{base_code}' AS machine_id {join_command}),
             sig AS (
                 SELECT c.machine_id, COALESCE(GROUP_CONCAT(DISTINCT g.condition_id ORDER BY g.condition_id SEPARATOR ','), '') AS sig FROM candidates c
-                LEFT JOIN sfdb.rms_group_machines g ON g.machine_id = c.machine_id GROUP BY c.machine_id
+                LEFT JOIN sfdb4070.rms_group_machines g ON g.machine_id = c.machine_id GROUP BY c.machine_id
             ),
             baseline AS (SELECT sig FROM sig WHERE machine_id = '{base_code}')
             SELECT s.machine_id FROM sig s
@@ -265,6 +304,89 @@ def filter_by_baseline():
 
     return send_response(200, True, "請求成功", {"groups": out})
 
+# Use for manufacturing block for specification document
+@bp.post("/pms/filter-by-pms-baseline")
+def filter_by_pms_baseline():
+    data = request.json
+    baseline_code = data.get("baseline_code")
+    
+    if not baseline_code:
+        return send_response(400, True, "參數錯誤", {"message": "缺少 baseline_code"})
+
+    try:
+        valid_machines = []
+        pms_table_rows = []
+
+        with odb(db_alias = "machine_db") as cur:
+            # === 第一步：純 SQL 高效篩選 ===
+            # 修正 ORA-01427: 改用 IN (...)
+            sql_filter = f"""
+                WITH BASELINE_DATA AS (
+                    SELECT SLOT_NAME, PARAMETER_DESC FROM SAJET.FLEX_PMS WHERE MACHINE_CODE = :b AND {MANUFACTURING_PREFIX}
+                ),
+                BASELINE_CNT AS (
+                    SELECT COUNT(*) AS CNT FROM BASELINE_DATA
+                )
+                SELECT P.MACHINE_CODE FROM SAJET.FLEX_PMS P WHERE P.PARAM_COMPARE = 'Y' GROUP BY P.MACHINE_CODE
+                HAVING COUNT(P.PMS_ID) = (SELECT CNT FROM BASELINE_CNT) AND COUNT(CASE WHEN (P.SLOT_NAME, P.PARAMETER_DESC) IN (SELECT SLOT_NAME, PARAMETER_DESC FROM BASELINE_DATA) THEN 1 END) = (SELECT CNT FROM BASELINE_CNT)
+            """
+            
+            cur.execute(sql_filter, b=baseline_code)
+            valid_machines = [row[0] for row in cur.fetchall()]
+            # print(f"[PMS Filter] Valid Machines Count: {len(valid_machines)}")
+
+            # === 第二步：取得基準機台表格資料 ===
+            sql_data = f"SELECT SLOT_NAME, PARAMETER_DESC, UNIT FROM SAJET.FLEX_PMS WHERE MACHINE_CODE = :b AND {MANUFACTURING_PREFIX} ORDER BY PMS_ID"
+            cur.execute(sql_data, b=baseline_code)
+            rows_data = cur.fetchall()
+
+            temp_pms_rows = []
+            for index, r in enumerate(rows_data):
+                slot, param, unit = r
+                param = f"{param}({unit})" if unit != None and len(unit) > 0 else param
+                row = [f"{index + 1}", slot, param, "", "", "", "", "", ""]
+                temp_pms_rows.append(row)
+
+            header = ["項次", "槽體", "管理項目", "規格下限(OOS-)", "操作下限(OOC-)", "設定值", "操作上限(OOC+)", "規格上限(OOS+)", "說明"]
+            pms_table_rows = [header] + temp_pms_rows if len(temp_pms_rows) > 0 else []
+
+        return send_response(200, True, "篩選成功", {"valid_machines": valid_machines, "pms_table_rows": pms_table_rows})
+
+    except Exception as e:
+        # === Debug Log: 輸出詳細錯誤 ===
+        import traceback
+        traceback.print_exc()
+        print(f"[PMS Filter Error] {str(e)}")
+        return send_response(500, True, "篩選失敗", {"message": str(e)})
+
+placeholder = lambda x: ','.join(['%s'] * len(x))
+list2SqlList = lambda l: "','".join(l)
+@bp.post("get-scope-units")
+def get_scope_units():
+    body       = request.get_json(silent=True) or {}
+    machines   = body.get("machines")
+
+    if len(machines) == 0:
+        return send_response(400, False, "缺少機台代碼", {"message": "缺少機台代碼"})
+    
+    departments = []
+    try:
+        with ora_cursor(db_alias = "machine_db") as cur:
+            sql = f"""
+                SELECT SD.DEPT_NAME FROM SAJET.SYS_MACHINE sm
+                JOIN SAJET.SYS_PDLINE sp ON sm.PDLINE_ID = sp.PDLINE_ID  
+                JOIN SAJET.SYS_DEPT sd ON sp.HCP_DEPT_ID || '00' = sd.DEPT_DESC 
+                WHERE sm.MACHINE_CODE IN ('{list2SqlList(machines)}') AND sm.ENABLED = 'Y' AND sm.MACHINE_TYPE = 'EQP'
+            """
+            cur.execute(sql)
+            departments = list(set([dept[0] for dept in cur.fetchall()]))
+
+    except Exception as e:
+        print(f"error result: {e}")
+        return send_response(400, True, "請求失敗", {"message": "Oracle資料庫查詢失敗，請重新嘗試"})
+    
+    return send_response(200, True, "請求成功", {"data": departments})
+
 # -------------------------------------------------------------------------------------------------
 
 def _paginate(items, page, page_size):
@@ -277,15 +399,16 @@ def _paginate(items, page, page_size):
 @bp.get("/engineering")
 def list_engineering():
     """List projects from MySQL (distinct project). Supports keyword + pagination."""
-    keyword = request.args.get("keyword", "")
+    keyword = request.args.get("keyword", '')
     page     = request.args.get("page")
     pageSize = request.args.get("pageSize")
 
+    keyword = f"(project LIKE '%{keyword}%') OR (spec_code LIKE '%{keyword}%') OR (spec_name LIKE '%{keyword}%')" if len(keyword) > 0 else '1=1'
     projects = []
     try:
-        with db(dict_cursor=True) as (_, cur):
-            cur.execute("SELECT DISTINCT project FROM sfdb.rms_spec_flat ORDER BY project")
-            projects = [r["project"] for r in cur.fetchall() if keyword in r["project"]]
+        with db() as (_, cur):
+            cur.execute(f"SELECT DISTINCT project FROM sfdb4070.rms_spec_flat WHERE {keyword} ORDER BY project")
+            projects = [p[0] for p in cur.fetchall()]
         
     except Exception as e:
         print(f"error result: {e}")
@@ -296,18 +419,15 @@ def list_engineering():
     rows = [{"id": p, "projectCode": p, "projectName": p} for p in projects]
     return send_response(200, True, "OK", _paginate(rows, page, pageSize))
 
-@bp.get("/engineering/<project_id>/processes")
-def list_engineering_processes(project_id):
-    """List specs already assigned to this project (from MySQL)."""
-    project = project_id
-    sql = """
-      SELECT DISTINCT spec_code, spec_name
-      FROM sfdb.rms_spec_flat
-      WHERE project=%s
-      ORDER BY spec_code
-    """
+@bp.get("/engineering/processes")
+def list_engineering_processes():
+    project_id = request.args.get("project_id", "")
+    keyword = request.args.get("keyword", "")
+    keyword = f"(project LIKE '%{keyword}%') OR (spec_code LIKE '%{keyword}%') OR (spec_name LIKE '%{keyword}%')" if len(keyword) > 0 else '1=1'
+
+    sql = f"SELECT DISTINCT spec_code, spec_name FROM sfdb4070.rms_spec_flat WHERE project = '{project_id}' AND ({keyword}) ORDER BY spec_code"
     with db(dict_cursor=True) as (_, cur):
-        cur.execute(sql, (project,))
+        cur.execute(sql)
         rows = [{"id": r["spec_code"], "specCode": r["spec_code"], "specName": r["spec_name"]} for r in cur.fetchall()]
     return send_response(200, True, "OK", rows)
 
@@ -319,13 +439,13 @@ def list_unassigned_processes():
 
     specification_dict = {}
     try:
-        with odb() as cur:
-            sql = """
-                SELECT DISTINCT p.PROCESS_DESC, p.PROCESS_NAME FROM IDBUSER.RMS_SYS_PROCESS p
-                JOIN IDBUSER.RMS_SYS_TERMINAL t ON p.PROCESS_ID = t.PROCESS_ID
-                JOIN IDBUSER.RMS_SYS_MACHINE sm ON t.PDLINE_ID = sm.PDLINE_ID
-                JOIN IDBUSER.RMS_SYS_MACHINE_TYPE mt ON mt.MACHINE_TYPE_ID = sm.MACHINE_TYPE_ID
-                WHERE REGEXP_LIKE(p.PROCESS_NAME, '^\([LR][0-8][[:digit:]]{2}-[[:digit:]]{2}\)') AND p.PROCESS_NAME NOT LIKE '%人工%' AND sm.ENABLED = 'Y' AND sm.EQM_ID <> 'NA'
+        with odb(db_alias = "machine_db") as cur:
+            sql = f"""
+                SELECT DISTINCT p.PROCESS_DESC, p.PROCESS_NAME FROM SAJET.SYS_PROCESS p
+                JOIN SAJET.SYS_TERMINAL t ON p.PROCESS_ID = t.PROCESS_ID
+                JOIN SAJET.SYS_MACHINE sm ON t.PDLINE_ID = sm.PDLINE_ID
+                JOIN SAJET.SYS_MACHINE_TYPE mt ON mt.MACHINE_TYPE_ID = sm.MACHINE_TYPE_ID
+                WHERE {WHERE_PREFIX}
             """
 
             if keyword != None:
@@ -341,7 +461,7 @@ def list_unassigned_processes():
     assign_specifications = []
     try:
         with db(dict_cursor = True) as (_, cur):
-            cur.execute("SELECT DISTINCT spec_code FROM sfdb.rms_spec_flat")
+            cur.execute("SELECT DISTINCT spec_code FROM sfdb4070.rms_spec_flat")
             assign_specifications = [r["spec_code"] for r in cur.fetchall() if r.get("spec_code")]
 
     except Exception as e:
@@ -371,14 +491,8 @@ def add_processes_to_engineering(project_id):
         return send_response(400, False, "缺少 processIds", {"message": "請提供要加入的製程代碼陣列"})
 
     # Bulk insert IGNORE
-    sql = """
-      INSERT IGNORE INTO sfdb.rms_spec_flat
-        (dept_code, work_center_name, spec_code, spec_name, project)
-      VALUES (%s, %s, %s, %s, %s)
-    """
-    vals = []
-    for process_id in process_ids:
-        vals.append(("NA", "NA", process_id["code"], clean_desc_to_name(process_id["desc"]), project))
+    sql = "INSERT IGNORE INTO sfdb4070.rms_spec_flat (dept_code, work_center_name, spec_code, spec_name, project) VALUES (%s, %s, %s, %s, %s)"
+    vals = [("NA", "NA", process_id["code"], clean_desc_to_name(process_id["desc"]), project) for process_id in process_ids]
 
     with db(dict_cursor=True) as (conn, cur):
         cur.executemany(sql, vals)
@@ -392,16 +506,16 @@ def delete_process_from_engineering(project_id, spec_code):
     project = project_id
     spec_code = spec_code
     with db(dict_cursor=True) as (conn, cur):
-        cur.execute("DELETE FROM sfdb.rms_spec_flat WHERE project=%s AND spec_code=%s", (project, spec_code))
+        cur.execute("DELETE FROM sfdb4070.rms_spec_flat WHERE project=%s AND spec_code=%s", (project, spec_code))
         conn.commit()
     return send_response(200, True, "移除成功", {"deletedSpec": spec_code})
 
 # -------------------------------------- PMS --------------------------------------
 
-HEADER_ROW = ['槽體', '管理項目', '規格下限(OOS-)', '操作下限(OOC-)', '設定值', '操作上限(OOC+)', '規格上限(OOS+)', '參數下放', '說明']
-def _nz(v):  # small helper
-    return (v or '').strip()
+HEADER_ROW = ['槽體', '管理項目', '規格下限(OOS-)', '操作下限(OOC-)', '設定值', '操作上限(OOC+)', '規格上限(OOS+)', '說明']
+_nz = lambda v: (v or '').strip()
 
+# Use for manufacturing block for instruction document
 @bp.get("/pms/machine-parameters-set-attribute")
 def get_machine_pms_parameters_set_attribute():
     """
@@ -411,24 +525,18 @@ def get_machine_pms_parameters_set_attribute():
     Filters:
       - MACHINE_CODE = :machine_id
       - PARAM_COMPARE = 'Y'
-      - SET_ATTRIBUTE = 'Y'
     """
     machine_id = _nz(request.args.get("machine_id"))
     if not machine_id:
         return send_response(400, True, "缺少機台代碼", {"message": "請提供 machine_id"})
 
     try:
-        with ora_cursor() as cur:
+        with ora_cursor(db_alias = "machine_db") as cur:
             cur.execute(
-                """
-                SELECT
-                    TRIM(SLOT_NAME)         AS SLOT_NAME,
-                    TRIM(PARAMETER_DESC)    AS PARAMETER_DESC,
-                    TRIM(UNIT)              AS UNIT,
-                    TRIM(SET_ATTRIBUTE)     AS SET_ATTRIBUTE
-                FROM IDBUSER.RMS_FLEX_PMS
-                WHERE MACHINE_CODE = :c AND NVL(PARAM_COMPARE, 'N') = 'Y' AND NVL(SET_ATTRIBUTE, 'N') = 'Y'
-                ORDER BY SLOT_NAME, PARAMETER_DESC
+                f"""
+                SELECT TRIM(SLOT_NAME) AS SLOT_NAME, TRIM(PARAMETER_DESC) AS PARAMETER_DESC, TRIM(UNIT) AS UNIT, TRIM(SET_ATTRIBUTE) AS SET_ATTRIBUTE FROM SAJET.FLEX_PMS
+                WHERE MACHINE_CODE = :c AND {MANUFACTURING_PREFIX}
+                ORDER BY SLOT_NUM, PMS_ID
                 """,
                 c=machine_id
             )
@@ -437,12 +545,7 @@ def get_machine_pms_parameters_set_attribute():
         # Normalize to objects
         items: List[Dict[str, str]] = []
         for slot_name, parameter_desc, unit, set_attr in rows or []:
-            items.append({
-                "slot_name":      _nz(slot_name),
-                "parameter_desc": _nz(parameter_desc),
-                "unit":           _nz(unit),
-                "set_attribute":  _nz(set_attr) or 'Y',  # 照條件應該都是 Y
-            })
+            items.append({"slot_name": _nz(slot_name), "parameter_desc": _nz(parameter_desc),"unit": _nz(unit), "set_attribute": _nz(set_attr) or 'Y'})
 
         # Build table_rows for frontend to drop into the TipTap table model easily
         # 表頭 + 每列填「槽體 / 管理項目 / 單位 / 參數下放」，中間 5 欄位與「說明」留空字串
@@ -450,24 +553,17 @@ def get_machine_pms_parameters_set_attribute():
         if items:
             table_rows.append(HEADER_ROW[:])  # header
             for it in items:
-                table_rows.append([
-                    it["slot_name"],          # 槽體
-                    f'{it["parameter_desc"]}({it["unit"]})',     # 管理項目
-                    '', '', '', '', '',       # 中間 5 欄（前端繼續編輯）
-                    'Y',                      # 參數下放（依條件固定 Y）
-                    ''                        # 說明
-                ])
+                unit = "(%s)" % it["unit"] if it["unit"] != None and len(it["unit"]) > 0 else ""
+                table_rows.append([it["slot_name"], f'{it["parameter_desc"]}{unit}', '', '', '', '', '', ''])
 
-        payload = {
-            "items": items,           # 物件陣列
-            "table_rows": table_rows  # 直接可用在前端 DEFAULT_ROWS 的表格資料
-        }
+        payload = {"items": items, "table_rows": table_rows}
         # 若為空，前端可據此顯示「無參數下放資料」
         return send_response(200, True, "請求成功", payload)
 
     except Exception as e:
         return send_response(500, True, "查詢失敗", {"message": f"Oracle 錯誤: {e}"})
 
+# Use for management block of instruction document
 @bp.get("/pms/machine-parameters")
 def get_machine_pms_parameters():
     """
@@ -486,29 +582,17 @@ def get_machine_pms_parameters():
         return send_response(400, True, "缺少機台代碼", {"message": "請提供 machine_id"})
 
     try:
-        with ora_cursor() as cur:
+        with ora_cursor(db_alias = "machine_db") as cur:
             cur.execute(
-                """
-                SELECT
-                    slot_name,
-                    parameter_desc,
-                    unit,
-                    set_attribute
-                FROM (
+                f"""
+                SELECT slot_name, parameter_desc, unit, set_attribute FROM (
                     SELECT
-                        TRIM(SLOT_NAME)      AS slot_name,
-                        TRIM(PARAMETER_DESC) AS parameter_desc,
-                        TRIM(UNIT)           AS unit,
-                        TRIM(SET_ATTRIBUTE)  AS set_attribute,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY TRIM(SLOT_NAME), TRIM(PARAMETER_DESC), TRIM(UNIT)
-                            ORDER BY TRIM(SLOT_NAME), TRIM(PARAMETER_DESC)
-                        ) AS rn
-                    FROM IDBUSER.RMS_FLEX_PMS
-                    WHERE MACHINE_CODE = :c AND (SET_POINT IS NOT NULL OR REAL_POINT IS NOT NULL)
+                        PMS_ID, SLOT_NUM, TRIM(SLOT_NAME) AS slot_name, TRIM(PARAMETER_DESC) AS parameter_desc, TRIM(UNIT) AS unit, TRIM(SET_ATTRIBUTE) AS set_attribute,
+                        ROW_NUMBER() OVER (PARTITION BY TRIM(SLOT_NAME), TRIM(PARAMETER_DESC), TRIM(UNIT) ORDER BY TRIM(SLOT_NAME), TRIM(PARAMETER_DESC)) AS rn FROM SAJET.FLEX_PMS
+                    WHERE MACHINE_CODE = :c AND {MANAGEMENT_PREFIX}
                 )
                 WHERE rn = 1
-                ORDER BY slot_name, parameter_desc
+                ORDER BY SLOT_NUM, PMS_ID
                 """,
                 c=machine_id
             )
@@ -516,42 +600,29 @@ def get_machine_pms_parameters():
 
         items: List[Dict[str, str]] = []
         for slot_name, parameter_desc, unit, set_attr in rows or []:
-            items.append({
-                "slot_name":      _nz(slot_name),
-                "parameter_desc": _nz(parameter_desc),
-                "unit":           _nz(unit),
-                "set_attribute":  _nz(set_attr) or 'Y',
-            })
+            items.append({"slot_name": _nz(slot_name), "parameter_desc": _nz(parameter_desc), "unit": _nz(unit), "set_attribute": _nz(set_attr) or 'Y'})
 
         # ---- 新版 header ----
-        # HEADER_ROW = [ "項次", "槽體", "管理項目", "規格下限(OOS-)", "操作下限(OOC-)", "設定值", "操作上限(OOC+)", "規格上限(OOS+)", "單位", "檢查頻率", "檢查方式", "檢驗人員", "記錄", "備註/參考指示書"]
-        HEADER_ROW = [ "項次", "槽體", "管理項目", "規格下限(OOS-)", "操作下限(OOC-)", "設定值", "操作上限(OOC+)", "規格上限(OOS+)", "檢查頻率", "檢查方式", "檢驗人員", "記錄", "備註/參考指示書"]
+        HEADER_ROW = ["項次", "槽體", "管理項目", "規格下限(OOS-)", "操作下限(OOC-)", "設定值", "操作上限(OOC+)", "規格上限(OOS+)", "檢查頻率", "檢查方式", "檢驗人員", "記錄", "備註/參考指示書"]
         table_rows: List[List[str]] = []
         if items:
             table_rows.append(HEADER_ROW[:])
             for idx, it in enumerate(items, start=1):
-                table_rows.append([
-                    str(idx),                  # 項次（之後前端 updateTable 會重算也沒關係）
-                    it["slot_name"],           # 槽體
-                    f'{it["parameter_desc"]}({it["unit"]})',      # 管理項目(單位)
-                    "", "", "", "", "",        # 規格/OOC/設定/OOC+/OOS+
-                    "", "", "", "", "",        # 檢查頻率 / 檢查方式 / 檢驗人員 / 記錄 / 備註
-                ])
+                unit = "(%s)" % it["unit"] if it["unit"] != None and len(it["unit"]) > 0 else ""
+                table_rows.append([str(idx), it["slot_name"], f'{it["parameter_desc"]}{unit}', "", "", "", "", "", "", "", "", "", ""])
 
-        payload = {
-            "items": items,
-            "table_rows": table_rows,
-        }
+        payload = {"items": items, "table_rows": table_rows}
         return send_response(200, True, "請求成功", payload)
 
     except Exception as e:
         return send_response(500, True, "查詢失敗", {"message": f"Oracle 錯誤: {e}"})
 
+# Use for process flow of instruction document
 @bp.get("/pms/machine-process-flow")
 def get_machine_process_flow():
     """
     取得某機台的「預設製程流程」欄位：
-      - 從 IDBUSER.RMS_FLEX_PMS 取出 DISTINCT SLOT_NAME
+      - 從 SAJET.FLEX_PMS 取出 DISTINCT SLOT_NAME
       - 條件：
           MACHINE_CODE = :machine_id
           (REAL_POINT IS NOT NULL OR SET_POINT IS NOT NULL)
@@ -564,17 +635,11 @@ def get_machine_process_flow():
         return send_response(400, True, "缺少機台代碼", {"message": "請提供 machine_id"})
 
     try:
-        with ora_cursor() as cur:
+        with ora_cursor(db_alias = "machine_db") as cur:
             cur.execute(
-                """
-                SELECT slot_name
-                FROM (
-                    SELECT TRIM(SLOT_NAME) AS slot_name,
-                           MIN(PMS_ID)     AS min_pms_id
-                    FROM IDBUSER.RMS_FLEX_PMS
-                    WHERE MACHINE_CODE = :c
-                      AND (REAL_POINT IS NOT NULL OR SET_POINT IS NOT NULL)
-                    GROUP BY TRIM(SLOT_NAME)
+                f"""
+                SELECT slot_name FROM (
+                    SELECT TRIM(SLOT_NAME) AS slot_name, MIN(PMS_ID) AS min_pms_id FROM SAJET.FLEX_PMS WHERE MACHINE_CODE = :c AND (SLOT_NAME NOT LIKE '%生產資訊%' AND SLOT_NAME NOT LIKE '%參數下放%') GROUP BY TRIM(SLOT_NAME)
                 )
                 ORDER BY min_pms_id
                 """,
@@ -588,7 +653,6 @@ def get_machine_process_flow():
     except Exception as e:
         return send_response(500, True, "查詢失敗", {"message": f"Oracle 錯誤: {e}"})
 
-# modules/mes_step1.py
 @bp.get("/step1/specs")
 def step1_specs():
     """
@@ -599,43 +663,226 @@ def step1_specs():
     keyword = (request.args.get("keyword") or "").strip().lower()
     machine = (request.args.get("machine") or "").strip()
     matnr   = (request.args.get("matnr") or "").strip()
+    specifications = []
 
+    if matnr:
+        try:
+            with ora_cursor(db_alias = 'item_db') as cur:
+                # 基礎：從 SYS_PROCESS 出發
+                table_name = 'EZFLEX."KKME_Table"'
+                sql = f"SELECT DISTINCT STATION FROM {table_name} WHERE (CASE WHEN INSTR(ITEM, '-') > 0 THEN SUBSTR(ITEM, 1, INSTR(ITEM, '-') - 1) ELSE ITEM END) = :matnr"
+                cur.execute(sql, {"matnr": matnr})
+                specifications = [row[0] for row in cur.fetchall()]
+
+                if len(specifications) == 0:
+                    return send_response(400, True, "查詢失敗", {"message": "此品目無任何製程工站"})
+
+        except Exception as e:
+            print("Error /mes/step1/specs:", e)
+            return send_response(500, True, "查詢失敗", {"message": str(e)})
+    
     try:
-        with ora_cursor() as cur:
-            # 基礎：從 RMS_SYS_PROCESS 出發
-            sql = """
-                SELECT DISTINCT p.PROCESS_DESC, p.PROCESS_NAME FROM IDBUSER.RMS_SYS_PROCESS p
-                JOIN IDBUSER.RMS_SYS_TERMINAL t ON p.PROCESS_ID = t.PROCESS_ID
-                JOIN IDBUSER.RMS_SYS_MACHINE sm ON t.PDLINE_ID = sm.PDLINE_ID
-                WHERE REGEXP_LIKE(p.PROCESS_NAME, '^\([LR][0-8][[:digit:]]{2}-[[:digit:]]{2}\)') AND p.PROCESS_NAME NOT LIKE '%人工%' AND sm.ENABLED = 'Y' AND sm.EQM_ID <> 'NA'
+        with ora_cursor(db_alias="machine_db") as cur:
+            # 假設 WHERE_PREFIX 是全域變數，若無則預設 '1=1' 以方便串接 AND
+            # 注意：p.PROCESS_DESC 應該是對應上面的 KTSCH
+            base_sql = f"""
+                SELECT DISTINCT p.PROCESS_DESC, p.PROCESS_NAME 
+                FROM SAJET.SYS_PROCESS p
+                JOIN SAJET.SYS_TERMINAL t ON p.PROCESS_ID = t.PROCESS_ID
+                JOIN SAJET.SYS_MACHINE sm ON t.PDLINE_ID = sm.PDLINE_ID
+                WHERE {WHERE_PREFIX} 
             """
+            # 如果你有特定的 WHERE_PREFIX，請加在 WHERE 之後，並確保以 AND 結尾或邏輯正確
+            
             binds = {}
 
+            # 1. 處理 Keyword
             if keyword:
-                sql += f" AND LOWER(p.PROCESS_NAME) LIKE '%{keyword}%'"
+                base_sql += " AND LOWER(p.PROCESS_NAME) LIKE :keyword"
+                binds["keyword"] = f"%{keyword}%"
 
-            # 如果有帶機台，就 join TERMINAL / MACHINE 只保留有掛在該機台線別上的製程
+            # 2. 處理 Machine
             if machine:
-                sql += f" AND sm.MACHINE_CODE = '{machine}'"
+                base_sql += " AND sm.MACHINE_CODE = :machine"
+                binds["machine"] = machine
 
-            # 如果有帶品目 matnr，就從 EZFLEX_ROUTING / EZFLEX_TOOL 反查有哪些製程
+            # 3. [重點] 處理 Matnr 的 Specifications (IN Clause)
             if matnr:
-                sql += f"""
-                  AND EXISTS (
-                    SELECT 1 FROM IDBUSER.EZFLEX_ROUTING r
-                    JOIN IDBUSER.EZFLEX_TOOL t ON r.MATNR = t.MATNR AND r.REVLV = t.REVLV AND r.VORNR = t.VORNR
-                    WHERE t.MATNR LIKE '{matnr}%' AND t.SFHNR LIKE '%-ST%' AND r.KTSCH = p.PROCESS_DESC
-                  )
-                """
+                # 因為 specifications 是一個 List，我們需要動態產生 :s0, :s1, :s2...
+                # 這樣做最安全，也能處理特殊字元
+                bind_names = [f":spec_{i}" for i in range(len(specifications))]
+                placeholders = ", ".join(bind_names)
+                
+                base_sql += f" AND p.PROCESS_DESC IN ({placeholders})"
+                
+                # 將值塞入 binds 字典
+                for name, value in zip(bind_names, specifications):
+                    # 注意：bind name 在字典key中不需要冒號 (視 library 而定，cx_Oracle/oracledb 通常不需要)
+                    key = name.replace(":", "") 
+                    binds[key] = value
 
-            sql += " ORDER BY p.PROCESS_DESC"
+            base_sql += " ORDER BY p.PROCESS_DESC"
 
-            cur.execute(sql, binds)
+            print(f"sql: {base_sql}") # Debug 用
+            print(f"binds: {binds}")   # Debug 用
+
+            cur.execute(base_sql, binds)
             rows = cur.fetchall()
 
         specifics = [{"code": r[0], "name": r[1]} for r in rows]
         
         return send_response(200, True, "請求成功", {"specifics": specifics})
+
     except Exception as e:
-        print("Error /mes/step1/specs:", e)
+        print("Error /mes/step1/specs (SYS_PROCESS):", e)
         return send_response(500, True, "查詢失敗", {"message": str(e)})
+
+# Use on management specification of instruction document 
+@bp.post("/pms/pms-match")
+def pms_match():
+    body       = request.get_json(silent=True) or {}
+    machine_id = body.get('machine_id')
+    src_pms    = body.get("pmsData")
+    
+    if src_pms == None or len(src_pms) == 0:
+        src_pms_item = {}
+        src_custom_pms_items = []
+    else:
+        src_pms_item = {f"{row[1]}-{row[2]}": {"data": row[1:], "isPms": row[0]} for row in src_pms}
+        src_custom_pms_items = [row[1:] for row in src_pms if row[0] == False]
+
+    if not machine_id or len(machine_id) == 0:
+        return send_response(400, True, "缺少機台代碼", {"message": "請提供 machine_id"})
+
+    try:
+        with ora_cursor(db_alias = "machine_db") as cur:
+            cur.execute(f"SELECT SLOT_NAME, PARAMETER_DESC, UNIT FROM SAJET.FLEX_PMS WHERE MACHINE_CODE = :c AND {MANAGEMENT_PREFIX} ORDER BY SLOT_NUM, PMS_ID", c = machine_id)
+            rows = cur.fetchall()
+
+    except Exception as e:
+        return send_response(500, True, "查詢失敗", {"message": f"Oracle 錯誤: {e}"})
+    
+    latestPMS = {}
+    for slot_name, parameter_desc, unit in rows:
+        unit = "(%s)" % unit if unit != None and len(unit) > 0 else ""
+        key = f'{slot_name}-{parameter_desc}{unit}'
+        latestPMS[key] = {"slotname": slot_name, "parameter_desc": f"{parameter_desc}{unit}"}
+
+    addList = [rowPMS for rowPMS in latestPMS if src_pms_item.get(rowPMS) == None or (src_pms_item.get(rowPMS) and src_pms_item.get(rowPMS)['isPms'] == False)]
+    delList = [rowPMS for rowPMS, PMS_info in src_pms_item.items() if PMS_info['isPms'] == True and latestPMS.get(rowPMS) == None]
+
+    rowIndex = 1
+    HEADER_ROW = ["PMS", "項次", "槽體", "管理項目", "規格下限(OOS-)", "操作下限(OOC-)", "設定值", "操作上限(OOC+)", "規格上限(OOS+)", "檢查頻率", "檢查方式", "檢驗人員", "記錄", "備註/參考指示書"]
+    newPMSData = [HEADER_ROW]
+    for rowPMS in latestPMS:
+        while len(src_custom_pms_items) > 0 and rowIndex >= int(src_custom_pms_items[0][0]):
+            newPMSData.append([False, str(rowIndex)] + src_custom_pms_items.pop(0)[1:])
+            rowIndex += 1
+
+        if (src_pms_item.get(rowPMS) != None and src_pms_item[rowPMS]["isPms"] == True):
+            newPMSData.append([True, str(rowIndex)] + src_pms_item[rowPMS]["data"])
+        else:
+            newPMSData.append([True, str(rowIndex), latestPMS[rowPMS]["slotname"], latestPMS[rowPMS]["parameter_desc"], "", "", "", "", "", "", "", "", "", ""])
+
+        rowIndex += 1
+
+    while len(src_custom_pms_items) > 0:
+        newPMSData.append([False, str(rowIndex)] + src_custom_pms_items.pop(0))
+        rowIndex += 1
+
+    return send_response(200, True, "查詢成功", {"data": {"PMSData": newPMSData, "added": addList, "removed": delList}})
+
+# Not use for frontend
+@bp.post("/pms/pms-cond-match")
+def pms_and_condition_match():
+    body       = request.get_json(silent=True) or {}
+    machine_id = body.get('machine_id')
+    src_pms    = body.get("pmsData")
+    src_cond   = body.get("condData")
+
+    if not machine_id or len(machine_id) == 0:
+        return send_response(400, True, "缺少機台代碼", {"message": "請提供 machine_id"})
+
+    try:
+        with ora_cursor(db_alias = "machine_db") as cur:
+            cur.execute(f"SELECT SLOT_NAME, PARAMETER_DESC, UNIT FROM SAJET.FLEX_PMS WHERE MACHINE_CODE = :c AND {MANUFACTURING_PREFIX} ORDER BY PMS_ID", c = machine_id)
+            pms_rows = cur.fetchall()
+
+    except Exception as e:
+        return send_response(500, True, "查詢失敗", {"message": f"Oracle 錯誤: {e}"})
+    
+    try:
+        with db() as (_, cur):
+            cur.execute("""
+                SELECT t1.condition_name, t2.parameter_name FROM rms_conditions t1
+                JOIN rms_condition_parameters t2 ON t1.condition_id = t2.condition_id
+                JOIN rms_group_machines t3 ON t1.condition_id = t3.condition_id
+                WHERE t3.machine_id = :c
+            """, c = machine_id)
+            cond_rows = cur.fetchall()
+        
+    except Exception as e:
+        return send_response(500, True, "查詢失敗", {"message": f"MySQL 錯誤: {e}"})
+    
+    latestPMS = {}
+    for slot_name, parameter_desc, unit in pms_rows:
+        unit = "(%s)" % unit if unit != None and len(unit) > 0 else ""
+        key = f'{slot_name}-{parameter_desc}{unit}'
+        latestPMS[key] = {"slotname": slot_name, "parameter_desc": f"{parameter_desc}{unit}"}
+
+    src_pms_item = {f"{row[0]}-{row[1]}": row for row in src_pms}
+    addList = [rowPMS for rowPMS in latestPMS if src_pms_item.get(rowPMS) == None]
+    delList = [rowPMS for rowPMS in src_pms_item if latestPMS.get(rowPMS) == None]
+
+    HEADER_ROW = ["槽體", "管理項目", "規格下限(OOS-)", "操作下限(OOC-)", "設定值", "操作上限(OOC+)", "規格上限(OOS+)", "參數下放", "說明"]
+    newPMSData = [HEADER_ROW]
+    for rowPMS in latestPMS:
+        row = src_pms_item[rowPMS]["data"] if (src_pms_item.get(rowPMS) != None) else [latestPMS[rowPMS]["slotname"], latestPMS[rowPMS]["parameter_desc"], "", "", "", "", "", "Y", ""]
+        newPMSData.append(row)
+
+    latestCond = {}
+    for condition, parameter in cond_rows:
+        if latestCond.get(condition) == None:
+            latestCond[condition] = {"parameter": []}
+        latestCond[condition]["parameter"].append(parameter)
+
+    addList = [condition for condition in latestCond if src_cond.get(condition) == None]
+    delList = [condition for condition in src_cond if latestCond.get(condition) == None]
+
+    for condition, cond_info in latestCond.items():
+        if src_cond.get(condition) and src_cond[condition] not in cond_info["parameter"]:
+            latestCond[condition]["del_item"] = src_cond[condition]
+
+    return send_response(200, True, "查詢成功", {"data": {"PMS": {"PMSData": newPMSData, "added": addList, "removed": delList}, "Cond": {"condData": latestCond, "added": addList, "removed": delList}}})
+
+# Not use for frontend
+@bp.get("/pms/get-latest-pms-and-condition")
+def get_latest_pms_and_condition():
+    machine_id = request.args.get("machine_id")
+
+    if not machine_id or len(machine_id) == 0:
+        return send_response(400, True, "缺少機台代碼", {"message": "請提供 machine_id"})
+
+    try:
+        with ora_cursor(db_alias = "machine_db") as cur:
+            cur.execute(f"SELECT SLOT_NAME, PARAMETER_DESC, UNIT FROM SAJET.FLEX_PMS WHERE MACHINE_CODE = :c AND {MANUFACTURING_PREFIX} ORDER BY PMS_ID", c = machine_id)
+            pms_rows = cur.fetchall()
+
+    except Exception as e:
+        return send_response(500, True, "查詢失敗", {"message": f"Oracle 錯誤: {e}"})
+    
+    try:
+        with db() as (_, cur):
+            cur.execute("""
+                SELECT t1.condition_name, t2.parameter_name FROM rms_conditions t1
+                JOIN rms_condition_parameters t2 ON t1.condition_id = t2.condition_id
+                JOIN rms_group_machines t3 ON t1.condition_id = t3.condition_id
+                WHERE t3.machine_id = :c
+            """, c = machine_id)
+            cond_rows = cur.fetchall()
+        
+    except Exception as e:
+        return send_response(500, True, "查詢失敗", {"message": f"MySQL 錯誤: {e}"})
+
+    return send_response(200, True, "查詢成功", {"data": {"PMS": pms_rows, "Cond": cond_rows}})
+

@@ -25,3 +25,4 @@ def db(dict_cursor=False):
     finally:
         try: cur.close(); conn.close()
         except: pass
+

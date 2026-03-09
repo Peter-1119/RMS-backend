@@ -31,7 +31,7 @@ def call_external_api(cmd: int, data: dict):
         "Content-Type": "application/x-www-form-urlencoded"
     }
 
-    target_url = "http://10.1.5.122/gxfirstOIS/gxfirstOIS.asmx/GetOISData"
+    target_url = "http://ksrv-web-ap3.flexium.local/gxfirstOIS/gxfirstOIS.asmx/GetOISData"
 
     try:
         # 使用 data= 表示用 form-urlencoded 格式傳送

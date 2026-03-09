@@ -17,6 +17,7 @@ def create_app():
     from modules.item import bp as item_bp
     from modules.parameters import bp as parameters_bp
     from modules.dcc import bp as dcc_bp   # ⬅️ 新增這行
+    from modules.spec import bp as spec_bp   # ⬅️ 新增這行
 
     app.register_blueprint(auth_bp, url_prefix="/api")
     app.register_blueprint(docs_bp, url_prefix="/docs")
@@ -24,7 +25,8 @@ def create_app():
     app.register_blueprint(mes_bp, url_prefix="/mes")
     app.register_blueprint(cond_bp, url_prefix="/conditions")
     app.register_blueprint(item_bp, url_prefix="/item")
-    app.register_blueprint(parameters_bp)
+    app.register_blueprint(parameters_bp, url_prefix="/parameters")
     app.register_blueprint(dcc_bp, url_prefix="/dcc")  # ⬅️ 新增這行
+    app.register_blueprint(spec_bp, url_prefix="/spec")  # ⬅️ 新增這行
 
     return app
