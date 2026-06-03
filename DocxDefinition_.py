@@ -701,7 +701,8 @@ def _fill_docx_cell_from_tiptap(docx_cell, cell_data, COLOR_DICT, center = True)
                         # 若讀取失敗，就安全地降級使用最大容許寬度
                         final_width_cm = cell_max_width_cm
                         
-                    run.add_picture(local_src, width=Cm(final_width_cm))
+                    if os.path.exists(local_src):
+                        run.add_picture(local_src, width=Cm(final_width_cm))   # 防呆：圖檔不存在則略過
                     
                 elif src.startswith('data:image'):
                     base64_data = src.split(",", 1)[-1]
@@ -1019,8 +1020,11 @@ def create_parameter_table(cell, condition_content, parameter_content, info):
         total_width = cell.width - Cm(0.2)
 
         first_col_width = Inches(1)
-        other_col_width = (total_width - first_col_width) // (cols - 1)
-        first_col_width = int(total_width - (other_col_width * (cols - 1)))
+        if cols > 1:
+            other_col_width = (total_width - first_col_width) // (cols - 1)
+            first_col_width = int(total_width - (other_col_width * (cols - 1)))
+        else:
+            other_col_width = int(total_width - first_col_width)   # 防呆：單欄表避免除以 (cols-1)=0
 
         for row in table.rows:
             row.allow_row_break_across_pages = False
@@ -1066,8 +1070,11 @@ def create_parameter_table(cell, condition_content, parameter_content, info):
         total_width = cell.width - Cm(0.2)
 
         first_col_width = Inches(1)
-        other_col_width = (total_width - first_col_width) // (cols - 1)
-        first_col_width = int(total_width - (other_col_width * (cols - 1)))
+        if cols > 1:
+            other_col_width = (total_width - first_col_width) // (cols - 1)
+            first_col_width = int(total_width - (other_col_width * (cols - 1)))
+        else:
+            other_col_width = int(total_width - first_col_width)   # 防呆：單欄表避免除以 (cols-1)=0
 
         for row in table.rows:
             row.allow_row_break_across_pages = False
@@ -1376,7 +1383,8 @@ def parse_json_content(parent_object, json_data, indent = None, header = False, 
                             target_width_cm = (MAX_PIXELS / 96) * 2.54
                             
                         # 寫入 Word
-                        run.add_picture(local_src, width=Cm(target_width_cm))
+                        if os.path.exists(local_src):
+                            run.add_picture(local_src, width=Cm(target_width_cm))   # 防呆：圖檔不存在則略過
                         
                     elif src.startswith('data:image'):
                         # 處理 Base64 圖片
@@ -1402,7 +1410,8 @@ def parse_json_content(parent_object, json_data, indent = None, header = False, 
                         local_src = src.split("/", 3)[-1]
                         # 以目前 cell 寬度大概估一下圖片寬度
                         cell_width_cm = parent_object.width.cm if hasattr(parent_object, "width") else 4
-                        run.add_picture(local_src, width=Cm(max(cell_width_cm - 0.5, 0.5)))
+                        if os.path.exists(local_src):
+                            run.add_picture(local_src, width=Cm(max(cell_width_cm - 0.5, 0.5)))   # 防呆：圖檔不存在則略過
                     elif src.startswith('data:image'):
                         # 處理 Base64 圖片 (格式通常是 "data:image/png;base64,iVBORw0K...")
                         # 1. 用逗號切開，取得後面的純 base64 字串
@@ -1765,7 +1774,8 @@ def clean_process_name(raw: str) -> str:
 def get_docx_(outpath, data, template = "docx-template/example3.docx"):
     attribute = data["attribute"][-1]
     Doc_id = attribute["document_id"]
-    Date = datetime.now().strftime("%Y/%m/%d")
+    # 制定日期：預覽快照時帶入「當初產生文件的日期」(data["render_date"])；產生 Word / 即時預覽則用 now()
+    Date = data.get("render_date") or datetime.now().strftime("%Y/%m/%d")
     Version = f"{int(attribute['document_version']):.1f}"
     Doc_name = attribute["document_name"]
 

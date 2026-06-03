@@ -643,7 +643,7 @@ def save_instruction():
         # 1.1 ★ status 提升：0→1 (草稿)，1/2/3 維持原值
         # 用 GREATEST 確保已公告 (2) 與已下載 (3) 不會被退回成草稿
         cur.execute(
-            "UPDATE rms_document_attributes SET status = GREATEST(COALESCE(status, 0), 1) WHERE document_token=%s",
+            "UPDATE rms_document_attributes SET status = GREATEST(COALESCE(status, 0), 1), issue_date = NOW() WHERE document_token=%s",
             (token,)
         )
 
@@ -823,7 +823,7 @@ def save_specification():
         # 1.1 ★ status 提升：0→1 (草稿)，1/2/3 維持原值
         # 用 GREATEST 確保已公告 (2) 與已下載 (3) 不會被退回成草稿
         cur.execute(
-            "UPDATE rms_document_attributes SET status = GREATEST(COALESCE(status, 0), 1) WHERE document_token=%s",
+            "UPDATE rms_document_attributes SET status = GREATEST(COALESCE(status, 0), 1), issue_date = NOW() WHERE document_token=%s",
             (token,)
         )
 
@@ -2139,6 +2139,72 @@ def _build_doc_payload_from_token(token: str) -> dict:
         "reference": references,
     }
 
+def _build_docx_payload_v2(token: str) -> dict:
+    """
+    給「新樹渲染器」get_docx_ / get_docx_without_framework_ 用的 payload（從 DB 即時組）：
+      - attribute：snake_case（對齊前端送 generate/word_ 的結構），含目前版 + 最多 2 個前版
+      - content：build_tree 產出的樹 [{step_type, children}]
+      - reference：{refer_type, refer_document, refer_document_name}
+      - form_attribute：目的 / 文件名 / 適用工程的 tiptap 樣式
+    （取代舊的 _build_doc_payload_from_token + 舊 get_docx；舊版查 tier_no/sub_no，新表已無此欄。）
+    """
+    with db(dict_cursor=True) as (conn, cur):
+        # 1) attributes：沿 previous_document_token 往回追
+        attrs = []
+        hops = 0
+        seen = set()
+        current_token = token
+        while current_token and current_token not in seen and hops < 3:
+            seen.add(current_token)
+            cur.execute("SELECT * FROM rms_document_attributes WHERE document_token=%s", (current_token,))
+            r = cur.fetchone()
+            if not r:
+                break
+            attr_json = jload(r.get("attribute"), {}) or {}
+            attrs.append({
+                "document_type":    r["document_type"],
+                "document_id":      r["document_id"] or "",
+                "document_name":    r["document_name"] or "",
+                "document_version": float(r["document_version"] or 1.0),
+                "attribute":        attr_json,
+                "department":       r["department"] or "",
+                "author_id":        r["author_id"] or "",
+                "author":           r["author"] or "",
+                "approver":         r["approver"] or "",
+                "confirmer":        r["confirmer"] or "",
+                "issue_date":       r["issue_date"].strftime("%Y/%m/%d") if r["issue_date"] else "",
+                "change_reason":    r["change_reason"] or "",
+                "change_summary":   r["change_summary"] or "",
+                "purpose":          r["purpose"] or "",          # 指示書 body「目的」
+                "documentPurpose":  r["purpose"] or "",          # 式樣書 body「目的」
+            })
+            current_token = r.get("previous_document_token")
+            hops += 1
+        attrs.reverse()   # [舊版..., 最新版]；get_docx_ 用 [-1] 當最新
+        if not attrs:
+            raise ValueError("document not found")
+
+        # 2) content：新樹（parent_id/sort_order/depth → build_tree）
+        cur.execute(
+            "SELECT content_id, step_type, parent_id, sort_order, depth, content_type, "
+            "header_text, header_json, content_text, content_json, table_text, table_json, files, metadata "
+            "FROM rms_block_content WHERE document_token=%s ORDER BY step_type ASC, sort_order ASC",
+            (token,),
+        )
+        content_tree = build_tree([deserialize_block_row(r) for r in (cur.fetchall() or [])])
+
+        # 3) references（key 對齊渲染器讀法 refer_document / refer_document_name）
+        cur.execute("SELECT refer_type, refer_document, refer_document_name FROM rms_references WHERE document_token=%s ORDER BY refer_type ASC, id ASC", (token,))
+        references = [
+            {"refer_type": int(r["refer_type"]), "refer_document": r["refer_document"], "refer_document_name": r["refer_document_name"]}
+            for r in (cur.fetchall() or [])
+        ]
+
+        # 4) form_attribute（目的 / 文件名 / 適用工程 的彩色樣式）
+        form_attr = _load_form_attributes(cur, token)
+
+    return {"attribute": attrs, "content": content_tree, "reference": references, "form_attribute": form_attr}
+
 @bp.get("/view/<token>/docx")
 def view_docx_from_token(token):
     """
@@ -2147,7 +2213,7 @@ def view_docx_from_token(token):
     回傳給前端做「全頁預覽」（前端直接 window.open 這個 URL）。
     """
     try:
-        data = _build_doc_payload_from_token(token)
+        data = _build_docx_payload_v2(token)   # 新樹 + snake_case attribute + form_attribute
     except Exception as e:
         print("[view_docx_from_token] error:", e)
         return jsonify({"ok": False, "error": "document not found"}), 404
@@ -2155,7 +2221,7 @@ def view_docx_from_token(token):
     # 檔名：優先用文件名稱 / 編號
     try:
         attr_last = data["attribute"][-1]
-        raw_name  = attr_last.get("documentName") or attr_last.get("documentID") or token
+        raw_name  = attr_last.get("document_name") or attr_last.get("document_id") or token
         doc_name  = _safe_docname(raw_name)
     except Exception:
         doc_name = token
@@ -2167,11 +2233,11 @@ def view_docx_from_token(token):
     fname    = f"{doc_name}-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}.docx"
     out_path = os.path.join(view_dir, fname)
 
-    # 產生 Word
-    if data["attribute"][-1]["documentType"] == 1:
-        get_docx(out_path, data, "docx-template/SpecificationDocument.docx")
+    # 產生 Word（新樹渲染器 get_docx_）
+    if data["attribute"][-1]["document_type"] == 1:
+        get_docx_(out_path, data, "docx-template/SpecificationDocument.docx")
     else:
-        get_docx(out_path, data, "docx-template/InstructionDocument.docx")
+        get_docx_(out_path, data, "docx-template/InstructionDocument.docx")
 
     # 回傳後刪掉暫存檔
     @after_this_request
@@ -2700,12 +2766,14 @@ def _process_instruction_id_ver(applyProject, machines):
     return next_document_id(applyProject[:3]), 1.0
 
 def _process_specification_id_ver(mpn_mode, style_no):
-    # Try get Past document information
+    # Try get Past document information（同 style_no 沿用同 document_id）
     try:
-        with db() as (conn, cur):
+        with db(dict_cursor=True) as (conn, cur):   # 需 dict cursor 才能用 exist_row['document_id']
             cur.execute("SELECT document_id, document_version FROM rms_document_list WHERE style_no = %s LIMIT 1", (style_no,))
             exist_row = cur.fetchone()
-            return exist_row['document_id'], exist_row['document_version']
+            if exist_row and exist_row.get("document_id"):
+                return exist_row["document_id"], exist_row["document_version"]   # 有舊號 → 沿用
+            # 查無此 style_no → 往下重新配號
 
     except Exception as e:
         print(f"訪問資料庫失敗: {e} => 因此重新配號")
@@ -2745,10 +2813,21 @@ def _create_snapshot_and_oracle_row(token, rms_id, doc_info):
         cur_o.execute("INSERT INTO IDBUSER.RMS_DCC2EIP (RMS_ID, RMS_DCCNO, RMS_VER, RMS_DCCNAME, RMS_INSDT) VALUES (:1, :2, :3, :4, :5)", (rms_id, attribute['document_id'], attribute['document_version'], attribute['document_name'], datetime.datetime.now()))
         cur_o.connection.commit()
 
-    # --- 3) 再寫 MySQL snapshot（meta + payload 分兩張表） ---
-    doc_row_json  = doc_info['attribute']
-    blocks_json   = doc_info['content']
-    refs_json     = doc_info['reference']
+    # --- 3) 從 MySQL 撈「目前 DB 狀態」當快照內容 ---
+    #     ⚠️ 必須與簽核快照同格式（reader _build_payload_for_docx_from_snapshot 預期）：
+    #        document_row = 單一 rms_document_attributes row（dict，非 list）
+    #        blocks_rows  = 攤平的 rms_block_content rows（reader 會再 build_tree），非已建好的樹
+    with db(dict_cursor=True) as (conn, cur):
+        cur.execute("SELECT * FROM rms_document_attributes WHERE document_token=%s", (token,))
+        doc_row = cur.fetchone()
+        cur.execute("SELECT * FROM rms_block_content WHERE document_token=%s", (token,))
+        blocks_rows = cur.fetchall() or []
+        cur.execute("SELECT * FROM rms_references WHERE document_token=%s", (token,))
+        ref_rows = cur.fetchall() or []
+
+    doc_row_json  = _normalize_for_json(doc_row)
+    blocks_json   = _normalize_for_json(blocks_rows)
+    refs_json     = _normalize_for_json(ref_rows)
     programs_json = list(program_codes_rows)
 
     try:
@@ -2820,7 +2899,8 @@ def generate_word_():
     attributes = [data['attribute'][0]]
     document_id = attributes[0]["document_id"]
     document_version = attributes[0]["document_version"]
-    if document_id != "":
+    # 有值才當「既有文件」；None / "" / 缺欄一律視為新文件去配號（式樣書前端送 null 會被 != "" 誤判，導致沒配號、header 拿不到 document_id）
+    if document_id:
         payload = _build_doc_payload_from_docid(document_id)
         attributes += payload[1:]
 
@@ -2882,6 +2962,15 @@ def _build_payload_for_docx_from_snapshot(snap_row):
     token   = snap_row["document_token"]
     snap_id = snap_row["snapshot_id"]
 
+    # 制定日期：用快照建立時間（= 當初產生文件的日期），讓預覽顯示原始日期而非 now()
+    _created = snap_row.get("created_at")
+    if hasattr(_created, "strftime"):
+        render_date = _created.strftime("%Y/%m/%d")
+    elif _created:
+        render_date = str(_created)[:10].replace("-", "/")
+    else:
+        render_date = None
+
     row, info = db_data_fetch(f"SELECT document_row, blocks_rows, references_rows, form_attributes FROM rms_document_snapshot_payloads WHERE snapshot_id = '{snap_id}'", fetch_one = True)
 
     if info != "Success":
@@ -2891,6 +2980,11 @@ def _build_payload_for_docx_from_snapshot(snap_row):
     blocks_rs = _normalize_metadata(row[1]) or []
     refs_rs   = _normalize_metadata(row[2]) or []
     form_attr = _normalize_metadata(row[3]) or {}   # 凍結的彩色標題/目的樣式（舊快照無此欄 → {}）
+
+    # 相容舊版 download 快照：_create_snapshot_and_oracle_row 曾把 document_row 存成 list、blocks 存成「已建好的樹」
+    if isinstance(doc_row, list):
+        doc_row = (doc_row[0] if doc_row else {}) or {}
+    blocks_is_tree = bool(blocks_rs) and isinstance(blocks_rs[0], dict) and ("children" in blocks_rs[0]) and ("content_id" not in blocks_rs[0])
 
     # ---------- 1.1 歷史版本（已經是 yyyy/mm/dd，就保留你現在的實作） ----------
     attrs: list[dict] = []
@@ -2920,19 +3014,20 @@ def _build_payload_for_docx_from_snapshot(snap_row):
                     issue_str = issue or ""
 
                 attrs.append({
-                    "documentType":     r.get("document_type") or 0,
-                    "documentID":       r.get("document_id") or "",
-                    "documentName":     r.get("document_name") or "",
-                    "documentVersion":  float(r.get("document_version") or 1.0),
+                    "document_type":    r.get("document_type") or 0,
+                    "document_id":      r.get("document_id") or "",
+                    "document_name":    r.get("document_name") or "",
+                    "document_version": float(r.get("document_version") or 1.0),
                     "attribute":        attr_json,
                     "department":       r.get("department") or "",
                     "author_id":        r.get("author_id") or "",
                     "author":           r.get("author") or "",
                     "approver":         r.get("approver") or "",
                     "confirmer":        r.get("confirmer") or "",
-                    "issueDate":        issue_str,   # 🔑 統一用 issueDate
-                    "reviseReason":     r.get("change_reason") or "",
-                    "revisePoint":      r.get("change_summary") or "",
+                    "issue_date":       issue_str,
+                    "change_reason":    r.get("change_reason") or "",
+                    "change_summary":   r.get("change_summary") or "",
+                    "purpose":          r.get("purpose") or "",
                     "documentPurpose":  r.get("purpose") or "",
                 })
 
@@ -2960,24 +3055,29 @@ def _build_payload_for_docx_from_snapshot(snap_row):
     else:
         issue_str = ""
 
+    # 制定日期：優先用快照凍結的 issue_date（真正的制定日）；舊快照沒有此欄時，仍退回快照建立時間
+    if issue_str:
+        render_date = issue_str
+
     attr_json = jload(doc_row.get("attribute"), {}) or {}
 
     latest_form = {
-        "documentType":     doc_row.get("document_type") or 0,
-        "documentID":       doc_row.get("document_id") or "",
-        "documentName":     doc_row.get("document_name") or "",
-        "documentVersion":  float(doc_row.get("document_version") or 1.0),
+        "document_type":    doc_row.get("document_type") or 0,
+        "document_id":      doc_row.get("document_id") or "",
+        "document_name":    doc_row.get("document_name") or "",
+        "document_version": float(doc_row.get("document_version") or 1.0),
         "attribute":        attr_json,
         "department":       doc_row.get("department") or "",
         "author_id":        doc_row.get("author_id") or "",
         "author":           doc_row.get("author") or "",
         "approver":         doc_row.get("approver") or "",
         "confirmer":        doc_row.get("confirmer") or "",
+        "purpose":          doc_row.get("purpose") or "",
         "documentPurpose":  doc_row.get("purpose") or "",
-        "reviseReason":     doc_row.get("change_reason") or "",
-        "revisePoint":      doc_row.get("change_summary") or "",
-        "issueDate":        issue_str,  # ✅ 現在一定是 yyyy/mm/dd
-        "previousDocumentToken": doc_row.get("previous_document_token") or "",
+        "change_reason":    doc_row.get("change_reason") or "",
+        "change_summary":   doc_row.get("change_summary") or "",
+        "issue_date":       issue_str,
+        "previous_document_token": doc_row.get("previous_document_token") or "",
     }
 
     attrs.append(latest_form)
@@ -3004,11 +3104,14 @@ def _build_payload_for_docx_from_snapshot(snap_row):
             "metadata": _normalize_metadata(r.get("metadata")) or {},
         }
 
-    prepared = [_prep_block_row(r) for r in blocks_rs]
-    # v1 舊快照（含 tier_no、無 parent_id）→ lazy 轉新階層；v2 直接用（spec §10.3）
-    if prepared and ("tier_no" in blocks_rs[0]) and ("parent_id" not in blocks_rs[0]):
-        prepared = normalize_legacy_blocks(prepared)
-    content_items = build_tree(prepared)   # [{step_type, children}]
+    if blocks_is_tree:
+        content_items = blocks_rs   # 舊 download 快照：blocks 已是樹 [{step_type, children}]，直接用
+    else:
+        prepared = [_prep_block_row(r) for r in blocks_rs]
+        # v1 舊快照（含 tier_no、無 parent_id）→ lazy 轉新階層；v2 直接用（spec §10.3）
+        if prepared and ("tier_no" in blocks_rs[0]) and ("parent_id" not in blocks_rs[0]):
+            prepared = normalize_legacy_blocks(prepared)
+        content_items = build_tree(prepared)   # [{step_type, children}]
 
     # ---------- 3) references：只用 snapshot 的 refs_rs ----------
     references = []
@@ -3019,9 +3122,9 @@ def _build_payload_for_docx_from_snapshot(snap_row):
             ref_type = 0
 
         references.append({
-            "referenceType": ref_type,
-            "referenceDocumentID": r.get("refer_document"),
-            "referenceDocumentName": r.get("refer_document_name"),
+            "refer_type": ref_type,
+            "refer_document": r.get("refer_document"),
+            "refer_document_name": r.get("refer_document_name"),
         })
 
     return {
@@ -3030,6 +3133,7 @@ def _build_payload_for_docx_from_snapshot(snap_row):
         "content": content_items,
         "reference": references,
         "form_attribute": form_attr,  # 凍結的 form_attribute（彩色 目的/文件名/適用工程）
+        "render_date": render_date,   # 制定日期：當初產生文件的日期（快照建立時間），預覽用
     }
 
 # Document preview in signed document
@@ -3067,6 +3171,7 @@ def preview_docx_from_snapshot(token):
     attr_list = payload.get("attribute") or []
     if attr_list:
         last_attr = attr_list[-1]
+        print(last_attr)
         doc_type = last_attr.get("documentType", 0)
         raw_name = last_attr.get("documentName") or last_attr.get("documentID") or "snapshot"
     else:

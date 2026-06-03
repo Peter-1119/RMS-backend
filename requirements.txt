@@ -3,3 +3,4 @@ flask_cors
 werkzeug
 mysqlclient
 python-docx
+xlsxwriter
