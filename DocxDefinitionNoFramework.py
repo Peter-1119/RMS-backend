@@ -1,4 +1,4 @@
-import json, re, os, io, base64
+import json, re, os, io, base64, tempfile
 import hashlib
 from PIL import Image
 from datetime import datetime
@@ -14,7 +14,6 @@ from docx.oxml.ns import qn
 COLOR_DICT = {
     "red": RGBColor(255, 0, 0),
     "blue": RGBColor(0, 0, 255),
-    "black": RGBColor(0, 0, 0),
     "#000": RGBColor(0, 0, 0),
     "#000000": RGBColor(0, 0, 0),
     "#ff0000": RGBColor(255, 0, 0),
@@ -416,7 +415,7 @@ def set_repeat_table_header(row):
     return row
 
 # --- New Content Generation Helper Functions ---
-def set_run_node_text_font_style(run_node, color = COLOR_DICT['black']):
+def set_run_node_text_font_style(run_node):
     # 基本字型：英文 Arial，中文 標楷體
     run_node.font.name = "Arial"
 
@@ -434,7 +433,6 @@ def set_run_node_text_font_style(run_node, color = COLOR_DICT['black']):
     rFonts.set(qn("w:ascii"), "Arial")
     rFonts.set(qn("w:hAnsi"), "Arial")
     rFonts.set(qn("w:eastAsia"), "標楷體")
-    run_node.font.color.rgb = color
 
 def set_table_run_text(p_node, text, color = COLOR_DICT['#000']):
     runs = []
@@ -697,13 +695,11 @@ def _fill_docx_cell_from_tiptap(docx_cell, cell_data, COLOR_DICT, center = True)
 def create_docx_table(cell, json_table_data):
     rows_data = [row for row in json_table_data.get("content", []) if row.get("type") == "tableRow"]
     if not rows_data:
-        print("skip cause rows_data")
         return
 
     # Build list of header cells JSON (row 0)
     row0_cells_json = [c for c in rows_data[0].get("content", []) if c.get("type") in ["customTableCell", "tableCell", "tableHeader"]]
     if not row0_cells_json:
-        print("skip cause row0_cells_json")
         return
 
     # Get header texts (full list, including extra headers like 項次/槽體/說明 etc.)
@@ -762,13 +758,13 @@ def create_docx_table(cell, json_table_data):
             last = table.cell(r + rowspan - 1, c + colspan - 1)
             first.merge(last)
 
-        # # 🚀 7) 禁止表格列 (Row) 跨頁斷行
-        # for row in table.rows:
-        #     trPr = row._tr.get_or_add_trPr()
-        #     if trPr.find(qn('w:cantSplit')) is None:
-        #         cantSplit = OxmlElement('w:cantSplit')
-        #         cantSplit.set(qn('w:val'), 'true')
-        #         trPr.append(cantSplit)
+        # 🚀 7) 禁止表格列 (Row) 跨頁斷行
+        for row in table.rows:
+            trPr = row._tr.get_or_add_trPr()
+            if trPr.find(qn('w:cantSplit')) is None:
+                cantSplit = OxmlElement('w:cantSplit')
+                cantSplit.set(qn('w:val'), 'true')
+                trPr.append(cantSplit)
 
         return
 
@@ -803,7 +799,8 @@ def create_docx_table(cell, json_table_data):
 
     # Create the new docx table with computed column count
     table = cell.add_table(rows=0, cols=len(new_header_titles))
-    table.width = cell.width.cm - Cm(1)
+    # table.width = cell.width.cm - Cm(1)
+    table.width = cell.sections[-1].page_width - Cm(1)
     table.style = 'Table Grid'
 
     # Write new header row
@@ -962,6 +959,23 @@ def prevent_table_break(table):
             for paragraph in cell.paragraphs:
                 paragraph.paragraph_format.keep_with_next = True
 
+def keep_table_on_one_page(table, keep_final_row = False):
+    # 1. 確保單一儲存格內的文字不會被切兩半
+    for row in table.rows:
+        row.allow_row_break_across_pages = False
+        
+    # 2. 將「除了最後一列以外」的所有段落，設定與下段同頁
+    # 這樣 Word 就會盡全力把整個表格包在同一頁
+    for row in table.rows[:-1]:
+        for cell in row.cells:
+            for p in cell.paragraphs:
+                p.paragraph_format.keep_with_next = True
+                
+    # 3. 確保最後一列「沒有」被設定與下段同頁，讓 Word 可以在表格後方自然換頁
+    for cell in table.rows[-1].cells:
+        for p in cell.paragraphs:
+            p.paragraph_format.keep_with_next = keep_final_row
+
 def create_parameter_table(cell, condition_content, parameter_content, info):
     # if (condition_content == None or len(condition_content) == 0) and (parameter_content == None or len(parameter_content) == 0):
     #     return
@@ -975,6 +989,8 @@ def create_parameter_table(cell, condition_content, parameter_content, info):
     info_N_rows = 2 if info["step_type"] == 2 else 3
 
     table = None
+    p = cell.add_paragraph("")
+    p.paragraph_format.keep_with_next = True
     if condition_content != None and len(condition_content) != 0:
         tableNode = condition_content
         rows_data = [row for row in tableNode['content'][0]['content'] if row.get("type") == "tableRow"]
@@ -985,7 +1001,8 @@ def create_parameter_table(cell, condition_content, parameter_content, info):
         table.autofit = False
         table.allow_autofit = False
 
-        total_width = cell.width - Cm(0.2)
+        # total_width = cell.width - Cm(0.2)
+        total_width = cell.sections[-1].page_width - Cm(2)
 
         first_col_width = Inches(1)
         other_col_width = (total_width - first_col_width) // (cols - 1)
@@ -1012,7 +1029,21 @@ def create_parameter_table(cell, condition_content, parameter_content, info):
             for colIndex, col_data in enumerate(row_data['content']):
                 _fill_docx_cell_from_tiptap(table.cell(rowIndex + 3, colIndex), col_data, COLOR_DICT)
 
-        prevent_table_break(table)
+        # prevent_table_break(table)
+
+        # # 取得第一個表格的最後一列
+        # last_row = table.rows[-1]
+        
+        # # 走訪最後一列的所有儲存格，將裡面的段落設定為與下段同頁 (Keep with next)
+        # for last_row_cell in last_row.cells:
+        #     for paragraph in last_row_cell.paragraphs:
+        #         paragraph.paragraph_format.keep_with_next = True
+
+        keep_table_on_one_page(table, True)
+
+        # 原本移除段落的程式碼保持不變
+        p_to_remove = cell.paragraphs[-1]._element  
+        p_to_remove.getparent().remove(p_to_remove)
 
     write_info = (table == None)
     # if parameter_content != None and len(parameter_content) != 0:
@@ -1020,16 +1051,17 @@ def create_parameter_table(cell, condition_content, parameter_content, info):
     rows_data = [row for row in tableNode['content'][0]['content'] if row.get("type") == "tableRow"] if parameter_content != None else []
     cols = len(rows_data[0]['content']) - 2 if parameter_content != None else 2
 
-    if condition_content != None and len(condition_content) != 0:
-        p_to_remove = cell.paragraphs[-1]._element  
-        p_to_remove.getparent().remove(p_to_remove)
+    # if condition_content != None and len(condition_content) != 0:
+    #     p_to_remove = cell.paragraphs[-1]._element  
+    #     p_to_remove.getparent().remove(p_to_remove)
     
     table = cell.add_table(rows = info_N_rows + max(1, len(rows_data)) + 1 if write_info else len(rows_data) + 1, cols = cols)
     table.style = 'Table Grid'
     table.autofit = False
     table.allow_autofit = False
 
-    total_width = cell.width - Cm(0.2)
+    # total_width = cell.width - Cm(0.2)
+    total_width = cell.sections[-1].page_width - Cm(2)
 
     first_col_width = Inches(1)
     other_col_width = (total_width - first_col_width) // (cols - 1)
@@ -1191,7 +1223,7 @@ def create_parameter_table(cell, condition_content, parameter_content, info):
             B = table.cell(rowIndex, SlotColIndex)
             A.merge(B)
             
-        prevent_table_break(table)
+        keep_table_on_one_page(table)
 
     elif info["step_type"] == 2:
         set_docx_table_cell_text(table.cell(3 if write_info else 0, 0), "請依照「3. 管理條件」進行製造參數設定與確認。", center = True)
@@ -1245,12 +1277,13 @@ def set_cell_border(cell, **kwargs):
 
 def create_process_table(cell, content_data):
     if content_data.get('files') != None and len(content_data.get('files')) > 0:
-        width = cell.width.cm
+        # width = cell.width.cm
+        width_cm = cell.sections[-1].page_width.cm
         src = content_data['files'][0]['path']
         p = cell.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         run = p.add_run()
-        run.add_picture(f'uploads/{src}', width = Cm(width - 1))
+        run.add_picture(f'uploads/{src}', width = Cm(width_cm - 3))
         return
         
     if type(content_data.get('jsonContent')) != dict or content_data['jsonContent'].get('content') == None or len(content_data['jsonContent']['content']) == 0:
@@ -1266,7 +1299,8 @@ def create_process_table(cell, content_data):
     if not rows_data:
         return []
     table = cell.add_table(rows=len(rows_data), cols=len(rows_data[0]['content']))
-    table.width = cell.width.cm - Cm(1)
+    # table.width = cell.width.cm - Cm(1)
+    table.width = cell.sections[-1].page_width - Cm(1)
     table.style = 'Table Grid'
 
     for r, row_data in enumerate(rows_data):
@@ -1411,6 +1445,9 @@ def parse_json_content(parent_object, json_data, indent = None, header = False, 
             # Indent factor is tier - 1. (Tier 1 gets indent factor 0, Tier 2 gets 1, etc.)
             indent_factor = max(0, content_tier - 1) * 2
             p.paragraph_format.left_indent = base_indent * indent_factor
+
+            if header:
+                p.paragraph_format.keep_with_next = True
         
         elif block_type == "table":
             # For tables nested inside content structure (less common but handled)
@@ -1443,7 +1480,8 @@ def createContent(cell, step_content_list):
 
 def createPictures(cell, step_content_list):
     """Adds picture placeholders/links (files) for all items in the list to the cell."""
-    width = cell.width.cm
+    # width = cell.width.cm
+    width_cm = cell.sections[-1].page_width.cm
     base_indent = Cm(0.7)
     for content_obj in step_content_list:
         tier = content_obj.get("tier", 1)
@@ -1461,7 +1499,7 @@ def createPictures(cell, step_content_list):
                         src = file_info["path_to_save"].split("/", 1)[-1]
                         run = p.add_run()
                         # run.add_picture(f'uploads/temp/{src}', width = Cm(width - 0.5))
-                        run.add_picture(f'uploads/temp/{src}', width = Cm(width - 1))
+                        run.add_picture(f'uploads/temp/{src}', width = Cm(width_cm - 2))
 
 def createTable(cell, step_content_list, info = {}):
     """Adds tables (jsonContent containing a table) for all items in the list to the cell."""
@@ -1484,12 +1522,7 @@ def draw_instruction_content(doc, data):
     references = data["reference"]
 
     documentType = attribute["documentType"]
-    cell = doc.tables[1].rows[0].cells[0]
-    
-    # Ensure a paragraph exists to start or continue content in the cell
-    if not cell.paragraphs or cell.paragraphs[0].text:
-         cell.add_paragraph()
-    cell.paragraphs[0].style = doc.styles["Normal"]
+    cell = doc
 
     # Get document chapters from definition
     for (stepIndex, itemInfo) in enumerate(DOCUMENT_STEP[DOCUMENT_TYPE(documentType).name].value):
@@ -1498,11 +1531,13 @@ def draw_instruction_content(doc, data):
         # 1. Set the step title
         if stepIndex > 0:
             cell.add_paragraph()
-        p_title = cell.paragraphs[0] if stepIndex == 0 else cell.add_paragraph()
+        p_title = cell.paragraphs[-1] if stepIndex == 0 else cell.add_paragraph()
+        # print("p_title: " + f"{stepIndex + 1}.{step}")
         p_title.text = f"{stepIndex + 1}.{step}"
         p_title.runs[0].font.size = Pt(12)
         set_run_node_text_font_style(p_title.runs[0])
         p_title.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        p_title.paragraph_format.keep_with_next = True
 
         # 2. Get current step content
         if stepInfo["parent"] == "attribute":
@@ -1519,7 +1554,6 @@ def draw_instruction_content(doc, data):
             # Filter content items for the current step_type
             step_content_list = [content for content in contents if content["step_type"] == stepInfo["code"]]
 
-            # Fill note for no content manufacture block
             if not step_content_list and stepInfo["code"] == 5 and attribute["attribute"].get("isParamNA", False):
                 stepContent = "請依照「2. 製作條件規範」進行製造參數設定與確認"
                 p_attr = cell.add_paragraph(stepContent)
@@ -1529,7 +1563,6 @@ def draw_instruction_content(doc, data):
                 p_attr.paragraph_format.left_indent = p_attr.runs[0].font.size * 2
                 continue
 
-            # Fill note for no content manufacture block
             if not step_content_list and stepInfo["code"] == 2 and attribute["attribute"].get("isParamNA", False):
                 stepContent = "請依照「3. 管理條件」進行製造參數設定與確認"
                 p_attr = cell.add_paragraph(stepContent)
@@ -1539,13 +1572,7 @@ def draw_instruction_content(doc, data):
                 p_attr.paragraph_format.left_indent = p_attr.runs[0].font.size * 2
                 continue
 
-            if not step_content_list and stepInfo["code"] == 0:
-                print("skip process flow")
-                continue
-
-            # Fill NA text for no content step
             if not step_content_list:
-                print("fill process flow ", stepInfo["code"])
                 stepContent = "NA" if len(step_content_list) == 0 else stepContent
                 p_attr = cell.add_paragraph(stepContent)
                 p_attr.alignment = WD_ALIGN_PARAGRAPH.LEFT
@@ -1574,7 +1601,6 @@ def draw_instruction_content(doc, data):
                     createTable(cell, [content_obj], {"step_type": content_obj["step_type"], "programs": content_obj["metadata"]['programs'], "machines": machines, "processOrder": processOrder})
 
                 if content_obj["step_type"] == 0:
-                    print("process processFlow block")
                     item_for_helper = {"data": content_obj.get("data", []), "step": stepIndex + 1, "tier": content_obj.get("tier", 1), "sub_no": 0}
                     createHeader(cell, [item_for_helper]) 
                     create_process_table(cell, content_obj['data'][0])
@@ -1620,41 +1646,14 @@ def draw_instruction_content(doc, data):
                     
                     # Wrap the single data item for consistent access by helpers
                     item_for_helper = {"data": [item_data], "step": stepIndex + 1, "tier": content_obj.get("tier", 1), "sub_no": index}
-
-                    # for row in table.rows:
-                    #     trPr = row._tr.get_or_add_trPr()
-                    #     if trPr.find(qn('w:cantSplit')) is None:
-                    #         cantSplit = OxmlElement('w:cantSplit')
-                    #         cantSplit.set(qn('w:val'), 'true')
-                    #         trPr.append(cantSplit)
                     
                     if option == 2: # Header + Table
-                        # table = cell.add_table(rows = 1, cols = 1)
-                        # set_cell_border(table.rows[0].cells[0], left = {"val": "nil"}, top = {"val": "nil"}, right = {"val": "nil"}, bottom = {"val": "nil"})
-                        # trPr = table.rows[0]._tr.get_or_add_trPr()
-                        # if trPr.find(qn('w:cantSplit')) is None:
-                        #     cantSplit = OxmlElement('w:cantSplit')
-                        #     cantSplit.set(qn('w:val'), 'true')
-                        #     trPr.append(cantSplit)
-                        
                         createHeader(cell, [item_for_helper]) 
                         createTable(cell, [item_for_helper]) 
-                        # createHeader(table.rows[0].cells[0], [item_for_helper]) 
-                        # createTable(table.rows[0].cells[0], [item_for_helper]) 
                     elif option == 1: # Header + Content + Pictures
-                        # table = cell.add_table(rows = 1, cols = 1)
-                        # set_cell_border(table.rows[0].cells[0], left = {"val": "nil"}, top = {"val": "nil"}, right = {"val": "nil"}, bottom = {"val": "nil"})
-                        # trPr = table.rows[0]._tr.get_or_add_trPr()
-                        # if trPr.find(qn('w:cantSplit')) is None:
-                        #     cantSplit = OxmlElement('w:cantSplit')
-                        #     cantSplit.set(qn('w:val'), 'true')
-                        #     trPr.append(cantSplit)
                         createHeader(cell, [item_for_helper]) 
                         createContent(cell, [item_for_helper]) 
                         createPictures(cell, [item_for_helper]) 
-                        # createHeader(table.rows[0].cells[0], [item_for_helper]) 
-                        # createContent(table.rows[0].cells[0], [item_for_helper]) 
-                        # createPictures(table.rows[0].cells[0], [item_for_helper]) 
                     elif option == 0 or option == 3: # Header only
                         createHeader(cell, [item_for_helper])
             
@@ -1665,14 +1664,13 @@ def draw_instruction_content(doc, data):
             if stepContent:
                 # Add a reference list with indentation
                 for index, ref in enumerate(stepContent):
-                    print(f"ref: {ref}")
                     # For reference documents, use a simple numbered format
                     ref_p = cell.add_paragraph(f"{stepIndex + 1}.{index + 1} {ref.get('referenceDocumentID', '')} - {ref.get('referenceDocumentName', '')}")
                     ref_p.runs[0].font.size = Pt(12)
                     ref_p.alignment = WD_ALIGN_PARAGRAPH.LEFT
                     ref_p.paragraph_format.left_indent = ref_p.runs[0].font.size * 2
                     ref_p.paragraph_format.space_after = Pt(3)
-                    set_run_node_text_font_style(ref_p.runs[0], COLOR_DICT[ref.get('color', 'black')])
+                    set_run_node_text_font_style(ref_p.runs[0])
 
             else:
                 stepContent = "NA" if len(stepContent) == 0 else stepContent
@@ -1766,6 +1764,8 @@ def fill_from_template(template_path, out_path, data, title_mapping, info_mappin
 
     enable_docx_protection(doc, "123456")
 
+    fix_image_id_clash(doc)
+
     doc.save(out_path)
 
 _code_prefix_re = re.compile(r"^\s*\(([^)]+)\)\s*(.*)$")
@@ -1780,12 +1780,11 @@ def clean_process_name(raw: str) -> str:
     m = _code_prefix_re.match(raw)
     return m.group(2).strip() if m else raw
 
-def get_docx(outpath, data, template = "docx-template/example3.docx"):
+def get_docx_without_framework(outpath, data, template = "docx-template/example3.docx"):
     attribute = data["attribute"][-1]
     Doc_id = attribute["documentID"]
     Date = datetime.now().strftime("%Y/%m/%d")
     Version = f"{int(attribute['documentVersion']):.1f}"
-    Title = "製造條件指示書" if attribute["documentType"] == 0 else "製造式樣書"
     Doc_name = attribute["documentName"]
 
     itemType = attribute["attribute"].get("itemType")
@@ -1841,6 +1840,25 @@ def get_docx(outpath, data, template = "docx-template/example3.docx"):
 
     # Assuming 'example__.docx' exists in the execution environment
     fill_from_template(template, outpath, data, title_mapping, info_mapping) 
+
+def fix_image_id_clash(document):
+    """
+    修復 python-docx 插入圖片導致的 wp:docPr ID 衝突問題 (Issue #455)
+    這會將主要文件中的所有圖片/圖案 ID 加上 100000，避免與頁首/頁尾的 ID 衝突。
+    """
+    # 取得整份主要文件的 XML 根節點
+    doc_element = document._part._element
+    
+    # 找出所有圖片的屬性節點 (wp:docPr)
+    docPrs = doc_element.findall('.//' + qn('wp:docPr'))
+    
+    for docPr in docPrs:
+        # 取得目前的 ID，並加上 100000
+        current_id = int(docPr.get('id', '0'))
+        new_id = current_id + 100000
+        
+        # 重新寫回 XML 中
+        docPr.set('id', str(new_id))
 
 # ----------------- Example usage -----------------
 if __name__ == "__main__":

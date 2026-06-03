@@ -27,11 +27,9 @@ def call_external_api(cmd: int, data: dict):
         "InMessage_Json": json.dumps(data)
     }
 
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded"
-    }
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
 
-    target_url = "http://ksrv-web-ap3.flexium.local/gxfirstOIS/gxfirstOIS.asmx/GetOISData"
+    target_url = "http://ksrv-web-ap3.flexium.local/gxfirstOIS_Test/gxfirstOIS.asmx/GetOISData"
 
     try:
         # 使用 data= 表示用 form-urlencoded 格式傳送

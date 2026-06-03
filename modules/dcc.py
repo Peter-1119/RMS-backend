@@ -7,7 +7,7 @@ from oracle_db import ora_cursor
 
 bp = Blueprint("dcc", __name__)
 
-base_condition = {"form": "^FM-", "doc": "^W[WM]"}
+base_condition = {"form": "^FM-", "document": "^W[WMQ]", "qua": "^WQ"}
 @bp.get("/docs")
 def search_docs():
     document_type = request.args.get("documentType")
@@ -15,6 +15,12 @@ def search_docs():
     page = int(request.args.get("page", 1))
     pageSize = int(request.args.get("pageSize", 10))
     getPages = request.args.get("getPages", "false").lower() == "true"
+
+    print(f"document_type: {document_type}")
+    print(f"keyword: {document_type}")
+    print(f"page: {page}")
+    print(f"pageSize: {pageSize}")
+    print(f"getPages: {getPages}")
 
     if document_type is None:
         return jsonify({"success": False, "error": "Please input document type you want to search"}), 400

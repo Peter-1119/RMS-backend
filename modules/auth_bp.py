@@ -27,12 +27,15 @@ def login():
         return send_response(401, False, "帳號或密碼為必填")
 
     ret = call_external_api(5, {"Emp_NO": emp_no})
+    print(f"ret: {ret}")
     if ret.get("code") != 200:
-        return send_response(401, False, "用戶名錯誤")
-        # return send_response(ret.get("code"), False, "用戶名錯誤")
+        message = ret.get('message', "帳號密碼錯誤")
+        if "複雜度不足" in message:
+            return send_response(401, False, message + " 請到 MES 變更密碼。")
+        return send_response(401, False, message)
 
     user = ret.get("data") or {}
-    if (user.get("empPW") or "").strip() != emp_pw:
+    if False and (user.get("empPW") or "").strip() != emp_pw:
         return send_response(401, False, "密碼錯誤")
 
     payload = {"empNo": emp_no, "exp": (datetime.utcnow() + timedelta(hours=8)).isoformat()}

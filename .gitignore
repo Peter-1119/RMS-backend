@@ -12,6 +12,8 @@ outdate/
 _captures/
 docxTemp
 data_store.py
+test*
+backup/
 
 
 # IDE / OS
@@ -23,3 +25,9 @@ Thumbs.db
 # Uploads / generated files
 uploads/**
 !uploads/.keep
+
+docs-design/
+uploads/
+
+migrate_sfdb4070_to_sfdb.py
+_diag_migrate_block.py

@@ -26,5 +26,10 @@ if __name__ == "__main__":
     #     worker.start()
     #     print(f"[main] sync_eip worker started (pid={worker.pid})")
 
+    worker = Process(target=sync_loop, kwargs={"interval_seconds": 1200})
+    worker.daemon = True  # 👈 daemon: 主程式結束時自動跟著關掉
+    worker.start()
+    print(f"[main] sync_eip worker started (pid={worker.pid})")
+
     # 啟動 Flask dev server
     app.run("0.0.0.0", 2150, debug=True)

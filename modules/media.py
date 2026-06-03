@@ -1,7 +1,7 @@
 # media.py
 from flask import Blueprint, request, jsonify, send_from_directory
 from werkzeug.utils import secure_filename
-import os, tempfile, uuid, subprocess, platform
+import os, tempfile, uuid, subprocess, platform, mimetypes
 from datetime import datetime
 from config import UPLOAD_ROOT_DIR, ALLOWED_EXTS, DRAWIO_CLI_PATH
 from db import db
@@ -31,6 +31,13 @@ def upload_image():
     token = (request.args.get("token") or "").strip()
     original = secure_filename(f.filename)
     ext = '.' + original.rsplit('.', 1)[1].lower() if '.' in original else ''
+
+    if ext == '':
+        ext = mimetypes.guess_extension(f.mimetype) or ''
+        # 防呆：將常見的舊格式 .jpe 自動轉為標準的 .jpg
+        if ext == '.jpe':
+            ext = '.jpg'
+
     subdir = os.path.join(UPLOAD_ROOT_DIR, 'temp', datetime.now().strftime('%Y/%m/%d'))
     os.makedirs(subdir, exist_ok=True)
 

@@ -11,10 +11,12 @@ from docx.enum.table import WD_ALIGN_VERTICAL
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 
+from modules.block_tree import format_node_number  # 階層編號（spec §5）
+
 COLOR_DICT = {
     "red": RGBColor(255, 0, 0),
     "blue": RGBColor(0, 0, 255),
-    "black": RGBColor(0, 0, 0),
+    'black': RGBColor(0, 0, 0),
     "#000": RGBColor(0, 0, 0),
     "#000000": RGBColor(0, 0, 0),
     "#ff0000": RGBColor(255, 0, 0),
@@ -27,7 +29,7 @@ class DOCUMENT_TYPE(Enum):
 
 class DOCUMENT_STEP(Enum):
     ManufacturingDocument = [
-        {"目的": {"parent": "attribute", "code": "documentPurpose"}},
+        {"目的": {"parent": "attribute", "code": "purpose"}},
         {"製造流程": {"parent": "content", "code": 0}},
         {"管理條件": {"parent": "content", "code": 1}},
         {"製造條件參數一覽表": {"parent": "content", "code": 2}},
@@ -373,18 +375,54 @@ def apply_default_fonts(doc, latin="Arial", east_asia="標楷體"):
         if s in doc.styles:
             set_style_fonts(doc.styles[s], latin, east_asia)
 
-def update_p(p, mapping):
+def style_json_runs(style_json):
+    """攤平 tiptap style_json（{type:doc, content:[paragraph...]}）→ [(text, RGBColor)]。
+    只取顏色 mark（沿用 COLOR_DICT）；跨段落串接成單行（header / 目的用）。非 dict / 無文字 → []。"""
+    out = []
+    if not isinstance(style_json, dict):
+        return out
+    for block in style_json.get("content") or []:
+        for item in (block.get("content") or []):
+            if item.get("type") == "text" and item.get("text"):
+                color = COLOR_DICT["#000"]
+                for m in (item.get("marks") or []):
+                    ck = (m.get("attrs") or {}).get("color")
+                    if ck in COLOR_DICT:
+                        color = COLOR_DICT[ck]
+                out.append((item["text"], color))
+    return out
+
+def fill_paragraph_styled(p, style_json):
+    """把佔位段落（如 header 的 DOC_NAME/PROJECT）換成 style_json 的彩色 runs（只加顏色、沿用原字級）。
+    有實際文字 → 渲染並回 True；無 → 不動回 False（呼叫端 fallback 純文字）。"""
+    parts = style_json_runs(style_json)
+    if not parts:
+        return False
+    size = p.runs[0].font.size if (p.runs and p.runs[0].font.size) else None
+    for r in p.runs:
+        r.text = ""
+    for text, color in parts:
+        for run in set_table_run_text(p, text, color):
+            if size:
+                run.font.size = size
+    return True
+
+def update_p(p, mapping, styled_mapping=None):
     if len(p.runs) == 0:
         return
-    
+
     full_text = "".join([pr.text for pr in p.runs])
 
     if mapping.get(full_text) == None:
         return
-    
+
     if ("POINT" in full_text) or ("REASON" in full_text) or ("DOC_NAME" in full_text) or ("PROJECT" in full_text) or ("ITEM_TYPE" in full_text) or ("STYLE_NO" in full_text):
         p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        
+
+    # 彩色覆寫：DOC_NAME / PROJECT 帶 form_attribute style_json 時，注入彩色 runs（無文字則 fallback 純文字）
+    if styled_mapping and styled_mapping.get(full_text) and fill_paragraph_styled(p, styled_mapping[full_text]):
+        return
+
     for r in p.runs:
         r.text = ""
 
@@ -397,12 +435,12 @@ def replace_in_footer(footer, title_mapping):
             for p in cell.paragraphs:
                 update_p(p, title_mapping)
 
-def replace_in_header(header, title_mapping):
+def replace_in_header(header, title_mapping, styled_mapping=None):
     for row in header.tables[0].rows:
         for cell in row.cells:
             for p in cell.paragraphs:
                 is_title_paragraph = "TITLE" in p.text
-                update_p(p, title_mapping)
+                update_p(p, title_mapping, styled_mapping)
                 if is_title_paragraph:
                     p.alignment = WD_ALIGN_PARAGRAPH.DISTRIBUTE
 
@@ -434,7 +472,10 @@ def set_run_node_text_font_style(run_node, color = COLOR_DICT['black']):
     rFonts.set(qn("w:ascii"), "Arial")
     rFonts.set(qn("w:hAnsi"), "Arial")
     rFonts.set(qn("w:eastAsia"), "標楷體")
-    run_node.font.color.rgb = color
+
+    if (COLOR_DICT['black'] != color):
+        run_node.font.color.rgb = color
+        run_node.underline = True
 
 def set_table_run_text(p_node, text, color = COLOR_DICT['#000']):
     runs = []
@@ -641,9 +682,7 @@ def _fill_docx_cell_from_tiptap(docx_cell, cell_data, COLOR_DICT, center = True)
                 src = text_item["attrs"]["src"]
                 run = p.add_run()
                 
-                # --- 1. 計算 Cell 的最大容許寬度 ---
-                # 取得 cell 的寬度，如果有明確設定就扣除 0.5cm 邊距
-                # 若為 None (Word 自動排版)，則給予一個合理的最大限制 (例如 4 公分)
+                # --- 共用的圖片寬度計算邏輯 ---
                 cell_w = getattr(docx_cell, "width", None)
                 cell_max_width_cm = (cell_w.cm - 0.5) if (cell_w and cell_w.cm) else 4.0
                 cell_max_width_cm = max(cell_max_width_cm, 0.5) # 防呆，避免變成負數
@@ -684,26 +723,15 @@ def _fill_docx_cell_from_tiptap(docx_cell, cell_data, COLOR_DICT, center = True)
                     # 寫入 Word
                     run.add_picture(image_stream, width=Cm(final_width_cm))
 
-                # elif src.startswith('data:image'):
-                #     # 處理 Base64 圖片
-                #     base64_data = src.split(",", 1)[-1]
-                #     image_bytes = base64.b64decode(base64_data)
-                #     image_stream = io.BytesIO(image_bytes)
-                    
-                #     # ★ 關鍵：在這裡也塞入 width=img_width，Word 會自動等比例縮放高度
-                #     run.add_picture(image_stream, width=img_width)
-
 
 def create_docx_table(cell, json_table_data):
     rows_data = [row for row in json_table_data.get("content", []) if row.get("type") == "tableRow"]
     if not rows_data:
-        print("skip cause rows_data")
         return
 
     # Build list of header cells JSON (row 0)
     row0_cells_json = [c for c in rows_data[0].get("content", []) if c.get("type") in ["customTableCell", "tableCell", "tableHeader"]]
     if not row0_cells_json:
-        print("skip cause row0_cells_json")
         return
 
     # Get header texts (full list, including extra headers like 項次/槽體/說明 etc.)
@@ -762,13 +790,13 @@ def create_docx_table(cell, json_table_data):
             last = table.cell(r + rowspan - 1, c + colspan - 1)
             first.merge(last)
 
-        # # 🚀 7) 禁止表格列 (Row) 跨頁斷行
-        # for row in table.rows:
-        #     trPr = row._tr.get_or_add_trPr()
-        #     if trPr.find(qn('w:cantSplit')) is None:
-        #         cantSplit = OxmlElement('w:cantSplit')
-        #         cantSplit.set(qn('w:val'), 'true')
-        #         trPr.append(cantSplit)
+        # 🚀 7) 禁止表格列 (Row) 跨頁斷行
+        for row in table.rows:
+            trPr = row._tr.get_or_add_trPr()
+            if trPr.find(qn('w:cantSplit')) is None:
+                cantSplit = OxmlElement('w:cantSplit')
+                cantSplit.set(qn('w:val'), 'true')
+                trPr.append(cantSplit)
 
         return
 
@@ -777,6 +805,10 @@ def create_docx_table(cell, json_table_data):
     insert_at = min(pos.values())
     # The set of indices to remove (the five spec headers)
     spec_idx_set = set(pos[h] for h in SPEC_HDRS)
+
+    # 若 header 含「定值項目」，連同此欄一併略過 (column 數會少 1)
+    if "定值項目" in headers:
+        spec_idx_set.add(headers.index("定值項目"))
 
     # Build new header sequence: copy original headers left->right, but when we hit insert_at, insert ["規格值","操作值"] once and skip all five spec columns.
     new_header_titles = []
@@ -795,7 +827,7 @@ def create_docx_table(cell, json_table_data):
         else:
             col_map.append(("COPY", index, len(new_header_titles)))
             new_header_titles.append(header)
-    
+
     # If insert_at > len(headers) (theoretically impossible), guard
     if not new_header_titles:
         # fallback to original render if something odd happened
@@ -803,7 +835,8 @@ def create_docx_table(cell, json_table_data):
 
     # Create the new docx table with computed column count
     table = cell.add_table(rows=0, cols=len(new_header_titles))
-    table.width = cell.width.cm - Cm(1)
+    # table.width = cell.width.cm - Cm(1)
+    table.width = cell.sections[-1].page_width - Cm(1)
     table.style = 'Table Grid'
 
     # Write new header row
@@ -962,15 +995,31 @@ def prevent_table_break(table):
             for paragraph in cell.paragraphs:
                 paragraph.paragraph_format.keep_with_next = True
 
-def create_parameter_table(cell, condition_content, parameter_content, info):
-    # if (condition_content == None or len(condition_content) == 0) and (parameter_content == None or len(parameter_content) == 0):
-    #     return
+def keep_table_on_one_page(table, keep_final_row = False):
+    # 1. 確保單一儲存格內的文字不會被切兩半
+    for row in table.rows:
+        row.allow_row_break_across_pages = False
+        
+    # 2. 將「除了最後一列以外」的所有段落，設定與下段同頁
+    # 這樣 Word 就會盡全力把整個表格包在同一頁
+    for row in table.rows[:-1]:
+        for cell in row.cells:
+            for p in cell.paragraphs:
+                p.paragraph_format.keep_with_next = True
+                
+    # 3. 確保最後一列「沒有」被設定與下段同頁，讓 Word 可以在表格後方自然換頁
+    for cell in table.rows[-1].cells:
+        for p in cell.paragraphs:
+            p.paragraph_format.keep_with_next = keep_final_row
+
+def create_parameter_table(doc, condition_content, parameter_content, info):
+    if (condition_content == None or len(condition_content) == 0) and (parameter_content == None or len(parameter_content) == 0):
+        return
     
     # print(f"condition_content: {condition_content}")
     # print(f"prarmeter_content: {parameter_content}")
-    # print(f"info: {info}")
     
-    programCode = '、'.join([p["programCode"] for p in info['programs']]) if len(info['programs']) > 0 else "NA"
+    programCode = '、'.join([p["programCode"] for p in info['programs']])
     machines_name = '、'.join([m['name'] for m in info['machines']])
     info_N_rows = 2 if info["step_type"] == 2 else 3
 
@@ -978,14 +1027,15 @@ def create_parameter_table(cell, condition_content, parameter_content, info):
     if condition_content != None and len(condition_content) != 0:
         tableNode = condition_content
         rows_data = [row for row in tableNode['content'][0]['content'] if row.get("type") == "tableRow"]
-        cols = len(rows_data[0]['content'])
+        cols = len(rows_data[0]['content']) - 1
 
-        table = cell.add_table(rows = info_N_rows + len(rows_data) + 1, cols = cols)
+        table = doc.add_table(rows = info_N_rows + len(rows_data) + 1, cols = cols)
         table.style = 'Table Grid'
         table.autofit = False
         table.allow_autofit = False
 
-        total_width = cell.width - Cm(0.2)
+        # total_width = cell.width - Cm(0.2)
+        total_width = doc.sections[-1].page_width - Cm(2)
 
         first_col_width = Inches(1)
         other_col_width = (total_width - first_col_width) // (cols - 1)
@@ -994,7 +1044,7 @@ def create_parameter_table(cell, condition_content, parameter_content, info):
         for row in table.rows:
             row.allow_row_break_across_pages = False
 
-        for c in range(len(table.columns)):
+        for c in range(cols):
             table.columns[c].width = first_col_width if c == 0 else other_col_width
             for table_cell in table.columns[c].cells:
                 table_cell.width = first_col_width if c == 0 else other_col_width
@@ -1009,68 +1059,76 @@ def create_parameter_table(cell, condition_content, parameter_content, info):
         table.cell(2, 0).merge(table.cell(2, cols - 1))
 
         for rowIndex, row_data in enumerate(rows_data):
-            for colIndex, col_data in enumerate(row_data['content']):
+            for colIndex, col_data in enumerate(row_data['content'][1:]):
                 _fill_docx_cell_from_tiptap(table.cell(rowIndex + 3, colIndex), col_data, COLOR_DICT)
 
-        prevent_table_break(table)
+        # prevent_table_break(table)
+        keep_table_on_one_page(table, True)
 
     write_info = (table == None)
-    # if parameter_content != None and len(parameter_content) != 0:
-    tableNode = parameter_content
-    rows_data = [row for row in tableNode['content'][0]['content'] if row.get("type") == "tableRow"] if parameter_content != None else []
-    cols = len(rows_data[0]['content']) - 2 if parameter_content != None else 2
-
-    if condition_content != None and len(condition_content) != 0:
-        p_to_remove = cell.paragraphs[-1]._element  
-        p_to_remove.getparent().remove(p_to_remove)
-    
-    table = cell.add_table(rows = info_N_rows + max(1, len(rows_data)) + 1 if write_info else len(rows_data) + 1, cols = cols)
-    table.style = 'Table Grid'
-    table.autofit = False
-    table.allow_autofit = False
-
-    total_width = cell.width - Cm(0.2)
-
-    first_col_width = Inches(1)
-    other_col_width = (total_width - first_col_width) // (cols - 1)
-    first_col_width = int(total_width - (other_col_width * (cols - 1)))
-
-    for row in table.rows:
-        row.allow_row_break_across_pages = False
-
-    for c in range(len(table.columns)):
-        table.columns[c].width = first_col_width if c == 0 else other_col_width
-        for table_cell in table.columns[c].cells:
-            table_cell.width = first_col_width if c == 0 else other_col_width
-
-    if write_info:
-        set_docx_table_cell_text(table.cell(0, 0), "程式代碼", center = True)
-        table.cell(0, 1).merge(table.cell(0, cols - 1))
-        set_docx_table_cell_text(table.cell(0, 1), programCode)
-        set_docx_table_cell_text(table.cell(1, 0), "機台名稱", center = True)
-        table.cell(1, 1).merge(table.cell(1, cols - 1))
-        set_docx_table_cell_text(table.cell(1, 1), machines_name)
-        if info["step_type"] == 5:
-            set_docx_table_cell_text(table.cell(2, 0), "流程順序", center = True)
-            table.cell(2, 1).merge(table.cell(2, cols - 1))
-            set_docx_table_cell_text(table.cell(2, 1), "、".join([f"第{order}次" for order in info["processOrder"]]))
-
-    if info["step_type"] == 2:
-        set_docx_table_cell_text(table.cell(2 if write_info else 0, 0), "製造參數", center = True)
-        table.cell(2 if write_info else 0, 0).merge(table.cell(2 if write_info else 0, cols - 1))
-    else:
-        set_docx_table_cell_text(table.cell(3 if write_info else 0, 0), "製造參數", center = True)
-        table.cell(3 if write_info else 0, 0).merge(table.cell(3 if write_info else 0, cols - 1))
-
     if parameter_content != None and len(parameter_content) != 0:
+        tableNode = parameter_content
+        rows_data = [row for row in tableNode['content'][0]['content'] if row.get("type") == "tableRow"]
+        # 若 header 含「定值項目」該欄將被略過 → cols 需多 -1
+        _hdr_preview = _header_texts(rows_data[0]['content'])
+        _has_fixed_value = "定值項目" in _hdr_preview
+        cols = len(rows_data[0]['content']) - 2 - (1 if _has_fixed_value else 0)
+
+        if condition_content != None and len(condition_content) != 0:
+            p_to_remove = doc.paragraphs[-1]._element
+            p_to_remove.getparent().remove(p_to_remove)
+        
+        table = doc.add_table(rows = info_N_rows + len(rows_data) + 1 if write_info else len(rows_data) + 1, cols = cols)
+        table.style = 'Table Grid'
+        table.autofit = False
+        table.allow_autofit = False
+
+        # total_width = cell.width - Cm(0.2)
+        total_width = doc.sections[-1].page_width - Cm(2)
+
+        first_col_width = Inches(1)
+        other_col_width = (total_width - first_col_width) // (cols - 1)
+        first_col_width = int(total_width - (other_col_width * (cols - 1)))
+
+        for row in table.rows:
+            row.allow_row_break_across_pages = False
+
+        for c in range(len(table.columns)):
+            table.columns[c].width = first_col_width if c == 0 else other_col_width
+            for table_cell in table.columns[c].cells:
+                table_cell.width = first_col_width if c == 0 else other_col_width
+
+        if write_info:
+            set_docx_table_cell_text(table.cell(0, 0), "程式代碼", center = True)
+            table.cell(0, 1).merge(table.cell(0, cols - 1))
+            set_docx_table_cell_text(table.cell(0, 1), programCode)
+            set_docx_table_cell_text(table.cell(1, 0), "機台名稱", center = True)
+            table.cell(1, 1).merge(table.cell(1, cols - 1))
+            set_docx_table_cell_text(table.cell(1, 1), machines_name)
+            if info["step_type"] == 5:
+                set_docx_table_cell_text(table.cell(2, 0), "流程順序", center = True)
+                table.cell(2, 1).merge(table.cell(2, cols - 1))
+                set_docx_table_cell_text(table.cell(2, 1), "、".join([f"第{order}次" for order in info["processOrder"]]))
+
+        if info["step_type"] == 2:
+            set_docx_table_cell_text(table.cell(2 if write_info else 0, 0), "製造參數", center = True)
+            table.cell(2 if write_info else 0, 0).merge(table.cell(2 if write_info else 0, cols - 1))
+        else:
+            set_docx_table_cell_text(table.cell(3 if write_info else 0, 0), "製造參數", center = True)
+            table.cell(3 if write_info else 0, 0).merge(table.cell(3 if write_info else 0, cols - 1))
+
         headers = _header_texts(rows_data[0]['content'])
         pos = _find_spec_header_indices(headers)
 
-            # ---------- SPEC TABLE TRANSFORMATION ----------
+         # ---------- SPEC TABLE TRANSFORMATION ----------
         # Determine insertion position = the smallest index among the five headers
         insert_at = min(pos.values())
         # The set of indices to remove (the five spec headers)
         spec_idx_set = set(pos[h] for h in SPEC_HDRS)
+
+        # 若 header 含「定值項目」，連同此欄一併略過 (column 數會少 1)
+        if "定值項目" in headers:
+            spec_idx_set.add(headers.index("定值項目"))
 
         # Build new header sequence: copy original headers left->right, but when we hit insert_at, insert ["規格值","操作值"] once and skip all five spec columns.
         new_header_titles = []
@@ -1191,15 +1249,15 @@ def create_parameter_table(cell, condition_content, parameter_content, info):
             B = table.cell(rowIndex, SlotColIndex)
             A.merge(B)
             
-        prevent_table_break(table)
-
+        # prevent_table_break(table)
+        keep_table_on_one_page(table)
+    
     elif info["step_type"] == 2:
         set_docx_table_cell_text(table.cell(3 if write_info else 0, 0), "請依照「3. 管理條件」進行製造參數設定與確認。", center = True)
         table.cell(3 if write_info else 0, 0).merge(table.cell(3 if write_info else 0, cols - 1))
     elif info["step_type"] == 5:
         set_docx_table_cell_text(table.cell(4 if write_info else 0, 0), "請依照「2. 製作條件規範」進行製造參數設定與確認。", center = True)
         table.cell(4 if write_info else 0, 0).merge(table.cell(4 if write_info else 0, cols - 1))
-
 
 def set_cell_border(cell, **kwargs):
     """
@@ -1245,28 +1303,29 @@ def set_cell_border(cell, **kwargs):
 
 def create_process_table(cell, content_data):
     if content_data.get('files') != None and len(content_data.get('files')) > 0:
-        width = cell.width.cm
+        # width = cell.width.cm
+        width_cm = cell.sections[-1].page_width.cm
         src = content_data['files'][0]['path']
         p = cell.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         run = p.add_run()
-        run.add_picture(f'uploads/{src}', width = Cm(width - 1))
+        run.add_picture(f'uploads/{src}', width = Cm(width_cm - 3))
         return
         
-    if type(content_data.get('jsonContent')) != dict or content_data['jsonContent'].get('content') == None or len(content_data['jsonContent']['content']) == 0:
-        # p_attr = cell.add_paragraph("NA")
-        # p_attr.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        # p_attr.runs[0].font.size = Pt(12)
-        # p_attr.paragraph_format.left_indent = p_attr.runs[0].font.size * 2
-        # set_run_node_text_font_style(p_attr.runs[0])
+    if type(content_data.get('table_json')) != dict or content_data['table_json'].get('content') == None or len(content_data['table_json']['content']) == 0:
+        p_attr = cell.add_paragraph("NA")
+        p_attr.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        p_attr.runs[0].font.size = Pt(12)
+        p_attr.paragraph_format.left_indent = p_attr.runs[0].font.size * 2
+        set_run_node_text_font_style(p_attr.runs[0])
         return 
     
-    tableNode = content_data['jsonContent']['content'][0]
+    tableNode = content_data['table_json']['content'][0]
     rows_data = [row for row in tableNode['content'] if row.get("type") == "tableRow"]
     if not rows_data:
         return []
     table = cell.add_table(rows=len(rows_data), cols=len(rows_data[0]['content']))
-    table.width = cell.width.cm - Cm(1)
+    table.width = cell.sections[-1].page_width - Cm(1)
     table.style = 'Table Grid'
 
     for r, row_data in enumerate(rows_data):
@@ -1276,45 +1335,25 @@ def create_process_table(cell, content_data):
             if cell_data['content'][0].get('content') == None:
                 set_cell_border(table.cell(r, c), left = {"val": "nil"}, top = {"val": "nil"}, right = {"val": "nil"}, bottom = {"val": "nil"})
 
-    # p_to_remove = cell.paragraphs[-1]._element  
-    # p_to_remove.getparent().remove(p_to_remove)
-
-    # table2 = cell.add_table(rows=len(rows_data), cols=len(rows_data[0]['content']) - 1)
-    # table2.width = cell.width.cm - Cm(1)
-    # table2.style = 'Table Grid'
-
-    # for r, row_data in enumerate(rows_data):
-    #     for c, cell_data in enumerate(row_data['content']):
-    #         if c == 9:
-    #             continue
-    #         _fill_docx_cell_from_tiptap(table2.rows[r].cells[c], cell_data, COLOR_DICT)
-
-    #         if cell_data['content'][0].get('content') == None:
-    #             set_cell_border(table2.cell(r, c), left = {"val": "nil"}, top = {"val": "nil"}, right = {"val": "nil"}, bottom = {"val": "nil"})
-
-def parse_json_content(parent_object, json_data, indent = None, header = False, no = None, tier=1):
+def parse_json_content(parent_object, json_data, indent = None, header = False, no = None, tier = 1, keep_with_next = False):
     """
-    Recursively parses the JSON content (jsonHeader/jsonContent) and adds elements 
+    Recursively parses the JSON content (header_json/content_json) and adds elements 
     (paragraphs, list items) to the parent object (docx.table._Cell).
     Applies tier-based indentation.
     """
     if json_data is None or json_data.get("content") is None:
         return
 
-    base_indent = Pt(12)
+    base_indent = Cm(0.7) 
 
     for block in json_data["content"]:
         block_type = block.get("type")
         
-        # Use the 'tier' from the content object, or the current recursion tier.
-        content_tier = block.get("tier", tier) 
+        # Use the 'tier_no' from the content object, or the current recursion tier.
+        content_tier = block.get("tier_no", tier) 
 
         if block_type == "paragraph" or block_type == "listItem":
-            # ★ 修正重點：如果目前容器只有一個預設空段落，就直接重複利用它
-            if hasattr(parent_object, 'paragraphs') and len(parent_object.paragraphs) == 1 and parent_object.paragraphs[0].text == "":
-                p = parent_object.paragraphs[0]
-            else:
-                p = parent_object.add_paragraph()
+            p = parent_object.add_paragraph()
             p.style = 'List Paragraph' if block_type == "listItem" else 'Normal'
 
             if header:
@@ -1406,90 +1445,104 @@ def parse_json_content(parent_object, json_data, indent = None, header = False, 
 
 
             p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            
-            # Apply tier-based indent. tier=1 means 1 level of content under step title.
-            # Indent factor is tier - 1. (Tier 1 gets indent factor 0, Tier 2 gets 1, etc.)
-            indent_factor = max(0, content_tier - 1) * 2
+            indent_factor = max(0, content_tier - 1)
             p.paragraph_format.left_indent = base_indent * indent_factor
-        
-        elif block_type == "table":
-            # For tables nested inside content structure (less common but handled)
-            create_docx_table(parent_object, block)
-            
-        # Recursive call for nested content
-        if 'content' in block and block.get("type") not in ["table", "tableRow", "tableCell", "tableHeader"]:
-            # Pass the current tier + 1 for deeper nesting
-            parse_json_content(parent_object, block, content_tier + 1)
+
+            if keep_with_next:
+                p.paragraph_format.keep_with_next = True
 
 
-def createHeader(cell, step_content_list):
-    """Adds header content (jsonHeader) for all items in the list to the cell."""
-    for content_obj in step_content_list:
-        no = f"{content_obj['step']}.{content_obj['tier']}" if content_obj['sub_no'] == 0 else f"{content_obj['step']}.{content_obj['tier']}.{content_obj['sub_no']}"
-        tier = 2 if content_obj.get("sub_no", 0) == 0 else 3
-        for item in content_obj.get("data", []):
-            if item.get("jsonHeader"):
-                # Headers are main headings, usually tier 1 (no base indent)
-                parse_json_content(cell, item["jsonHeader"], header = True, no = no, tier = tier) 
+def createHeader(cell, content_obj, no=None, depth=2):
+    """標題渲染：no 由 DFS 算好傳入；depth 控縮排。header_json 為空但有 no → 仍輸出編號（如 ct=2 PMS 3.1）。"""
+    if no is None:
+        no = ""
+    hj = content_obj.get("header_json")
+    if hj:
+        parse_json_content(cell, hj, header = True, no = no, tier = depth, keep_with_next = True)
+    elif no:
+        p = cell.add_paragraph()
+        # 指示書 step1 的 3.1 為固定標題「基本生產條件」（metadata.source=management）
+        src = (content_obj.get("metadata") or {}).get("source")
+        text = f"{no} 基本生產條件" if src == "management" else f"{no} "
+        runs = set_table_run_text(p, text)
+        for run in runs:
+            run.font.size = Pt(12)
+        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        p.paragraph_format.left_indent = Cm(0.7) * max(0, depth - 1)
+        p.paragraph_format.keep_with_next = True
 
-def createContent(cell, step_content_list):
-    """Adds main content (jsonContent) for all items in the list to the cell, applying tier-based indent."""
-    for content_obj in step_content_list:
-        tier = 3 if content_obj.get("sub_no", 0) == 0 else 4
-        for item in content_obj.get("data", []):
-            if item.get("jsonContent"):
-                # Pass the content's tier to enable indentation
-                parse_json_content(cell, item["jsonContent"], tier=tier)
+def createContent(cell, content_obj, depth=2):
+    """內文渲染：縮排隨 depth（2..8）遞增。"""
+    if content_obj.get("content_json"):
+        parse_json_content(cell, content_obj["content_json"], tier=depth)
 
-def createPictures(cell, step_content_list):
+def createPictures(cell, content_obj):
     """Adds picture placeholders/links (files) for all items in the list to the cell."""
-    width = cell.width.cm
-    base_indent = Cm(0.7)
-    for content_obj in step_content_list:
-        tier = content_obj.get("tier", 1)
-        indent_factor = max(0, tier - 1)
-        for item in content_obj.get("data", []):
-            if item.get("files"):
-                for file_info in item["files"]:
-                    # Cannot embed image, so use a placeholder text/link
-                    # p = cell.add_paragraph(f"圖片連結: {file_info.get('url', 'N/A')}")
-                    # p.runs[0].font.size = Pt(10)
-                    # p.paragraph_format.left_indent = base_indent * indent_factor
-                    if file_info.get("path_to_save") != None:
-                        p = cell.add_paragraph()
-                        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                        src = file_info["path_to_save"].split("/", 1)[-1]
-                        run = p.add_run()
-                        # run.add_picture(f'uploads/temp/{src}', width = Cm(width - 0.5))
-                        run.add_picture(f'uploads/temp/{src}', width = Cm(width - 1))
+    width_cm = cell.sections[-1].page_width.cm
+    if content_obj.get("files"):
+        for file_info in content_obj["files"]:
+            if file_info.get("path_to_save") != None:
+                p = cell.add_paragraph()
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                src = file_info["path_to_save"].split("/", 1)[-1]
+                run = p.add_run()
+                run.add_picture(f'uploads/temp/{src}', width = Cm(width_cm - 2))
 
-def createTable(cell, step_content_list, info = {}):
-    """Adds tables (jsonContent containing a table) for all items in the list to the cell."""
-    for content_obj in step_content_list:
-        for item in content_obj.get("data", []):
-            if item.get("jsonContent"):
-                # The JSON for table content is expected to be a single 'table' block inside 'content'
-                table_blocks = [b for b in item["jsonContent"].get("content", []) if b.get("type") == "table"]
-                for table_block in table_blocks:
-                    # Table is created directly in the cell, as requested, to avoid left indent.
-                    create_docx_table(cell, table_block)
+def createTable(cell, content_obj):
+    """Adds tables (content_json containing a table) for all items in the list to the cell."""
+    if content_obj.get("table_json"):
+        # The JSON for table content is expected to be a single 'table' block inside 'content'
+        table_blocks = [b for b in content_obj["table_json"].get("content", []) if b.get("type") == "table"]
+        for table_block in table_blocks:
+            # Table is created directly in the cell, as requested, to avoid left indent.
+            create_docx_table(cell, table_block)
 
-        if info.get("step_type"):
-            # print(f"step: type: {info.get('step_type')}, content: {content_obj}")
-            create_parameter_table(cell, content_obj.get("jsonConditionContent", []), content_obj.get("jsonParameterContent", []), info)
+def _na_paragraph(cell, text="NA", indent_factor=2):
+    """加一行 NA / 提示文字段落。"""
+    p = cell.add_paragraph(text)
+    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    p.runs[0].font.size = Pt(12)
+    set_run_node_text_font_style(p.runs[0])
+    p.paragraph_format.left_indent = p.runs[0].font.size * indent_factor
+
+def _msg_paragraph(cell, text):
+    """加一行固定提示（如 isParamNA 的『請依照…』）。"""
+    p = cell.add_paragraph(text)
+    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    p.runs[0].font.size = Pt(12)
+    set_run_node_text_font_style(p.runs[0])
+    p.paragraph_format.left_indent = Cm(0.7) * 1
+
+def _render_node_dfs(cell, chapter, index_path, node):
+    """
+    一般階層節點 DFS 渲染（L2..L8，直接寫進 doc）。順序：標題 → 自身內容 → children（spec §19 F4）。
+    """
+    depth = 1 + len(index_path)
+    no = format_node_number(chapter, index_path)
+    option = node.get("content_type")
+
+    if option == 2:        # 標題 + 表格
+        createHeader(cell, node, no=no, depth=depth)
+        createTable(cell, node)
+        createContent(cell, node, depth=depth)
+    elif option == 1:      # 標題 + 文字 + 圖
+        createHeader(cell, node, no=no, depth=depth)
+        createContent(cell, node, depth=depth)
+        createPictures(cell, node)
+    else:                  # option 0 / 3：純標題
+        createHeader(cell, node, no=no, depth=depth)
+
+    for j, child in enumerate(node.get("children") or [], start=1):
+        _render_node_dfs(cell, chapter, index_path + [j], child)
 
 def draw_instruction_content(doc, data):
     attribute = data["attribute"][-1]
-    contents = data["content"]
+    content_tree = data["content"]   # build_tree 產出：[{step_type, children}]
+    tree_by_step = {int(s["step_type"]): (s.get("children") or []) for s in content_tree}
     references = data["reference"]
 
-    documentType = attribute["documentType"]
-    cell = doc.tables[1].rows[0].cells[0]
-    
-    # Ensure a paragraph exists to start or continue content in the cell
-    if not cell.paragraphs or cell.paragraphs[0].text:
-         cell.add_paragraph()
-    cell.paragraphs[0].style = doc.styles["Normal"]
+    documentType = attribute["document_type"]
+    cell = doc
 
     # Get document chapters from definition
     for (stepIndex, itemInfo) in enumerate(DOCUMENT_STEP[DOCUMENT_TYPE(documentType).name].value):
@@ -1498,185 +1551,109 @@ def draw_instruction_content(doc, data):
         # 1. Set the step title
         if stepIndex > 0:
             cell.add_paragraph()
-        p_title = cell.paragraphs[0] if stepIndex == 0 else cell.add_paragraph()
+        p_title = cell.paragraphs[-1] if stepIndex == 0 else cell.add_paragraph()
         p_title.text = f"{stepIndex + 1}.{step}"
         p_title.runs[0].font.size = Pt(12)
         set_run_node_text_font_style(p_title.runs[0])
         p_title.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        p_title.paragraph_format.keep_with_next = True
 
         # 2. Get current step content
         if stepInfo["parent"] == "attribute":
-            stepContent = attribute.get(stepInfo["code"])
-            if isinstance(stepContent, str):
-                stepContent = "NA" if len(stepContent) == 0 else stepContent
-                p_attr = cell.add_paragraph(stepContent)
-                p_attr.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                p_attr.runs[0].font.size = Pt(12)
-                set_run_node_text_font_style(p_attr.runs[0])
-                p_attr.paragraph_format.left_indent = p_attr.runs[0].font.size * 2
+            # 目的：優先用 form_attribute 的 style_json（tiptap 彩色）；沒有實際文字 → fallback 純文字
+            form_attr = data.get("form_attribute") or {}
+            purpose_style = form_attr.get("purpose")   # form_attribute key 固定為 "purpose"（指示書/式樣書皆同）
+            if style_json_runs(purpose_style):
+                p0 = len(cell.paragraphs)
+                parse_json_content(cell, purpose_style)
+                for p_attr in cell.paragraphs[p0:]:
+                    p_attr.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                    p_attr.paragraph_format.left_indent = Pt(12) * 2
+            else:
+                stepContent = attribute.get(stepInfo["code"])
+                if isinstance(stepContent, str):
+                    stepContent = "NA" if len(stepContent) == 0 else stepContent
+                    p_attr = cell.add_paragraph(stepContent)
+                    p_attr.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                    p_attr.runs[0].font.size = Pt(12)
+                    set_run_node_text_font_style(p_attr.runs[0])
+                    p_attr.paragraph_format.left_indent = p_attr.runs[0].font.size * 2
         
         elif stepInfo["parent"] == "content":
-            # Filter content items for the current step_type
-            step_content_list = [content for content in contents if content["step_type"] == stepInfo["code"]]
+            # 新階層：依 step_type 取子樹（build_tree 產出），分流渲染
+            chapter = stepIndex + 1
+            step_type = stepInfo["code"]
+            children = tree_by_step.get(step_type, [])
+            attr = attribute["attribute"]
 
-            # Fill note for no content manufacture block
-            if not step_content_list and stepInfo["code"] == 5 and attribute["attribute"].get("isParamNA", False):
-                stepContent = "請依照「2. 製作條件規範」進行製造參數設定與確認"
-                p_attr = cell.add_paragraph(stepContent)
-                p_attr.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                p_attr.runs[0].font.size = Pt(12)
-                set_run_node_text_font_style(p_attr.runs[0])
-                p_attr.paragraph_format.left_indent = p_attr.runs[0].font.size * 2
+            # --- 製造流程圖 (step 0) ---
+            if step_type == 0:
+                if not children:
+                    _na_paragraph(cell)
+                else:
+                    for i, node in enumerate(children, start=1):
+                        createHeader(cell, node, no=format_node_number(chapter, [i]), depth=2)
+                        create_process_table(cell, node)
                 continue
 
-            # Fill note for no content manufacture block
-            if not step_content_list and stepInfo["code"] == 2 and attribute["attribute"].get("isParamNA", False):
-                stepContent = "請依照「3. 管理條件」進行製造參數設定與確認"
-                p_attr = cell.add_paragraph(stepContent)
-                p_attr.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                p_attr.runs[0].font.size = Pt(12)
-                set_run_node_text_font_style(p_attr.runs[0])
-                p_attr.paragraph_format.left_indent = p_attr.runs[0].font.size * 2
-                continue
-
-            if not step_content_list and stepInfo["code"] == 0:
-                print("skip process flow")
-                continue
-
-            # Fill NA text for no content step
-            if not step_content_list:
-                print("fill process flow ", stepInfo["code"])
-                stepContent = "NA" if len(step_content_list) == 0 else stepContent
-                p_attr = cell.add_paragraph(stepContent)
-                p_attr.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                p_attr.runs[0].font.size = Pt(12)
-                set_run_node_text_font_style(p_attr.runs[0])
-                p_attr.paragraph_format.left_indent = p_attr.runs[0].font.size * 2
-                continue
-
-            # Process all data items across all matching step content objects
-            for content_index, content_obj in enumerate(step_content_list):
-                if content_obj["step_type"] == 2 or content_obj["step_type"] == 5:
-                    machines, processOrder = [], None
-                    if content_obj["step_type"] == 2:
-                        machines_name = attribute["attribute"]["inputMachines"].split(",")
-                        machines_code = attribute["attribute"]["machines"]
-                        machines = [{"code": code, "name": name} for code, name in zip(machines_code, machines_name)]
-                        # createTable(cell, [content_obj], {"step_type": content_obj["step_type"], "programs": content_obj["metadata"]['programs'], "machines": machines, "processOrder": processOrder})
-                    elif content_obj["step_type"] == 5:
-                        machines_name = content_obj['metadata']['machines_name']
-                        machines_code = content_obj['metadata']['machines']
-                        machines = [{"code": code, "name": name} for code, name in zip(machines_code, machines_name)]
-                        processOrder = content_obj['metadata']['processOrder']
-                        # if attribute["attribute"]["isParamNA"] == False:
-                            # createTable(cell, [content_obj], {"step_type": content_obj["step_type"], "programs": content_obj["metadata"]['programs'], "machines": machines, "processOrder": processOrder})
-                    
-                    createTable(cell, [content_obj], {"step_type": content_obj["step_type"], "programs": content_obj["metadata"]['programs'], "machines": machines, "processOrder": processOrder})
-
-                if content_obj["step_type"] == 0:
-                    print("process processFlow block")
-                    item_for_helper = {"data": content_obj.get("data", []), "step": stepIndex + 1, "tier": content_obj.get("tier", 1), "sub_no": 0}
-                    createHeader(cell, [item_for_helper]) 
-                    create_process_table(cell, content_obj['data'][0])
+            # --- 指示書 製造條件參數一覽表 (step 2)：多個 ct=4 兄弟節點 ---
+            if step_type == 2:
+                if not children or attr.get("isParamNA", False):
+                    _msg_paragraph(cell, "請依照「3. 管理條件」進行製造參數設定與確認")
                     continue
-                
-                if content_index == 0 and content_obj.get('step_type') == 1 and content_obj.get('tier') != 1:
-                    stepContent = "3.1 生產管理條件"
-                    p_attr = cell.add_paragraph(stepContent)
-                    p_attr.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                    p_attr.runs[0].font.size = Pt(12)
-                    set_run_node_text_font_style(p_attr.runs[0])
-                    p_attr.paragraph_format.left_indent = p_attr.runs[0].font.size * 2
+                machines_name = attr["inputMachines"].split(",")
+                machines_code = attr["machines"]
+                machines = [{"code": c, "name": n} for c, n in zip(machines_code, machines_name)]
+                for node in children:
+                    tj = node.get("table_json") or {}
+                    info = {"step_type": 2, "programs": (node.get("metadata") or {}).get("programs", []), "machines": machines, "processOrder": None}
+                    create_parameter_table(cell, tj.get("conditionTable"), tj.get("parameterTable"), info)
+                continue
 
-                    stepContent = "NA"
-                    p_attr = cell.add_paragraph(stepContent)
-                    p_attr.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                    p_attr.runs[0].font.size = Pt(12)
-                    set_run_node_text_font_style(p_attr.runs[0])
-                    p_attr.paragraph_format.left_indent = p_attr.runs[0].font.size * 4
-                   
-                if content_obj.get('step_type') == 1 and content_obj.get('tier') == 1:
-                    stepContent = "3.1 生產管理條件"
-                    p_attr = cell.add_paragraph(stepContent)
-                    p_attr.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                    p_attr.runs[0].font.size = Pt(12)
-                    set_run_node_text_font_style(p_attr.runs[0])
-                    p_attr.paragraph_format.left_indent = p_attr.runs[0].font.size * 2
-
-                    tiptap_content = content_obj["data"]
-                    content = "" if tiptap_content[0]['jsonHeader']['content'][0].get("content") == None else tiptap_content[0]['jsonHeader']['content'][0]["content"][0]['text']
-                    if len(content) > 0:
-                        p_attr = cell.add_paragraph(content)
-                        p_attr.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                        p_attr.runs[0].font.size = Pt(12)
-                        set_run_node_text_font_style(p_attr.runs[0])
-                        p_attr.paragraph_format.left_indent = p_attr.runs[0].font.size * 4
-                    item_for_helper = {"data": tiptap_content, "step": 3, "tier": content_obj.get("tier", 1), "sub_no": 0}
-                    createTable(cell, [item_for_helper]) 
+            # --- 式樣書 製造參數一覽表 (step 5)：單/多個 ct=4 節點 ---
+            if step_type == 5:
+                if not children:
+                    _na_paragraph(cell)
                     continue
+                for node in children:
+                    md = node.get("metadata") or {}
+                    if md.get("isParamNA", False):
+                        _msg_paragraph(cell, "請依照「2. 製作條件規範」進行製造參數設定與確認")
+                        continue
+                    machines_name = md.get("machines_name", [])
+                    machines_code = md.get("machines", [])
+                    machines = [{"code": c, "name": n} for c, n in zip(machines_code, machines_name)]
+                    tj = node.get("table_json") or {}
+                    info = {"step_type": 5, "programs": md.get("programs", []), "machines": machines, "processOrder": md.get("processOrder")}
+                    create_parameter_table(cell, None, tj.get("parameterTable"), info)
+                continue
 
-                for index, item_data in enumerate(content_obj.get("data", [])):
-                    option = item_data.get("option")
-                    
-                    # Wrap the single data item for consistent access by helpers
-                    item_for_helper = {"data": [item_data], "step": stepIndex + 1, "tier": content_obj.get("tier", 1), "sub_no": index}
+            # --- 一般階層 (step 1/3/4/6/7)：DFS L2..L8 ---
+            if not children:
+                _na_paragraph(cell)
+                continue
+            for i, node in enumerate(children, start=1):
+                _render_node_dfs(cell, chapter, [i], node)
 
-                    # for row in table.rows:
-                    #     trPr = row._tr.get_or_add_trPr()
-                    #     if trPr.find(qn('w:cantSplit')) is None:
-                    #         cantSplit = OxmlElement('w:cantSplit')
-                    #         cantSplit.set(qn('w:val'), 'true')
-                    #         trPr.append(cantSplit)
-                    
-                    if option == 2: # Header + Table
-                        # table = cell.add_table(rows = 1, cols = 1)
-                        # set_cell_border(table.rows[0].cells[0], left = {"val": "nil"}, top = {"val": "nil"}, right = {"val": "nil"}, bottom = {"val": "nil"})
-                        # trPr = table.rows[0]._tr.get_or_add_trPr()
-                        # if trPr.find(qn('w:cantSplit')) is None:
-                        #     cantSplit = OxmlElement('w:cantSplit')
-                        #     cantSplit.set(qn('w:val'), 'true')
-                        #     trPr.append(cantSplit)
-                        
-                        createHeader(cell, [item_for_helper]) 
-                        createTable(cell, [item_for_helper]) 
-                        # createHeader(table.rows[0].cells[0], [item_for_helper]) 
-                        # createTable(table.rows[0].cells[0], [item_for_helper]) 
-                    elif option == 1: # Header + Content + Pictures
-                        # table = cell.add_table(rows = 1, cols = 1)
-                        # set_cell_border(table.rows[0].cells[0], left = {"val": "nil"}, top = {"val": "nil"}, right = {"val": "nil"}, bottom = {"val": "nil"})
-                        # trPr = table.rows[0]._tr.get_or_add_trPr()
-                        # if trPr.find(qn('w:cantSplit')) is None:
-                        #     cantSplit = OxmlElement('w:cantSplit')
-                        #     cantSplit.set(qn('w:val'), 'true')
-                        #     trPr.append(cantSplit)
-                        createHeader(cell, [item_for_helper]) 
-                        createContent(cell, [item_for_helper]) 
-                        createPictures(cell, [item_for_helper]) 
-                        # createHeader(table.rows[0].cells[0], [item_for_helper]) 
-                        # createContent(table.rows[0].cells[0], [item_for_helper]) 
-                        # createPictures(table.rows[0].cells[0], [item_for_helper]) 
-                    elif option == 0 or option == 3: # Header only
-                        createHeader(cell, [item_for_helper])
-            
         elif stepInfo["parent"] == "reference":
             # Filter reference items for the current referenceType
-            stepContent = [reference for reference in references if reference["referenceType"] == stepInfo["code"]]
+            docs = [reference for reference in references if reference["refer_type"] == stepInfo["code"]]
+            print(f"docs: {docs}")
             
-            if stepContent:
+            if len(docs) > 0:
                 # Add a reference list with indentation
-                for index, ref in enumerate(stepContent):
-                    print(f"ref: {ref}")
+                for index, ref in enumerate(docs):
                     # For reference documents, use a simple numbered format
-                    ref_p = cell.add_paragraph(f"{stepIndex + 1}.{index + 1} {ref.get('referenceDocumentID', '')} - {ref.get('referenceDocumentName', '')}")
-                    ref_p.runs[0].font.size = Pt(12)
-                    ref_p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                    ref_p.paragraph_format.left_indent = ref_p.runs[0].font.size * 2
-                    ref_p.paragraph_format.space_after = Pt(3)
-                    set_run_node_text_font_style(ref_p.runs[0], COLOR_DICT[ref.get('color', 'black')])
+                    p_attr = cell.add_paragraph(f"{stepIndex + 1}.{index + 1} {ref.get('refer_document', '')} - {ref.get('refer_document_name', '')}")
+                    p_attr.runs[0].font.size = Pt(12)
+                    p_attr.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                    p_attr.paragraph_format.left_indent = p_attr.runs[0].font.size * 2
+                    p_attr.paragraph_format.space_after = Pt(3)
+                    set_run_node_text_font_style(p_attr.runs[0], COLOR_DICT[ref.get("color", 'black')])
 
             else:
-                stepContent = "NA" if len(stepContent) == 0 else stepContent
-                p_attr = cell.add_paragraph(stepContent)
+                docs = "NA" if len(docs) == 0 else docs
+                p_attr = cell.add_paragraph(docs)
                 p_attr.alignment = WD_ALIGN_PARAGRAPH.LEFT
                 p_attr.runs[0].font.size = Pt(12)
                 p_attr.paragraph_format.left_indent = p_attr.runs[0].font.size * 2
@@ -1699,7 +1676,7 @@ def generate_word_password_hash(password, spin_count=100000):
     for i in range(spin_count):
         # 迭代器必須是 4 bytes 的 Little-Endian 格式
         iterator = i.to_bytes(4, byteorder='little')
-        hash_calc = hashlib.sha512(iterator + hash_calc).digest()
+        hash_calc = hashlib.sha512(hash_calc + iterator).digest()
         
     # 5. 回傳 Base64 編碼後的字串
     salt_b64 = base64.b64encode(salt).decode('utf-8')
@@ -1741,18 +1718,19 @@ def enable_docx_protection(doc, password):
     # 寫入新標籤
     settings_element.append(protection)
 
-def fill_from_template(template_path, out_path, data, title_mapping, info_mapping):
+def fill_from_template(template_path, out_path, data, title_mapping, info_mapping, styled_mapping=None):
     doc = Document(template_path)
     apply_default_fonts(doc, latin="Arial", east_asia="標楷體")
 
     # 產生內容（影響頁數）
     draw_instruction_content(doc, data)
 
+
     # 先做原本的 header/footer 文字替換
     for index, section in enumerate(doc.sections):
         # 如果你的第一頁 header 也要做文字替換，可以另外處理：
         # replace_in_header(section.first_page_header, title_mapping)  # 視需求決定
-        replace_in_header(section.header, title_mapping)
+        replace_in_header(section.header, title_mapping, styled_mapping)
         replace_in_footer(section.footer, title_mapping)
         # print(f"index: {index}, section: {section.header}")
 
@@ -1764,7 +1742,9 @@ def fill_from_template(template_path, out_path, data, title_mapping, info_mappin
     # ★ 內容都產生完之後，再插入頁碼欄位
     setup_page_numbers(doc)
 
-    enable_docx_protection(doc, "123456")
+    enable_docx_protection(doc, "1q2w3e4R")
+
+    fix_image_id_clash(doc)
 
     doc.save(out_path)
 
@@ -1780,13 +1760,12 @@ def clean_process_name(raw: str) -> str:
     m = _code_prefix_re.match(raw)
     return m.group(2).strip() if m else raw
 
-def get_docx(outpath, data, template = "docx-template/example3.docx"):
+def get_docx_without_framework_(outpath, data, template = "docx-template/example3.docx"):
     attribute = data["attribute"][-1]
-    Doc_id = attribute["documentID"]
+    Doc_id = attribute["document_id"]
     Date = datetime.now().strftime("%Y/%m/%d")
-    Version = f"{int(attribute['documentVersion']):.1f}"
-    Title = "製造條件指示書" if attribute["documentType"] == 0 else "製造式樣書"
-    Doc_name = attribute["documentName"]
+    Version = f"{float(attribute['document_version']):.1f}"
+    Doc_name = attribute["document_name"]
 
     itemType = attribute["attribute"].get("itemType")
     styleNo = attribute["attribute"].get("styleNo")
@@ -1799,7 +1778,6 @@ def get_docx(outpath, data, template = "docx-template/example3.docx"):
         "DATE": Date,
         "REV": Version,
         "PAGE": "1",
-        # "TITLE": Title,
         "DOC_NAME": Doc_name,
         "PROJECT": "",
         "ITEM_TYPE": "",
@@ -1814,33 +1792,53 @@ def get_docx(outpath, data, template = "docx-template/example3.docx"):
     else:
         title_mapping["PROJECT"] = attribute["attribute"].get("applyProject", "")
 
+    # 指示書才用 form_attribute 的彩色 DOC_NAME / PROJECT（式樣書頁首只有純文字；目的另在 body 處理）
+    form_attr = data.get("form_attribute") or {}
+    styled_mapping = {}
+    if attribute.get("document_type", 0) == 0:
+        if style_json_runs(form_attr.get("document_name")):
+            styled_mapping["DOC_NAME"] = form_attr.get("document_name")
+        if style_json_runs(form_attr.get("applyProject")):
+            styled_mapping["PROJECT"] = form_attr.get("applyProject")
+
     info_mapping = {
-        "REV1": "", "DATE1": "", "REASON1": "", "POINT1": "", "DEPT1": "", "APPROVER1": "", "CONFIRMER1": "", "AUTHOR1": "",
+        "REV1": "", "DATE1": "", "REASON1": "", "POINT1": "", "DEPT1": attribute["department"], "APPROVER1": "", "CONFIRMER1": "", "AUTHOR1": attribute["author"],
         "REV2": "", "DATE2": "", "REASON2": "", "POINT2": "", "DEPT2": "", "APPROVER2": "", "CONFIRMER2": "", "AUTHOR2": "",
         "REV3": "", "DATE3": "", "REASON3": "", "POINT3": "", "DEPT3": "", "APPROVER3": "", "CONFIRMER3": "", "AUTHOR3": ""
     }
 
-    # 若你要在內容 table 裡也顯示 key，可以這樣放：
-    # info_mapping["DOC_KEY"] = doc_key
-
     # Place document attribute into Word
-    for index, attribute in enumerate(data["attribute"]):
-        info_mapping[f"REV{index + 1}"] = f'{attribute["documentVersion"]:.1f}'
-        info_mapping[f"DATE{index + 1}"] = attribute.get("issueDate", datetime.now().strftime("%Y/%m/%d"))
-        info_mapping[f"REASON{index + 1}"] = attribute["reviseReason"]
-        info_mapping[f"POINT{index + 1}"] = attribute["revisePoint"]
+    for index, attr in enumerate(data["attribute"]):
+        info_mapping[f"REV{index + 1}"] = f'{float(attr["document_version"]):.1f}'
+        info_mapping[f"DATE{index + 1}"] = attr.get("issue_date", datetime.now().strftime("%Y/%m/%d"))
         info_mapping[f"DEPT{index + 1}"] = attribute["department"]
-        info_mapping[f"APPROVER{index + 1}"] = attribute["approver"]
-        info_mapping[f"CONFIRMER{index + 1}"] = attribute["confirmer"]
+        info_mapping[f"APPROVER{index + 1}"] = attr["approver"]
+        info_mapping[f"CONFIRMER{index + 1}"] = attr["confirmer"]
         info_mapping[f"AUTHOR{index + 1}"] = attribute["author"]
-        info_mapping[f"REASON{index + 1}"] = f'變更理由\n{attribute["reviseReason"]}'
-        info_mapping[f"POINT{index + 1}"] = f'變更要點\n{attribute["revisePoint"]}'
-
-    key = f"DATE{len(data['attribute'])}"
-    info_mapping[key] = Date
+        info_mapping[f"REASON{index + 1}"] = f'變更理由\n{attr["change_reason"]}'
+        info_mapping[f"POINT{index + 1}"] = f'變更要點\n{attr["change_summary"]}'
 
     # Assuming 'example__.docx' exists in the execution environment
-    fill_from_template(template, outpath, data, title_mapping, info_mapping) 
+    fill_from_template(template, outpath, data, title_mapping, info_mapping, styled_mapping)
+
+def fix_image_id_clash(document):
+    """
+    修復 python-docx 插入圖片導致的 wp:docPr ID 衝突問題 (Issue #455)
+    這會將主要文件中的所有圖片/圖案 ID 加上 100000，避免與頁首/頁尾的 ID 衝突。
+    """
+    # 取得整份主要文件的 XML 根節點
+    doc_element = document._part._element
+    
+    # 找出所有圖片的屬性節點 (wp:docPr)
+    docPrs = doc_element.findall('.//' + qn('wp:docPr'))
+    
+    for docPr in docPrs:
+        # 取得目前的 ID，並加上 100000
+        current_id = int(docPr.get('id', '0'))
+        new_id = current_id + 100000
+        
+        # 重新寫回 XML 中
+        docPr.set('id', str(new_id))
 
 # ----------------- Example usage -----------------
 if __name__ == "__main__":
@@ -1858,11 +1856,11 @@ if __name__ == "__main__":
     output = "docxTemp/temp.docx"
 
     attribute = data["attribute"][-1]
-    Doc_id = attribute["documentID"]
+    Doc_id = attribute["document_id"]
     Date = datetime.now().strftime("%Y/%m/%d")
-    Version = f"{int(attribute['documentVersion']):.1f}"
-    Title = "製造條件指示書" if attribute["documentType"] == 0 else "製造式樣書"
-    Doc_name = attribute["documentName"]
+    Version = f"{int(attribute['document_version']):.1f}"
+    Title = "製造條件指示書" if attribute["document_type"] == 0 else "製造式樣書"
+    Doc_name = attribute["document_name"]
 
     # Put placeholders like [DOC_NO], [REV], [DATE], [TOTAL_PAGES] in the header cells of your template.
     # title_mapping = { "DOC_NO": "WMH250", "DATE": "2025/10/29", "REV": "1.0", "PAGE": "1", "TITLE": "製造條件指示書", "DOC_NAME": "", "PROJECT": "", "DOC_CODE": "FM-R-MF-AZ-052 Rev7.0"}
@@ -1874,7 +1872,7 @@ if __name__ == "__main__":
     }
 
     for index, attribute in enumerate(data["attribute"]):
-        info_mapping[f"REV{index + 1}"] = f'{attribute["documentVersion"]:.1f}'
+        info_mapping[f"REV{index + 1}"] = f'{attribute["document_version"]:.1f}'
         info_mapping[f"DATE{index + 1}"] = attribute.get("issueDate", datetime.now().strftime("%Y/%m/%d"))
         info_mapping[f"REASON{index + 1}"] = attribute["reviseReason"]
         info_mapping[f"POINT{index + 1}"] = attribute["revisePoint"]

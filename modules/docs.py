@@ -1,6 +1,7 @@
 # modules/docs.py
 from __future__ import annotations
 import datetime, os, uuid, re, json, math
+from collections import defaultdict
 from datetime import timezone, timedelta
 from decimal import Decimal
 
@@ -10,6 +11,11 @@ from db import db
 from oracle_db import ora_cursor as odb
 from utils import send_response, jload, jdump, dver, none_if_blank, new_token
 from DocxDefinition import get_docx
+from DocxDefinitionNoFramework import get_docx_without_framework
+from DocxDefinition_ import get_docx_
+from DocxDefinitionNoFramework_ import get_docx_without_framework_
+from modules.department import get_visible_emp_ids  # 可視範圍卡控
+from modules.block_tree import flatten_tree, build_tree, normalize_legacy_blocks, migrate_legacy_blocks, NEW_BLOCK_COLUMNS  # 階層樹核心
 
 BASE_DIR = "docxTemp"
 os.makedirs(BASE_DIR, exist_ok=True)
@@ -51,6 +57,63 @@ def odb_data_fetch(sql):
         return [], e
 
 # ---- Attributes ------------------------------------------------
+@bp.post("/latest-instruction-version")
+def get_latest_instruction_document_version():
+    body = request.get_json(silent=True) or {}
+
+    applyProject = body.get("applyProject", "")
+    machines = body.get("machines", [])
+
+    if applyProject == "":
+        return send_response(500, False, "適用工程不可為空", {"message": "請填寫適用工程"})
+
+    document_id, document_version = _process_instruction_id_ver(applyProject, machines)
+
+    return send_response(200, False, "獲取歷史版本成功", {"success": True, "document_id": document_id, "document_version": document_version})
+
+@bp.get("/latest-specification-version")
+def get_latest_specification_document_version():
+    """
+    根據 style_no (去尾) 查詢 rms_document_list 中是否已有舊文件。
+    若有，回傳舊的 document_id 以及 (舊版本號 + 1) 作為新版本。
+    若無，回傳預設版本 1.0。
+    """
+    style_no = request.args.get("style_no")
+    if not style_no:
+        return send_response(400, False, "缺少 style_no 參數")
+
+    # 1. 忽略最後的英文字母
+    clean_style_no = re.sub(r'[A-Za-z]+$', '', style_no)
+
+    try:
+        with db(dict_cursor=True) as (conn, cur): # 請換成你實際連線 rms_document_list 的 db alias
+            # 2. 查詢資料庫，並用 ORDER BY 確保抓到最大的版本號
+            # query = "SELECT document_id, document_version FROM rms_document_list WHERE REGEXP_REPLACE(style_no, '[A-Za-z]+$', '') = %s ORDER BY CAST(document_version AS DECIMAL(10,1)) DESC LIMIT 1"
+            # cur.execute(query, (clean_style_no,))
+            query = "SELECT document_id, document_version FROM rms_document_list WHERE style_no = %s ORDER BY CAST(document_version AS DECIMAL(10,1)) DESC LIMIT 1"
+            cur.execute(query, (style_no,))
+            exist_row = cur.fetchone()
+
+            if exist_row and exist_row["document_id"]:
+                # 若找到歷史紀錄，沿用 document_id，並將版本 + 1
+                doc_id = exist_row["document_id"]
+                old_doc_ver = float(exist_row["document_version"] or 1.0)
+                next_ver = old_doc_ver + 1.0
+                
+                return send_response(200, True, "獲取歷史版本成功", {
+                    "document_id": doc_id,
+                    "document_version": next_ver
+                })
+            else:
+                # 查無紀錄，為全新文件
+                return send_response(200, True, "查無舊版紀錄", {
+                    "document_id": "",
+                    "document_version": 1.0
+                })
+    except Exception as e:
+        print(f"Error fetching latest version: {e}")
+        return send_response(500, False, "查詢舊版紀錄失敗", {"message": str(e)})
+    
 @bp.post("/init")
 def init_doc():
     body = request.get_json(silent=True) or {}
@@ -290,23 +353,13 @@ def save_draft_all():
         # 先刪除再新增
         cur.execute("DELETE FROM rms_references WHERE document_token=%s", (token,))
         if documents or forms:
-            ins_ref_sql = """
-              INSERT INTO rms_references
-              (document_token, refer_type, refer_document, refer_document_name, created_at)
-              VALUES (%s,%s,%s,%s,NOW())
-            """
+            ins_ref_sql = "INSERT INTO rms_references(document_token, refer_type, refer_document, refer_document_name, color, created_at) VALUES (%s,%s,%s,%s,%s,NOW())"
             for d in documents:
-                cur.execute(ins_ref_sql, (
-                    token, 0,
-                    (d.get("docId") or "").strip(),
-                    (d.get("docName") or "").strip()
-                ))
+                print(f"document: {d}")
+                cur.execute(ins_ref_sql, (token, 0, (d.get("docId") or "").strip(), (d.get("docName") or "").strip(), d.get("color", "black")))
             for f_ in forms:
-                cur.execute(ins_ref_sql, (
-                    token, 1,
-                    (f_.get("formId") or "").strip(),
-                    (f_.get("formName") or "").strip()
-                ))
+                print(f"form: {f_}")
+                cur.execute(ins_ref_sql, (token, 1, (f_.get("formId") or "").strip(), (f_.get("formName") or "").strip(), f_.get("color", "black")))
 
     # transaction 結束
     return jsonify({
@@ -322,11 +375,7 @@ def is_document_locked(token: str) -> bool:
    （避免使用者在瀏覽器沒關的情況下繼續存草稿，破壞快照一致性）
     """
     with db(dict_cursor=True) as (conn, cur):
-        cur.execute("""
-            SELECT document_id, document_version
-            FROM rms_document_attributes
-            WHERE document_token=%s
-        """, (token,))
+        cur.execute("SELECT document_id, document_version FROM rms_document_attributes WHERE document_token=%s", (token,))
         row = cur.fetchone()
 
     if not row:
@@ -362,6 +411,549 @@ def is_document_locked(token: str) -> bool:
         return True
 
     return False
+
+ATTR_COLUMNS = [
+    "document_type", "previous_document_token", "document_id", "document_name",
+    "document_version", "attribute", "department", "author_id", "author",
+    "approver", "confirmer", "change_reason", "change_summary", "purpose",
+]
+
+BLOCK_COLUMNS = [
+    "content_id", "document_token", "step_type", "tier_no", "sub_no",
+    "content_type", "header_text", "header_json", "content_text", "content_json",
+    "table_text", "table_json", "files", "metadata"
+]
+
+REF_COLUMNS = [
+    "document_token", "refer_type", "refer_document", "refer_document_name", "color"
+]
+
+clean_value = lambda v: None if isinstance(v, str) and len(v) == 0 else v
+def clean_payload(data: dict, json_fields=None, decimal_fields=None):
+    json_fields = set(json_fields or [])
+    decimal_fields = set(decimal_fields or [])
+
+    out = {}
+    for k, v in data.items():
+        if k in json_fields:
+            out[k] = jdump(v) if v is not None else None
+        elif k in decimal_fields:
+            out[k] = dver(v) if v is not None else None
+        else:
+            out[k] = clean_value(v)
+    return out
+
+def build_update_sql(table, columns, where_clause):
+    set_clause = ", ".join(f"{col}=%({col})s" for col in columns)
+    return f"UPDATE {table} SET {set_clause} {where_clause}"
+
+# ==========================================
+# 資料準備區 (因為欄位全對齊，程式碼大幅縮短)
+# ==========================================
+
+def prepare_attr_form(form: dict, token: str):
+    # 注意：status 不在這裡寫死。
+    # status 由 save / download API 各自用 SQL 表達式 (GREATEST / CASE) 處理，
+    # 以避免把 2 (已公告) 或 3 (已下載) 的狀態硬退回 1 (草稿)。
+    payload = {k: form.get(k) for k in ATTR_COLUMNS}
+    payload = clean_payload(payload, json_fields={"attribute"}, decimal_fields={"document_version"})
+    payload["document_token"] = token
+    return payload
+
+def prepare_block_item(item: dict, token: str):
+    # 🟢 前端已經攤平並帶有 sub_no，直接讀取即可
+    payload = {k: item.get(k) for k in BLOCK_COLUMNS}
+    payload = clean_payload(payload, json_fields={"header_json", "content_json", "table_text", "table_json", "files", "metadata"})
+    payload["content_id"] = new_token()
+    payload["document_token"] = token
+    return payload
+
+def prepare_ref_item(ref: dict, token: str):
+    payload = {k: ref.get(k) for k in REF_COLUMNS if k != "document_token"}
+    payload = clean_payload(payload)
+    payload["document_token"] = token
+    payload["refer_type"] = int(payload.get("refer_type") or 0)
+    payload["color"] = payload.get("color") or "black"   # color NOT NULL，缺省帶 black
+    return payload
+
+# === 階層樹 block 落地 / 還原（與 modules.block_tree 共用）=================
+_BLOCK_JSON_FIELDS = ("header_json", "content_json", "table_text", "table_json", "files", "metadata")
+
+def serialize_tree_row(row: dict) -> dict:
+    """flatten_tree 產出的節點 → DB 參數（json 欄位 jdump、空字串轉 None）。"""
+    out = {}
+    for k in NEW_BLOCK_COLUMNS:
+        v = row.get(k)
+        out[k] = (jdump(v) if v is not None else None) if k in _BLOCK_JSON_FIELDS else clean_value(v)
+    return out
+
+def deserialize_block_row(r: dict) -> dict:
+    """DB row（dict）→ build_tree 可吃的節點（json 欄位 jload）。"""
+    return {
+        "content_id": r["content_id"],
+        "step_type": r["step_type"],
+        "parent_id": r.get("parent_id"),
+        "sort_order": r.get("sort_order"),
+        "depth": r.get("depth"),
+        "content_type": r.get("content_type"),
+        "header_text": r.get("header_text"),
+        "header_json": jload(r.get("header_json")),
+        "content_text": r.get("content_text"),
+        "content_json": jload(r.get("content_json")),
+        "table_text": jload(r.get("table_text")),
+        "table_json": jload(r.get("table_json")),
+        "files": jload(r.get("files"), []),
+        "metadata": jload(r.get("metadata"), {}),
+    }
+
+# ==========================================
+# save API for New version
+# ==========================================
+def _is_document_announced(token: str) -> bool:
+    """
+    判斷指定 token 的文件當前 status 是否為 2 (已公告)。
+    - 若 token 在 DB 中查無資料 (新文件)：回傳 False (允許儲存)。
+    - 若 status = 2：回傳 True (禁止儲存)。
+    """
+    if not token:
+        return False
+    try:
+        with db() as (_, cur):
+            cur.execute(
+                "SELECT status FROM rms_document_attributes WHERE document_token=%s",
+                (token,),
+            )
+            row = cur.fetchone()
+            return bool(row and row[0] == 2)
+    except Exception as e:
+        print(f"[_is_document_announced] check failed: {e}")
+        # 查詢失敗時保守處理：不阻擋儲存 (避免誤鎖)
+        return False
+
+
+# =====================================================================
+# Form attribute (tiptap 樣式 JSON) — 存到獨立表 rms_document_form_attributes
+#   key 名稱 = 主表欄位名：document_name / applyProject / purpose
+#   - upsert: value 非 null → INSERT ON DUPLICATE KEY UPDATE
+#   - delete: value 為 null → DELETE 該 (token, field) 列
+# =====================================================================
+FORM_ATTRIBUTE_FIELDS = ("document_name", "applyProject", "purpose")
+def _save_form_attributes(cur, token, form_attribute):
+    """
+    把 form_attribute dict 寫進 rms_document_form_attributes。
+    僅處理已知的 FORM_ATTRIBUTE_FIELDS，避免任意 key 灌進去。
+    沒帶該 key 的欄位不動 (保留原樣)；帶 null 則刪掉該列。
+    """
+    if not isinstance(form_attribute, dict):
+        return
+    for field_name in FORM_ATTRIBUTE_FIELDS:
+        if field_name not in form_attribute:
+            continue  # 沒帶就略過，不會誤刪
+        value = form_attribute[field_name]
+        if value is None:
+            cur.execute(
+                "DELETE FROM rms_document_form_attributes "
+                "WHERE document_token=%s AND field_name=%s",
+                (token, field_name),
+            )
+        else:
+            payload = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+            cur.execute(
+                "INSERT INTO rms_document_form_attributes (document_token, field_name, style_json) "
+                "VALUES (%s, %s, %s) "
+                "ON DUPLICATE KEY UPDATE style_json = VALUES(style_json)",
+                (token, field_name, payload),
+            )
+
+def _load_form_attributes(cur, token):
+    """
+    讀出該文件所有 form_attribute，回傳 { field_name: style_json|None }。
+    已知的 3 個 key 預設給 None，前端拿到後直接用即可 (查不到 → fallback)。
+    """
+    out = {k: None for k in FORM_ATTRIBUTE_FIELDS}
+    if not token:
+        return out
+    cur.execute(
+        "SELECT field_name, style_json FROM rms_document_form_attributes WHERE document_token=%s",
+        (token,),
+    )
+    for r in cur.fetchall():
+        # 兼容 tuple cursor / dict cursor
+        if isinstance(r, dict):
+            field_name = r.get("field_name")
+            style = r.get("style_json")
+        else:
+            field_name, style = r[0], r[1]
+        # 某些 driver 對 JSON 欄位會回字串，這裡統一 parse 回 dict
+        if isinstance(style, (bytes, bytearray)):
+            try:
+                style = style.decode("utf-8")
+            except UnicodeDecodeError:
+                style = None
+        if isinstance(style, str):
+            try:
+                style = json.loads(style)
+            except (ValueError, TypeError):
+                pass
+        if field_name in out:
+            out[field_name] = style
+    return out
+
+def _resolve_form_attribute(data, token):
+    """Word 產生用：優先取前端送的 form_attribute（含尚未存的當前樣式）；沒有 → 依 token 從 DB 讀。"""
+    fa = data.get("form_attribute") if isinstance(data, dict) else None
+    if isinstance(fa, dict):
+        return fa
+    if token:
+        try:
+            with db() as (conn, cur):
+                return _load_form_attributes(cur, token)
+        except Exception as e:
+            print(f"[_resolve_form_attribute] load failed: {e}")
+    return {}
+
+@bp.post("/draft/save-instruction")
+def save_instruction():
+    body = request.get_json(silent=True) or {}
+
+    token = clean_value(body.get("token")) or new_token()
+    attribute_list = body.get("attribute") or []
+    content_list = body.get("content") or []          # 舊平鋪格式（保留相容）
+    content_tree = body.get("tree") or []             # 新巢狀樹格式（§7.1）
+    reference_list = body.get("reference") or []
+    form = attribute_list[0] if attribute_list else {}
+    form_attribute = body.get("form_attribute")  # ← 新增；可能為 None / dict
+
+    # ★ 前置檢查：已公告 (status=2) 的文件禁止儲存，使用者需自行從前端走變版流程
+    if _is_document_announced(token):
+        return send_response(409, False, "文件已公告，禁止儲存。請使用變版流程建立新版本。", {})
+
+    # if is_document_locked(token):
+    #     return send_response(409, False, "此文件已送出或已結案，禁止再修改草稿內容。請重新開啟新版本。", {"message": "EIP 狀態已更新，無法再儲存。"})
+
+    issue_time_str = None
+    resp_form = None
+
+    with db() as (conn, cur):
+        # 1. ★ 移除原本的 INSERT，純粹使用 UPDATE 更新主表 (不含 status)
+        attr_payload = prepare_attr_form(form, token)
+        update_sql = build_update_sql("rms_document_attributes", ATTR_COLUMNS, "WHERE document_token=%(document_token)s")
+        cur.execute(update_sql, attr_payload)
+
+        # 1.1 ★ status 提升：0→1 (草稿)，1/2/3 維持原值
+        # 用 GREATEST 確保已公告 (2) 與已下載 (3) 不會被退回成草稿
+        cur.execute(
+            "UPDATE rms_document_attributes SET status = GREATEST(COALESCE(status, 0), 1) WHERE document_token=%s",
+            (token,)
+        )
+
+        # 2. 取得更新後的主表資訊 (維持你原本的邏輯)
+        cur.execute("SELECT * FROM rms_document_attributes WHERE document_token=%s", (token,))
+        row = cur.fetchone()
+        if row:
+            issue_time_str = row[15].strftime("%Y-%m-%d %H:%M:%S") if row[15] else None
+            resp_form = {
+                "document_type": row[0] or 0, "document_id": row[5] or "", "document_name": row[6] or "",
+                "document_version": float(row[7] or 1.0), "attribute": jload(row[8], {}) or {},
+                "department": row[9] or "", "author_id": row[10] or "", "author": row[11] or "",
+                "approver": row[12] or "", "confirmer": row[13] or "", "change_reason": row[16] or "",
+                "change_summary": row[17] or "", "purpose": row[19] or "", "previous_document_token": row[4] or "",
+            }
+
+        # 3. ★ Block 處理：巢狀樹 → DFS 攤平（block_tree.flatten_tree），對齊新 schema
+        cur.execute("DELETE FROM rms_block_content WHERE document_token=%s", (token,))
+        block_rows, node_id_map = flatten_tree(content_tree, token)
+        if block_rows:
+            insert_block_sql = f"""INSERT INTO rms_block_content ({", ".join(NEW_BLOCK_COLUMNS)}, created_at, updated_at) VALUES ({", ".join(f"%({c})s" for c in NEW_BLOCK_COLUMNS)}, NOW(), NOW())"""
+            cur.executemany(insert_block_sql, [serialize_tree_row(r) for r in block_rows])
+
+        # 4. ★ Ref 處理：同上
+        cur.execute("DELETE FROM rms_references WHERE document_token=%s", (token,))
+        if reference_list:
+            insert_ref_sql = f"""INSERT INTO rms_references ({", ".join(REF_COLUMNS)}, created_at) VALUES ({", ".join(f"%({c})s" for c in REF_COLUMNS)}, NOW())"""
+            ref_data = [prepare_ref_item(ref, token) for ref in reference_list]
+            cur.executemany(insert_ref_sql, ref_data)
+
+        # 5. ★ Form attribute (tiptap 樣式 JSON) → rms_document_form_attributes
+        # 沒帶 form_attribute → 完全不動 (向下相容舊前端)
+        if form_attribute is not None:
+            _save_form_attributes(cur, token, form_attribute)
+
+    return jsonify({"success": True, "token": token, "issueTime": issue_time_str, "form": resp_form, "nodeIdMap": node_id_map })
+
+@bp.get("/draft/load-instruction")
+def load_instruction():
+    print("Receive load instruction API")
+    token = request.args.get("token", "").strip()
+    emp_id = request.args.get("emp_id", "").strip()
+
+    # 準備裝載所有資料的超級大禮包
+    payload = {
+        "projects": [],
+        "personnel": {"confirmer": "", "approver": ""},
+        "form": None,
+        "tree": [],
+        "references": None,
+        # form_attribute: 主表欄位的 tiptap 樣式 JSON；查不到 → null，前端 fallback 純文字
+        "form_attribute": {k: None for k in FORM_ATTRIBUTE_FIELDS},
+    }
+
+    # ==========================================
+    # 1. 取得 Personnel 簽核人員資訊 (Oracle)
+    # ==========================================
+    if emp_id:
+        try:
+            with odb() as cur:
+                sql = f"""
+                    SELECT A.EMP_NO, A.EMPNAME, A.IN_DATE, C.EMP_NO, C.EMPNAME, B.LEV, E.EMP_NO, E.EMPNAME, D.LEV FROM IDBUSER.RMS_USERS A
+                    INNER JOIN IDBUSER.RMS_DEPT B ON A.DEPT_NO = B.DEPT_NO
+                    LEFT JOIN IDBUSER.RMS_USERS C ON B.LEADER_EMP_ID = C.EMP_NO
+                    LEFT JOIN IDBUSER.RMS_DEPT D ON B.GL_DEPARTMENT_CODE = D.DEPT_NO
+                    LEFT JOIN IDBUSER.RMS_USERS E ON D.LEADER_EMP_ID = E.EMP_NO
+                    WHERE A.OUT_DATE IS NULL AND A.EMP_NO = '{emp_id}'
+                """
+                cur.execute(sql)
+                p_rows = cur.fetchall()
+                if p_rows:
+                    payload["personnel"]["confirmer"] = p_rows[0][4] or ""
+                    payload["personnel"]["approver"] = p_rows[0][7] or ""
+        except Exception as e:
+            print(f"Oracle Personnel Error: {e}")
+
+    # ==========================================
+    # 2. 取得 適用工程 & 草稿資料 (MySQL)
+    # ==========================================
+    try:
+        with db() as (conn, cur):
+            # (A) 取得 Projects 適用工程
+            cur.execute("SELECT DISTINCT project FROM rms_spec_flat ORDER BY project")
+            payload["projects"] = [{"id": p[0], "projectCode": p[0], "projectName": p[0]} for p in cur.fetchall()]
+
+            # (B) 取得草稿資料 (如果有 token)
+            if token:
+                # --- 載入主表屬性 (Form) ---
+                cur.execute("SELECT * FROM rms_document_attributes WHERE document_token=%s", (token,))
+                row = cur.fetchone()
+                if row:
+                    cols = [desc[0] for desc in cur.description]
+                    r_dict = dict(zip(cols, row))
+                    
+                    payload["form"] = {
+                        "document_type": r_dict.get("document_type") or 0,
+                        "document_id": r_dict.get("document_id") or "",
+                        "document_name": r_dict.get("document_name") or "",
+                        "document_version": float(r_dict.get("document_version") or 1.0),
+                        "attribute": jload(r_dict.get("attribute"), {}) or {},
+                        "department": r_dict.get("department") or "",
+                        "author_id": r_dict.get("author_id") or "",
+                        "author": r_dict.get("author") or "",
+                        # ★ 核心防呆：如果草稿沒有簽核人，就自動帶入剛剛從 Oracle 查到的人事資料！
+                        "approver": r_dict.get("approver") or payload["personnel"]["approver"],
+                        "confirmer": r_dict.get("confirmer") or payload["personnel"]["confirmer"],
+                        "change_reason": r_dict.get("change_reason") or "",
+                        "change_summary": r_dict.get("change_summary") or "",
+                        "purpose": r_dict.get("purpose") or "",
+                        "previous_document_token": r_dict.get("previous_document_token") or "",
+                    }
+
+                    # --- 載入 Block 區塊內容（組回巢狀樹，§7.3） ---
+                    cur.execute(
+                        "SELECT content_id, step_type, parent_id, sort_order, depth, content_type, "
+                        "header_text, header_json, content_text, content_json, table_text, table_json, files, metadata "
+                        "FROM rms_block_content WHERE document_token=%s ORDER BY step_type, sort_order",
+                        (token,),
+                    )
+                    b_cols = [desc[0] for desc in cur.description]
+                    block_rows = [deserialize_block_row(dict(zip(b_cols, b_row))) for b_row in cur.fetchall()]
+                    payload["tree"] = build_tree(block_rows)
+                    for blockk in payload["tree"]:
+                        print(blockk)
+
+                    # --- 載入 Reference 參考文件/表單 ---
+                    cur.execute("SELECT refer_type, refer_document, refer_document_name FROM rms_references WHERE document_token=%s", (token,))
+                    refs_out = {"document": [], "form": []}
+                    
+                    for r_type, r_doc, r_name in cur.fetchall():
+                        ref_obj = {"refer_document": r_doc, "refer_document_name": r_name}
+                        if r_type == 0:
+                            refs_out["document"].append(ref_obj)
+                        elif r_type == 1:
+                            refs_out["form"].append(ref_obj)
+
+                    payload["references"] = refs_out
+
+                    # --- 載入 Form Attribute (tiptap 樣式 JSON) ---
+                    payload["form_attribute"] = _load_form_attributes(cur, token)
+
+    except Exception as e:
+        print(f"MySQL Load Error: {e}")
+        return send_response(500, False, "資料載入失敗", {"message": str(e)})
+
+    # 一次回傳所有資料！
+    return send_response(200, True, "請求成功", payload)
+
+@bp.post("/draft/save-specification")
+def save_specification():
+    body = request.get_json(silent=True) or {}
+
+    token = clean_value(body.get("token")) or new_token()
+    attribute_list = body.get("attribute") or []
+    content_list = body.get("content") or []          # 舊平鋪格式（保留相容）
+    content_tree = body.get("tree") or []             # 新巢狀樹格式（§7.1）
+    reference_list = body.get("reference") or []
+    form = attribute_list[0] if attribute_list else {}
+    form_attribute = body.get("form_attribute")  # tiptap 樣式 JSON（讓「目的」可變色）；可能 None / dict
+
+    # ★ 前置檢查：已公告 (status=2) 的文件禁止儲存，使用者需自行從前端走變版流程
+    if _is_document_announced(token):
+        return send_response(409, False, "文件已公告，禁止儲存。請使用變版流程建立新版本。", {})
+
+    # if is_document_locked(token):
+    #     return send_response(409, False, "此文件已送出或已結案，禁止再修改草稿內容。請重新開啟新版本。", {"message": "EIP 狀態已更新，無法再儲存。"})
+
+    issue_time_str = None
+    resp_form = None
+
+    with db() as (conn, cur):
+        # 1. 更新主表屬性 (不含 status)
+        attr_payload = prepare_attr_form(form, token)
+        update_sql = build_update_sql("rms_document_attributes", ATTR_COLUMNS, "WHERE document_token=%(document_token)s")
+        cur.execute(update_sql, attr_payload)
+
+        # 1.1 ★ status 提升：0→1 (草稿)，1/2/3 維持原值
+        # 用 GREATEST 確保已公告 (2) 與已下載 (3) 不會被退回成草稿
+        cur.execute(
+            "UPDATE rms_document_attributes SET status = GREATEST(COALESCE(status, 0), 1) WHERE document_token=%s",
+            (token,)
+        )
+
+        # 2. 取得更新後的主表資訊 (回傳給前端)
+        cur.execute("SELECT * FROM rms_document_attributes WHERE document_token=%s", (token,))
+        row = cur.fetchone()
+        if row:
+            issue_time_str = row[15].strftime("%Y-%m-%d %H:%M:%S") if row[15] else None
+            resp_form = {
+                "document_type": row[0] or 1, "document_id": row[5] or "", "document_name": row[6] or "",
+                "document_version": float(row[7] or 1.0), "attribute": jload(row[8], {}) or {},
+                "department": row[9] or "", "author_id": row[10] or "", "author": row[11] or "",
+                "approver": row[12] or "", "confirmer": row[13] or "", "change_reason": row[16] or "",
+                "change_summary": row[17] or "", "purpose": row[19] or "", "previous_document_token": row[4] or "",
+            }
+
+        # 3. Block 處理：巢狀樹 → DFS 攤平（block_tree.flatten_tree），對齊新 schema
+        cur.execute("DELETE FROM rms_block_content WHERE document_token=%s", (token,))
+        block_rows, node_id_map = flatten_tree(content_tree, token)
+        if block_rows:
+            insert_block_sql = f"""INSERT INTO rms_block_content ({", ".join(NEW_BLOCK_COLUMNS)}, created_at, updated_at) VALUES ({", ".join(f"%({c})s" for c in NEW_BLOCK_COLUMNS)}, NOW(), NOW())"""
+            cur.executemany(insert_block_sql, [serialize_tree_row(r) for r in block_rows])
+
+        # 4. Reference 處理：刪除舊的，批量新增新的
+        cur.execute("DELETE FROM rms_references WHERE document_token=%s", (token,))
+        if reference_list:
+            insert_ref_sql = f"""INSERT INTO rms_references ({", ".join(REF_COLUMNS)}, created_at) VALUES ({", ".join(f"%({c})s" for c in REF_COLUMNS)}, NOW())"""
+            ref_data = [prepare_ref_item(ref, token) for ref in reference_list]
+            cur.executemany(insert_ref_sql, ref_data)
+
+        # 5. Form attribute (tiptap 樣式 JSON) → rms_document_form_attributes（讓「目的」可變色）
+        if form_attribute is not None:
+            _save_form_attributes(cur, token, form_attribute)
+
+    return jsonify({"success": True, "token": token, "issueTime": issue_time_str, "form": resp_form, "nodeIdMap": node_id_map })
+
+@bp.get("/draft/load-specification")
+def load_specification():
+    print("Receive load specification API")
+    token = request.args.get("token", "").strip()
+    emp_id = request.args.get("emp_id", "").strip()
+
+    # 準備裝載資料的 payload (不需要 projects 列表，所以拿掉以加速查詢)
+    payload = {"personnel": {"confirmer": "", "approver": ""}, "form": None, "tree": [], "references": None, "form_attribute": {k: None for k in FORM_ATTRIBUTE_FIELDS}}
+
+    # ==========================================
+    # 1. 取得 Personnel 簽核人員資訊 (Oracle)
+    # ==========================================
+    if emp_id:
+        try:
+            with odb() as cur:
+                sql = f"""
+                    SELECT A.EMP_NO, A.EMPNAME, A.IN_DATE, C.EMP_NO, C.EMPNAME, B.LEV, E.EMP_NO, E.EMPNAME, D.LEV FROM IDBUSER.RMS_USERS A
+                    INNER JOIN IDBUSER.RMS_DEPT B ON A.DEPT_NO = B.DEPT_NO
+                    LEFT JOIN IDBUSER.RMS_USERS C ON B.LEADER_EMP_ID = C.EMP_NO
+                    LEFT JOIN IDBUSER.RMS_DEPT D ON B.GL_DEPARTMENT_CODE = D.DEPT_NO
+                    LEFT JOIN IDBUSER.RMS_USERS E ON D.LEADER_EMP_ID = E.EMP_NO
+                    WHERE A.OUT_DATE IS NULL AND A.EMP_NO = '{emp_id}'
+                """
+                cur.execute(sql)
+                p_rows = cur.fetchall()
+                if p_rows:
+                    payload["personnel"]["confirmer"] = p_rows[0][4] or ""
+                    payload["personnel"]["approver"] = p_rows[0][7] or ""
+        except Exception as e:
+            print(f"Oracle Personnel Error: {e}")
+
+    # ==========================================
+    # 2. 取得 草稿資料 (MySQL)
+    # ==========================================
+    try:
+        with db() as (conn, cur):
+            if token:
+                # --- 載入主表屬性 (Form) ---
+                cur.execute("SELECT * FROM rms_document_attributes WHERE document_token=%s", (token,))
+                row = cur.fetchone()
+                if row:
+                    cols = [desc[0] for desc in cur.description]
+                    r_dict = dict(zip(cols, row))
+                    
+                    payload["form"] = {
+                        "document_type": r_dict.get("document_type") or 1,
+                        "document_id": r_dict.get("document_id") or "",
+                        "document_name": r_dict.get("document_name") or "",
+                        "document_version": float(r_dict.get("document_version") or 1.0),
+                        "attribute": jload(r_dict.get("attribute"), {}) or {},
+                        "department": r_dict.get("department") or "",
+                        "author_id": r_dict.get("author_id") or "",
+                        "author": r_dict.get("author") or "",
+                        # ★ 核心防呆：自動帶入人事資料
+                        "approver": r_dict.get("approver") or payload["personnel"]["approver"],
+                        "confirmer": r_dict.get("confirmer") or payload["personnel"]["confirmer"],
+                        "change_reason": r_dict.get("change_reason") or "",
+                        "change_summary": r_dict.get("change_summary") or "",
+                        "purpose": r_dict.get("purpose") or "",
+                        "previous_document_token": r_dict.get("previous_document_token") or "",
+                    }
+
+                    # --- 載入 Block 區塊內容（組回巢狀樹，§7.3） ---
+                    cur.execute(
+                        "SELECT content_id, step_type, parent_id, sort_order, depth, content_type, "
+                        "header_text, header_json, content_text, content_json, table_text, table_json, files, metadata "
+                        "FROM rms_block_content WHERE document_token=%s ORDER BY step_type, sort_order",
+                        (token,),
+                    )
+                    b_cols = [desc[0] for desc in cur.description]
+                    block_rows = [deserialize_block_row(dict(zip(b_cols, b_row))) for b_row in cur.fetchall()]
+                    payload["tree"] = build_tree(block_rows)
+
+                    # --- 載入 Reference 參考表單 ---
+                    cur.execute("SELECT refer_type, refer_document, refer_document_name, color FROM rms_references WHERE document_token=%s", (token,))
+                    refs_out = {"document": [], "form": []}
+                    
+                    for r_type, r_doc, r_name, color in cur.fetchall():
+                        ref_obj = {"refer_document": r_doc, "refer_document_name": r_name, "color": color}
+                        if r_type == 0:
+                            refs_out["document"].append(ref_obj)
+                        elif r_type == 1:
+                            refs_out["form"].append(ref_obj)
+                            
+                    payload["references"] = refs_out
+
+                    # --- 載入 Form Attribute (tiptap 樣式 JSON，讓「目的」可變色) ---
+                    payload["form_attribute"] = _load_form_attributes(cur, token)
+
+    except Exception as e:
+        print(f"MySQL Load Error: {e}")
+        return send_response(500, False, "資料載入失敗", {"message": str(e)})
+
+    return send_response(200, True, "請求成功", payload)
 
 @bp.get("/<token>/draft-all")
 def load_draft_all(token):
@@ -429,6 +1021,7 @@ def load_draft_all(token):
         if include_attrs:
             cur.execute("SELECT * FROM rms_document_attributes WHERE document_token=%s", (token,))
             r = cur.fetchone()
+            print(f"document_id: {r['document_id'] or ''}")
             if not r:
                 out["attributes"] = {"success": False, "message": "Not found"}
             else:
@@ -526,25 +1119,15 @@ def load_draft_all(token):
 
         # ---------- 4) references ----------
         if include_refs:
-            cur.execute("""
-              SELECT refer_type, refer_document, refer_document_name FROM rms_references
-              WHERE document_token=%s
-              ORDER BY refer_type ASC, id ASC
-            """, (token,))
+            cur.execute("SELECT refer_type, refer_document, refer_document_name, color FROM rms_references WHERE document_token=%s ORDER BY refer_type ASC, id ASC", (token,))
             rows = cur.fetchall() or []
 
             docs, forms = [], []
             for r in rows:
                 if int(r["refer_type"]) == 0:
-                    docs.append({
-                        "docId": r["refer_document"],
-                        "docName": r["refer_document_name"],
-                    })
+                    docs.append({"docId": r["refer_document"],"docName": r["refer_document_name"], "color": r["color"]})
                 else:
-                    forms.append({
-                        "formId": r["refer_document"],
-                        "formName": r["refer_document_name"],
-                    })
+                    forms.append({"formId": r["refer_document"],"formName": r["refer_document_name"], "color": r["color"]})
             out["references"] = {
                 "success": True,
                 "documents": docs,
@@ -800,37 +1383,18 @@ def create_revision():
             "", "", None, r["purpose"],
         ))
 
-        # 2) 複製 blocks（流程 / 管理條件 / MCR / 異常處置...）
-        cur.execute("""
-          SELECT step_type, tier_no, sub_no, content_type,
-                 header_text, header_json, content_text, content_json, files, metadata
-          FROM rms_block_content
-          WHERE document_token = %s
-        """, (prev_token,))
-        old_blocks = cur.fetchall() or []
-
-        ins_blk_sql = """
-          INSERT INTO rms_block_content
-          (content_id, document_token, step_type, tier_no, sub_no, content_type,
-           header_text, header_json, content_text, content_json, files, metadata,
-           created_at, updated_at)
-          VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NOW())
-        """
-        for b in old_blocks:
-            cur.execute(ins_blk_sql, (
-                new_token(),            # 新 content_id
-                new_token_,             # 🔥 改成新 token
-                b["step_type"],
-                b["tier_no"],
-                b["sub_no"],
-                b["content_type"],
-                b["header_text"],
-                b["header_json"],
-                b["content_text"],
-                b["content_json"],
-                b["files"],
-                b["metadata"],
-            ))
+        # 2) 複製 blocks：用 block_tree 重建樹再攤平 → 重配 content_id 並 remap parent_id（新階層 schema）
+        cur.execute(
+            "SELECT content_id, step_type, parent_id, sort_order, depth, content_type, "
+            "header_text, header_json, content_text, content_json, table_text, table_json, files, metadata "
+            "FROM rms_block_content WHERE document_token = %s ORDER BY step_type, sort_order",
+            (prev_token,),
+        )
+        old_blocks = [deserialize_block_row(b) for b in (cur.fetchall() or [])]
+        new_block_rows, _ = flatten_tree(build_tree(old_blocks), new_token_)
+        if new_block_rows:
+            ins_blk_sql = f"""INSERT INTO rms_block_content ({", ".join(NEW_BLOCK_COLUMNS)}, created_at, updated_at) VALUES ({", ".join(f"%({c})s" for c in NEW_BLOCK_COLUMNS)}, NOW(), NOW())"""
+            cur.executemany(ins_blk_sql, [serialize_tree_row(r) for r in new_block_rows])
 
         # 3) 複製 references
         cur.execute("""
@@ -840,10 +1404,11 @@ def create_revision():
         """, (prev_token,))
         old_refs = cur.fetchall() or []
 
+        # 變版：reference 一律重置為黑色（上一版內容視為未變更，使用者改了才轉藍）
         ins_ref_sql = """
           INSERT INTO rms_references
-          (document_token, refer_type, refer_document, refer_document_name, created_at)
-          VALUES (%s,%s,%s,%s,NOW())
+          (document_token, refer_type, refer_document, refer_document_name, color, created_at)
+          VALUES (%s,%s,%s,%s,'black',NOW())
         """
         for r_ref in old_refs:
             cur.execute(ins_ref_sql, (
@@ -914,65 +1479,148 @@ def _data_compilation(status, rows, docs_filter = None):
     return data, delete_id_list
 
 ATTRIBUTE_ORDER = ["document_type", "EIP_id", "status", "document_token", "previous_document_token", "document_id", "document_name", "document_version", "attribute", "department", "author_id", "author", "approver", "confirmer", "rejecter", "issue_date", "change_reason", "change_summary", "reject_reason", "purpose"]
-BLOCK_CONTENT_ORDER = ["content_id", "document_token", "step_type", "tier_no", "sub_no", "content_type", "header_text", "header_json", "content_text", "content_json", "files", "metadata", "created_at", "updated_at"]
-REFERENCE_ORDER = ["document_token", "refer_type", "refer_document", "refer_document_name", "created_at"]
+# 新 schema：移除 tier_no/sub_no，新增 parent_id/sort_order/depth，並補上 table_text/table_json（舊版漏帶，見 spec §20 第1點）
+BLOCK_CONTENT_ORDER = ["content_id", "document_token", "step_type", "parent_id", "sort_order", "depth", "content_type", "header_text", "header_json", "content_text", "content_json", "table_text", "table_json", "files", "metadata", "created_at", "updated_at"]
+REFERENCE_ORDER = ["document_token", "refer_type", "refer_document", "refer_document_name", "color", "created_at"]
 def apply_snapshots_to_main_db(signed_docs):
     rms_id_map = {info["rms_id"]: info for info in signed_docs.values()}
     signed_rms_id_list = list(rms_id_map.keys())
     sql = f"""
-        SELECT rds.rms_id, rds.document_token, rdsp.document_row, rdsp.blocks_rows, rdsp.references_rows, rdsp.program_codes_rows FROM rms_document_snapshots AS rds 
+        SELECT rds.snapshot_id, rds.rms_id, rds.document_token, rdsp.document_row, rdsp.blocks_rows, rdsp.references_rows, rdsp.program_codes_rows, rdsp.form_attributes
+        FROM rms_document_snapshots AS rds
         JOIN rms_document_snapshot_payloads AS rdsp ON rds.snapshot_id = rdsp.snapshot_id
         WHERE rds.rms_id IN ({placeholder(signed_rms_id_list)})
     """
 
-    # 用來存放 executemany 的參數列表
     attr_params_list = []
     block_params_list = []
     ref_params_list = []
     program_codes_params_list = []
+    form_attr_restores = []   # [(final_token, form_attr_dict)]，寫回時還原 form_attributes
+    
+    # 紀錄快照更新 (如果有重配 Token，必須連快照表一起更新)
+    snapshot_token_updates = []
+    # 紀錄需要清除舊畫布的 Token
+    tokens_to_clear_canvas = []
 
-    parse_func = lambda r: json.dumps(r) if isinstance(r, dict) else r
+    parse_func = lambda r: json.dumps(r) if isinstance(r, (dict, list)) else r  # dict/list 都序列化（table_text 2D 陣列等）
+    # v1 快照 block 內層 JSON 欄位（migrate 前需深解析成 dict/list）
+    _snap_block_json_fields = ("header_json", "content_json", "table_json", "table_text", "files", "metadata", "content_text")
     try:
-        with db(dict_cursor = True) as (conn, cur):
+        with db(dict_cursor=True) as (conn, cur):
             cur.execute(sql, signed_rms_id_list)
             rows = cur.fetchall()
 
+            # 1. 預先收集這批快照的 Token，查詢資料庫確認「所有權」
+            raw_tokens = []
+            parsed_rows = []
             for row in rows:
-                oracle_info = rms_id_map.get(row["rms_id"], {})
                 doc_snap = json.loads(row["document_row"]) or {}
+                token = doc_snap.get("document_token")
+                doc_id = doc_snap.get("document_id")
+                if token and doc_id:
+                    raw_tokens.append(token)
+                parsed_rows.append({"row": row, "doc_snap": doc_snap, "token": token, "doc_id": doc_id})
+
+            # 建立 Token 擁有者追蹤器: { token: document_id }
+            token_owner_tracker = {}
+            if raw_tokens:
+                cur.execute(f"SELECT document_token, document_id FROM rms_document_attributes WHERE document_token IN ({placeholder(raw_tokens)})", raw_tokens)
+                for res in cur.fetchall():
+                    token_owner_tracker[res['document_token']] = res['document_id']
+
+            # 2. 開始處理資料，遇到衝突就重新發配 Token
+            for item in parsed_rows:
+                row = item["row"]
+                doc_snap = item["doc_snap"]
+                original_token = item["token"]
+                doc_id = item["doc_id"]
+                
+                final_token = original_token
+                
+                # 衝突偵測：如果 Token 已存在，且擁有者不是現在這份 document_id，代表發生污染！
+                if original_token in token_owner_tracker and token_owner_tracker[original_token] != doc_id:
+                    final_token = str(uuid.uuid4()) # 重新配號
+                    snapshot_token_updates.append((final_token, row["snapshot_id"]))
+                    print(f"⚠️ 警告：偵測到 Token 污染！文件 {doc_id} 已自動重新配發新 Token: {final_token}")
+                else:
+                    # 登記所有權，防止同批次內的互相污染
+                    token_owner_tracker[original_token] = doc_id
+
+                tokens_to_clear_canvas.append(final_token)
+
+                oracle_info = rms_id_map.get(row["rms_id"], {})
                 blocks_snap = json.loads(row["blocks_rows"]) or []
+                # 階層格式判斷（spec §10.3）：v1 舊快照帶 tier_no/sub_no → migrate 成新階層
+                #（structural + 內容分類 + 定值項目 + step5 program-code）；v2 帶 parent_id → pass-through。
+                if blocks_snap and ("tier_no" in blocks_snap[0]) and ("parent_id" not in blocks_snap[0]):
+                    attr_obj = _normalize_metadata(doc_snap.get("attribute")) or {}
+                    item_type = attr_obj.get("itemType") if isinstance(attr_obj, dict) else None
+                    legacy_parsed = [
+                        {**b, **{k: _normalize_metadata(b.get(k)) for k in _snap_block_json_fields if k in b}}
+                        for b in blocks_snap
+                    ]
+                    blocks_snap = migrate_legacy_blocks(legacy_parsed, item_type=item_type)
                 refs_snap = json.loads(row["references_rows"]) or []
                 codes_snap = json.loads(row["program_codes_rows"]) or []
 
+                # 把 Final Token 強制寫入資料中
+                doc_snap["document_token"] = final_token
                 doc_snap = {**doc_snap, "EIP_id": oracle_info.get("eip_no"), "status": 2, "issue_date": oracle_info.get("eip_createdt")}
 
                 attr_params_list.append([parse_func(doc_snap.get(key)) for key in ATTRIBUTE_ORDER])
+                
+                # Blocks, Refs, Codes 也強制替換為 Final Token
                 for b in blocks_snap:
-                    b_ = {**b, "created_at": oracle_info.get("eip_createdt")}
-                    block_params_list.append([parse_func(b_[key]) for key in BLOCK_CONTENT_ORDER])
+                    b_ = {**b, "document_token": final_token, "created_at": oracle_info.get("eip_createdt"), "updated_at": oracle_info.get("eip_createdt")}
+                    block_params_list.append([parse_func(b_.get(key)) for key in BLOCK_CONTENT_ORDER])
                 for r in refs_snap:
-                    r_ = {**r, "created_at": oracle_info.get("eip_createdt")}
-                    ref_params_list.append([parse_func(r_[key]) for key in REFERENCE_ORDER])
-                program_codes_params_list = [[doc_snap["document_token"], code] for code in codes_snap]
+                    r_ = {**r, "document_token": final_token, "created_at": oracle_info.get("eip_createdt"), "color": r.get("color") or "black"}
+                    ref_params_list.append([parse_func(r_.get(key)) for key in REFERENCE_ORDER])
+                
+                program_codes_params_list.extend([[final_token, code] for code in codes_snap])
 
+                # form_attributes（彩色標題/目的樣式）→ 寫回時還原；舊快照無此欄為 None，略過
+                form_attr_snap = _normalize_metadata(row.get("form_attributes"))
+                if isinstance(form_attr_snap, dict) and form_attr_snap:
+                    form_attr_restores.append((final_token, form_attr_snap))
+
+            # 3. 開始寫入資料庫
             if attr_params_list:
                 cols = ",".join(ATTRIBUTE_ORDER)
-                sql_insert_attr = f"INSERT INTO rms_document_attributes ({cols}) VALUES ({placeholder(ATTRIBUTE_ORDER)})"
+                updates = ", ".join([f"{col}=VALUES({col})" for col in ATTRIBUTE_ORDER])
+                sql_insert_attr = f"INSERT INTO rms_document_attributes ({cols}) VALUES ({placeholder(ATTRIBUTE_ORDER)}) ON DUPLICATE KEY UPDATE {updates}"
                 cur.executemany(sql_insert_attr, attr_params_list)
+
+                # 清除舊畫布 (確保不會殘留使用者刪除的區塊)
+                if tokens_to_clear_canvas:
+                    cur.execute(f"DELETE FROM rms_block_content WHERE document_token IN ({placeholder(tokens_to_clear_canvas)})", tokens_to_clear_canvas)
+                    cur.execute(f"DELETE FROM rms_references WHERE document_token IN ({placeholder(tokens_to_clear_canvas)})", tokens_to_clear_canvas)
+                    cur.execute(f"DELETE FROM rms_document_form_attributes WHERE document_token IN ({placeholder(tokens_to_clear_canvas)})", tokens_to_clear_canvas)
 
                 if block_params_list:
                     cols = ",".join(BLOCK_CONTENT_ORDER)
-                    sql_insert_block = f"INSERT INTO rms_block_content ({cols}) VALUES ({placeholder(BLOCK_CONTENT_ORDER)})"
+                    updates = ", ".join([f"{col}=VALUES({col})" for col in BLOCK_CONTENT_ORDER])
+                    sql_insert_block = f"INSERT INTO rms_block_content ({cols}) VALUES ({placeholder(BLOCK_CONTENT_ORDER)}) ON DUPLICATE KEY UPDATE {updates}"
                     cur.executemany(sql_insert_block, block_params_list)
 
                 if ref_params_list:
                     cols = ",".join(REFERENCE_ORDER)
-                    sql_insert_ref = f"INSERT INTO rms_references ({cols}) VALUES ({placeholder(REFERENCE_ORDER)})"
+                    updates = ", ".join([f"{col}=VALUES({col})" for col in REFERENCE_ORDER])
+                    sql_insert_ref = f"INSERT INTO rms_references ({cols}) VALUES ({placeholder(REFERENCE_ORDER)}) ON DUPLICATE KEY UPDATE {updates}"
                     cur.executemany(sql_insert_ref, ref_params_list)
 
                 if program_codes_params_list:
                     sql_update_code = "UPDATE rms_program_code SET document_token = %s, status = 1 WHERE program_code = %s"
                     cur.executemany(sql_update_code, program_codes_params_list)
+                    
+                # 4. 還原 form_attributes（彩色標題/目的樣式）回 rms_document_form_attributes
+                for tok, fa in form_attr_restores:
+                    _save_form_attributes(cur, tok, fa)
+
+                # 5. 更新快照表中的 Token (根除污染源)
+                if snapshot_token_updates:
+                    cur.executemany("UPDATE rms_document_snapshots SET document_token = %s WHERE snapshot_id = %s", snapshot_token_updates)
 
             conn.commit()
         return "Success"
@@ -1017,6 +1665,8 @@ def sync_eip():
         WHERE (EIP_STATUS IS NOT NULL OR HAS_SIGNED > 0) AND RMS_DCCNAME IS NOT NULL
         ORDER BY CASE WHEN EIP_STATUS = '已簽核' THEN 0 ELSE 1 END, EIP_CREATEDT DESC"""
     )
+
+    print(f"data: {data}")
 
     if info != "Success":
         return jsonify({"Success": False, "error": "Connect database error, please try again!"}), 500
@@ -1152,7 +1802,7 @@ def clear_doc_id():
 
     return jsonify({"success": True})
 
-@bp.get("drafts")
+@bp.get("/drafts")
 def list_drafts():
     user_id = request.args.get("userId", "")
     keyword = request.args.get("keyword", "")
@@ -1161,11 +1811,27 @@ def list_drafts():
     getPages = request.args.get("getPages", False)
 
     if len(keyword) > 0:
-        keyword = f" AND document_id LIKE '%{keyword}%' AND document_name LIKE '%{keyword}%' AND author = '%{keyword}%' AND author_id = %{keyword}%"
+        keyword = f" AND (document_id LIKE '%{keyword}%' OR document_name LIKE '%{keyword}%' OR author LIKE '%{keyword}%' OR author_id LIKE '%{keyword}%')"
 
     target = "COUNT(*)" if getPages else "document_type, document_token, document_name, document_version, document_id, author, author_id, issue_date"
-    
-    sql = f"SELECT {target} FROM rms_document_attributes WHERE (status = 1 OR status = 0) AND author_id = '{user_id}' {keyword} ORDER BY issue_date "
+
+    if user_id == '07714' or user_id == '12868':
+        # admin (07714, 12868) 看全部
+        sql = f"SELECT {target} FROM rms_document_attributes WHERE (status = 3 OR status = 1 OR status = 0) AND author_id IS NOT NULL {keyword} ORDER BY issue_date DESC "
+    else:
+        # ★ 可視範圍卡控：依 Oracle dept tree 展開該使用者能看到的所有 EMP_NO
+        # 規則: { 自己 DEPT } ∪ { descendants } ∪ { parent (限 KJ 樹內) }
+        visible_emp_ids = get_visible_emp_ids(user_id)
+        if not visible_emp_ids:
+            return send_response(200, True, "查詢成功", {"pages": 0} if getPages else {"items": []})
+        emp_list_sql = ",".join(f"'{e}'" for e in visible_emp_ids)
+        sql = (
+            f"SELECT {target} FROM rms_document_attributes "
+            f"WHERE (status = 3 OR status = 1 OR status = 0) "
+            f"  AND author_id IN ({emp_list_sql}) "
+            f"  {keyword} "
+            f"ORDER BY issue_date DESC "
+        )
 
     data, info = db_data_fetch(sql if getPages else sql + f"LIMIT {pageSize} OFFSET {(page - 1) * pageSize}")
 
@@ -1199,7 +1865,8 @@ def delete_draft(document_token):
     
     try:
         with db() as (conn, cur):
-            cur.execute(f"DELETE FROM rms_document_attributes WHERE document_token = '{document_token}' AND status = 1")
+            # 允許刪除草稿 (1) 與已下載 (3)； 已公告 (2) 不允許刪除 (避免破壞已公告文件的圖片連結與外部引用)
+            cur.execute("DELETE FROM rms_document_attributes WHERE document_token = %s AND status IN (1, 3)", (document_token,))
             conn.commit()
             deleted = cur.rowcount or 0
 
@@ -1221,10 +1888,19 @@ def list_passed():
     getPages = request.args.get("getPages", False)
 
     if len(keyword) > 0:
-        keyword = f" AND document_id LIKE '%{keyword}%' AND document_name LIKE '%{keyword}%' AND author = '%{keyword}%' AND author_id = %{keyword}%"
+        keyword = f" AND (document_id LIKE '%{keyword}%' OR document_name LIKE '%{keyword}%' OR author LIKE '%{keyword}%' OR author_id LIKE '%{keyword}%')"
 
+    # ★ 可視範圍卡控 (與 /drafts 同邏輯)：admin 看全部；其餘人看 dept tree 範圍內
+    user_filter = ""
     if len(user_id) > 0:
-        user_id = f" AND author_id = '{user_id}'"
+        if user_id == '12868' or user_id == '07714':
+            user_filter = ""  # admin 看全部
+        else:
+            visible_emp_ids = get_visible_emp_ids(user_id)
+            if not visible_emp_ids:
+                return send_response(200, True, "查詢成功", {"pages": 0} if getPages else {"items": []})
+            emp_list_sql = ",".join(f"'{e}'" for e in visible_emp_ids)
+            user_filter = f" AND author_id IN ({emp_list_sql})"
 
     if len(document_type) > 0:
         document_type = f" AND document_type = {document_type}"
@@ -1236,7 +1912,7 @@ def list_passed():
             SELECT *, ROW_NUMBER() OVER ( PARTITION BY document_id ORDER BY issue_date DESC, document_version DESC ) as rn FROM rms_document_attributes WHERE status = 2
         )
         SELECT {target} FROM RankedDocuments
-        WHERE rn = 1 {document_type} {user_id} {keyword} ORDER BY issue_date
+        WHERE rn = 1 {document_type} {user_filter} {keyword} ORDER BY issue_date
     """
 
     data, info = db_data_fetch(sql if getPages else sql + f"LIMIT {pageSize} OFFSET {(page - 1) * pageSize}")
@@ -1271,14 +1947,15 @@ def list_submitted_and_rejected():
     getPages = request.args.get("getPages", False)
 
     if len(keyword) > 0:
-        keyword = f"AND a.document_id LIKE '%{keyword}%' AND a.document_name LIKE '%{keyword}%'"
+        keyword = f"AND (a.document_id LIKE '%{keyword}%' OR a.document_name LIKE '%{keyword}%') OR a.author LIKE '%{keyword}%'"
 
     target = "COUNT(*)" if getPages else "a.document_type, a.document_token, a.document_name, a.document_version, a.document_id, a.author, a.author_id, s.created_at, a.rejecter, a.reject_reason, s.rms_id"
 
     sql = f"""
         SELECT {target} FROM rms_document_attributes AS a
-        JOIN rms_document_snapshots AS s ON a.document_token = s.document_token
-        WHERE a.author_id = '{user_id}' {keyword} ORDER BY s.created_at ASC
+        JOIN (SELECT document_token, MAX(snapshot_id) AS latest_id FROM rms_document_snapshots GROUP BY document_token) AS latest_snap ON a.document_token = latest_snap.document_token
+        JOIN rms_document_snapshots AS s ON s.snapshot_id = latest_snap.latest_id
+        WHERE 1=1 {keyword} ORDER BY s.created_at DESC
     """
     data, info = db_data_fetch(sql if getPages else sql + f"LIMIT {pageSize} OFFSET {(page - 1) * pageSize}")
 
@@ -1288,11 +1965,11 @@ def list_submitted_and_rejected():
     if getPages:
         return send_response(200, True, "查詢成功", {"pages": math.ceil(data[0][0] / pageSize)})
     
+    if not data:
+        return send_response(200, True, "查詢成功", {"items": []})
+
     search_id = "','".join([item[10] for item in data])
-    sql = f"""
-        SELECT RMS_ID, EIP_CREATEDT, EIP_STATUS, DECISION_USER, DECISION_COMMENT FROM IDBUSER.RMS_DCC2EIP
-        WHERE RMS_ID IN ('{search_id}')
-    """
+    sql = f"SELECT RMS_ID, EIP_CREATEDT, EIP_STATUS, DECISION_USER, DECISION_COMMENT FROM IDBUSER.RMS_DCC2EIP WHERE RMS_ID IN ('{search_id}')"
     data_status, info = odb_data_fetch(sql)
 
     if info != "Success":
@@ -1302,6 +1979,7 @@ def list_submitted_and_rejected():
 
     items = []
     for item in data:
+        print(f"item: {item}")
         issueDate, eipStatus, rejecter, rejectReason = item[7], "已下載", "", ""
         if data_status.get(item[10]) == None:
             eipStatus = "同步失敗"
@@ -1604,8 +2282,9 @@ def create_snapshot_and_oracle_row(token: str, rms_id: str, user_emp_no: str):
         cur.execute("INSERT INTO rms_document_snapshots (document_token, rms_id, document_id, document_version, document_name, created_by) VALUES (%s,%s,%s,%s,%s,%s)", (token, rms_id, doc_id, doc_ver, doc_name, user_emp_no))
         snapshot_id = cur.lastrowid
 
-        # 3-2) 再插入 payload
-        cur.execute("INSERT INTO rms_document_snapshot_payloads (snapshot_id, document_row, blocks_rows, references_rows, program_codes_rows) VALUES (%s,%s,%s,%s,%s)", (snapshot_id, doc_row_str, blocks_str, refs_str, programs_str))
+        # 3-2) 再插入 payload（含 form_attributes：凍結彩色標題/目的樣式）
+        form_attr_str = jdump(_load_form_attributes(cur, token))
+        cur.execute("INSERT INTO rms_document_snapshot_payloads (snapshot_id, document_row, blocks_rows, references_rows, program_codes_rows, form_attributes) VALUES (%s,%s,%s,%s,%s,%s)", (snapshot_id, doc_row_str, blocks_str, refs_str, programs_str, form_attr_str))
 
         conn.commit()
 
@@ -1619,13 +2298,7 @@ def next_document_id(prefix: str) -> str:
     prefix = prefix[:3]
 
     with db(dict_cursor=True) as (conn, cur):
-        cur.execute("""
-          SELECT document_id
-          FROM rms_document_attributes
-          WHERE document_id LIKE %s
-          ORDER BY document_id DESC
-          LIMIT 1
-        """, (prefix + "%",))
+        cur.execute("SELECT document_id FROM rms_document_attributes WHERE document_id LIKE %s ORDER BY document_id DESC LIMIT 1", (prefix + "%",))
         row = cur.fetchone()
 
         if not row or not row["document_id"]:
@@ -1639,37 +2312,29 @@ def next_document_id(prefix: str) -> str:
 
         return f"{prefix}{num + 1:03d}"
 
-def next_monthly_document_id(prefix: str = "W") -> str:
+def next_monthly_document_id(prefix: str = "W", mpn_mode: str = "MP") -> str:
     """
-    依照 W_YY_MM_XXX 規則產生 document_id：
-      W_25_11_001, W_25_11_002, ...
+    依照 W_YY_MM_XXX (MP) 或 W-YYMMXXX (NPI) 規則產生 document_id。
+    流水號分開計算 (各自取當月該格式的最大值 + 1)。
     """
+    # According to mpn_mode to decide base format
     now = datetime.datetime.now()
-    yy = now.year % 100
-    mm = now.month
+    base = f"{prefix}-{now.year % 100:02d}-{now.month:02d}-" if mpn_mode == "MP" else f"{prefix}-{now.year % 100:02d}{now.month:02d}"
 
-    base = f"{prefix}_{yy:02d}_{mm:02d}_"
+    # Get serial number of current base format from database
+    try:
+        with db(dict_cursor=True) as (conn, cur):
+            cur.execute("SELECT document_id FROM rms_document_attributes WHERE document_id LIKE %s", (f"{base}%",))
+            rows = cur.fetchall() or []
+    except Exception as e:
+        print(f"查找文件 ID 失敗: {e} => 因此返回空 ID")
+        return ""
 
-    with db(dict_cursor=True) as (conn, cur):
-        cur.execute("""
-          SELECT document_id
-          FROM rms_document_attributes
-          WHERE document_id LIKE %s
-          ORDER BY document_id DESC
-          LIMIT 1
-        """, (base + "%",))
-        row = cur.fetchone()
+    # Find the biggest serial number for base format
+    doc_ids = [int(row["document_id"][-3:]) for row in rows]
+    next_num = max(doc_ids) + 1 if len(doc_ids) > 0 else 1
 
-        if not row or not row["document_id"]:
-            return f"{base}001"
-
-        tail = row["document_id"][-3:]
-        try:
-            num = int(tail)
-        except ValueError:
-            num = 0
-
-        return f"{base}{num + 1:03d}"
+    return f"{base}{next_num:03d}"
 
 def _update_attributes_from_latest_attr(token, latest_attr):
     f = {
@@ -1725,6 +2390,7 @@ def generate_word():
     data.setdefault("reference", [])
 
     token = (data.get("token") or "").strip()
+    rms_id = make_rms_id()
 
     if token:
         try:
@@ -1735,6 +2401,7 @@ def generate_word():
             return send_response(404, False, "document not found")
 
         latest_attr = payload["attribute"][-1]
+        latest_attr['documentKey'] = rms_id
 
         # B) 前端有送 attribute，就覆蓋「最新版」欄位
         if data["attribute"]:
@@ -1768,33 +2435,70 @@ def generate_word():
             # 初版且尚無 document_id → 依文件類型決定編碼規則
             if doc_ver == 1.0 and not doc_id:
                 if doc_type == 1:
-                    doc_id = next_monthly_document_id("W")
+                    style_no = attr_json.get("styleNo") or ""
+                    
+                    # ★ 1. 優先查詢 rms_document_list 看是否已有此式樣號
+                    # clean_style_no = re.sub(r'[A-Za-z]+$', '', style_no)
+                    # cur.execute("SELECT document_id, document_version FROM rms_document_list WHERE REGEXP_REPLACE(style_no, '[A-Za-z]+$', '') = %s LIMIT 1", (clean_style_no,))
+                    cur.execute("SELECT document_id, document_version FROM rms_document_list WHERE style_no = %s LIMIT 1", (style_no,))
+                    exist_row = cur.fetchone()
+                    
+                    if exist_row and exist_row["document_id"]:
+                        # 若找到，直接重用資料庫中的 document_id 與 document_version
+                        doc_id = exist_row["document_id"]
+                        old_doc_ver = float(exist_row["document_version"]) + 1.0 or 1.0
+                        doc_ver = old_doc_ver if doc_ver <= old_doc_ver else doc_ver
+                    else:
+                        # ★ 2. 若找不到，則跑原本的「全新賦號」邏輯
+                        mpn_mode = attr_json.get("MPN_MODE")
+                        
+                        if not mpn_mode:
+                            mpn_prefix = style_no.split("-")[0] if style_no else ""
+                            if mpn_prefix:
+                                try:
+                                    with odb() as cur_o:
+                                        cur_o.execute("SELECT MPN_MODE FROM IDBUSER.EIP_MPN_TRACE_DETAIL WHERE MPN LIKE :1", (mpn_prefix + "%",))
+                                        o_row = cur_o.fetchone()
+                                        if o_row and o_row[0]:
+                                            mpn_mode = o_row[0]
+                                except Exception as e:
+                                    print(f"[generate_word] 查詢 Oracle MPN_MODE 失敗 (MPN: {mpn_prefix}):", e)
+                
+                        if not mpn_mode:
+                            mpn_mode = "MP"
+                            
+                        doc_id = next_monthly_document_id("W", mpn_mode)
+                        # doc_ver 維持為 1.0
                 else:
+                    # 指示書的編碼邏輯
                     apply_project = (attr_json.get("applyProject") or "").strip()
-                    prefix = (apply_project[:3] or "XXX").upper()
-                    doc_id = next_document_id(prefix)
+                    machines = attr_json.get("machines", [])
+                    # prefix = (apply_project[:3] or "XXX").upper()
+                    # doc_id = next_document_id(prefix)
+                    doc_id, doc_ver = _process_instruction_id_ver(apply_project, machines)
 
-            # 4.1 生成 RMS_ID / documentKey
-            rms_id = make_rms_id()
-
-            cur.execute("UPDATE rms_document_attributes SET document_id=%s WHERE document_token=%s", (doc_id, token))
+            # 更新主表 (把可能變動的 doc_id 與 doc_ver 一併寫入)
+            cur.execute("UPDATE rms_document_attributes SET document_id=%s, document_version=%s WHERE document_token=%s", (doc_id, doc_ver, token))
             conn.commit()
 
-        # 5) 把 docID & documentKey 塞回「最新版 attribute」（在 payload 上）
+        # 5) 把 docID & documentVersion 塞回「最新版 attribute」（在 payload 上）
         latest_attr["documentID"] = doc_id or ""
+        latest_attr["documentVersion"] = doc_ver
 
-        # 如果你還有想讓前端回收的 data，也可以同步更新：
         if data["attribute"]:
             data["attribute"][-1]["documentID"] = doc_id or ""
+            data["attribute"][-1]["documentVersion"] = doc_ver
 
         # 5.5) 暫存內容（寫回 rms_document_attributes）
         _update_attributes_from_latest_attr(token, latest_attr)
 
-        # 6) 檔名
+        # 6) 檔名 (確保檔名上的版本號也同步更新)
         try:
-            doc_name = _safe_docname(
-                f'{latest_attr.get("documentName")}{latest_attr.get("documentVersion"):.1f}'
-            )
+            if (doc_type == 0):
+                doc_name = _safe_docname(f'{latest_attr.get("documentName")}{doc_ver:.1f}')
+            elif (doc_type == 1):
+                style_suffix = latest_attr["attribute"].get("styleNo", "").split("-")[-1]
+                doc_name = _safe_docname(f'{latest_attr.get("documentName")}{style_suffix} {doc_ver:.1f}')
         except Exception:
             doc_name = "document"
 
@@ -1807,25 +2511,33 @@ def generate_word():
 
         # 8) Oracle + snapshot 都成功後，才產生 Word
         out_path = os.path.join(BASE_DIR, f"{doc_name}.docx")
-
-        # 🔑 用 payload（包含歷史版本 attributes），而不是 data
+        
         doc_type_for_word = latest_attr.get("documentType", 0)
         if doc_type_for_word == 1:
-            get_docx(out_path, payload, "docx-template/SpecificationDocument.docx")
+            get_docx_without_framework(out_path, payload, "docx-template/SpecificationDocumentv6.docx")
         else:
-            get_docx(out_path, payload, "docx-template/InstructionDocument.docx")
+            get_docx_without_framework(out_path, payload, "docx-template/InstructionDocumentv6.docx")
 
+        # 9) 透過 Header 將 ID 與 Version 回傳給前端
         @after_this_request
-        def add_docid_header(response):
+        def add_doc_headers(response):
             if doc_id:
-                response.headers["X-Document-ID"] = doc_id
+                response.headers["X-Document-ID"] = str(doc_id)
+            if doc_ver:
+                response.headers["X-Document-Version"] = str(doc_ver)
+                
+            expose_headers = ["X-Document-ID", "X-Document-Version"]
             existing = response.headers.get("Access-Control-Expose-Headers", "")
-            expose = "X-Document-ID"
+            
             if existing:
-                if expose not in existing:
-                    response.headers["Access-Control-Expose-Headers"] = existing + "," + expose
+                parts = [x.strip() for x in existing.split(",")]
+                for e in expose_headers:
+                    if e not in parts:
+                        parts.append(e)
+                response.headers["Access-Control-Expose-Headers"] = ",".join(parts)
             else:
-                response.headers["Access-Control-Expose-Headers"] = expose
+                response.headers["Access-Control-Expose-Headers"] = ",".join(expose_headers)
+                
             return response
 
         return send_file(
@@ -1914,6 +2626,14 @@ def preview_docx():
     if attr_list:
         doc_type = attr_list[-1].get("documentType", 0)
 
+    if base_payload.get("attribute"):
+        latest_attr_ref = base_payload["attribute"][-1]
+        if "documentVersion" in latest_attr_ref:
+            try:
+                latest_attr_ref["documentVersion"] = float(latest_attr_ref["documentVersion"])
+            except (ValueError, TypeError):
+                latest_attr_ref["documentVersion"] = 1.0
+
     if doc_type == 1:
         get_docx(out_path, base_payload, "docx-template/SpecificationDocument.docx")
     else:
@@ -1935,18 +2655,242 @@ def preview_docx():
         mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
 
+def _build_doc_payload_from_docid(docid):
+    if docid == None or docid == "":
+        return []
+    
+    attributes = []
+    try:
+        with db(dict_cursor=True) as (conn, cur):
+            sql = """
+                SELECT document_version, issue_date, approver, confirmer, change_reason, change_summary FROM rms_document_attributes
+                WHERE document_id = %s ORDER BY document_version DESC LIMIT 3;
+            """
+            cur.execute(sql, (docid,),)
+            rows = cur.fetchall()
+
+            if len(rows) <= 1:
+                return []
+                
+            return list(rows[1:])
+
+    except Exception as e:
+        print(f"Some error occur: {e}")
+        return []
+
+def _process_instruction_id_ver(applyProject, machines):
+    if applyProject == None or applyProject == "" or len(applyProject) < 3:
+        print("no apply project")
+        return None, None
+
+    try: 
+        with db(dict_cursor=True) as (conn, cur):
+            cur.execute(f"SELECT DISTINCT document_id, document_version FROM rms_document_machine WHERE machine_id IN ({placeholder(machines)})", machines)
+            rows = cur.fetchall()
+
+            if len(rows) > 1:
+                return next_document_id(applyProject[:3]), 1.0
+            elif len(rows) == 1:
+                return rows[0]["document_id"], float(rows[0]["document_version"])
+    
+    except Exception as e:
+        print(f"訪問資料庫失敗: {e} => 因此返回空值")
+        return None, None
+    
+    return next_document_id(applyProject[:3]), 1.0
+
+def _process_specification_id_ver(mpn_mode, style_no):
+    # Try get Past document information
+    try:
+        with db() as (conn, cur):
+            cur.execute("SELECT document_id, document_version FROM rms_document_list WHERE style_no = %s LIMIT 1", (style_no,))
+            exist_row = cur.fetchone()
+            return exist_row['document_id'], exist_row['document_version']
+
+    except Exception as e:
+        print(f"訪問資料庫失敗: {e} => 因此重新配號")
+    
+    # Search style to get mpn mode
+    if not mpn_mode:
+        try:
+            with odb() as cur_o:
+                cur_o.execute("SELECT MPN_MODE FROM IDBUSER.EIP_MPN_TRACE_DETAIL WHERE MPN LIKE :1", (style_no.split("-")[0] + "%",))
+                mpn_mode = cur_o.fetchone()
+                
+        except Exception as e:
+            print(f"[generate_word] 查詢 Oracle MPN_MODE 失敗 (MPN: {style_no}):", e)
+    
+    # Set default NPI mode and get document id
+    mpn_mode = "NPI" if not mpn_mode else mpn_mode
+    return next_monthly_document_id("W", mpn_mode), 1.0
+
+def _create_snapshot_and_oracle_row(token, rms_id, doc_info):
+    """
+    1) 從 MySQL 撈出目前 token 的 document_row / blocks_rows / references_rows
+    2) 先在 Oracle.IDBUSER.RMS_DCC2EIP 新增 RMS_* 一筆
+    3) 再寫入 sfdb4070.rms_document_snapshots (meta) + rms_document_snapshot_payloads (JSON)
+    """
+    attribute = doc_info['attribute'][0]
+
+    # 新樹結構：doc_info['content'] = [{step_type, children}]；step2 的 ct=4 子節點各自帶 metadata.programs
+    program_codes_rows = set()
+    for step in doc_info['content']:
+        if step.get('step_type') == 2:
+            for node in step.get('children', []):
+                for program in (node.get('metadata') or {}).get('programs', []):
+                    program_codes_rows.add(program['programCode'])
+
+    # --- 2) 先寫 Oracle.RMS_DCC2EIP ---
+    with odb() as cur_o:
+        cur_o.execute("INSERT INTO IDBUSER.RMS_DCC2EIP (RMS_ID, RMS_DCCNO, RMS_VER, RMS_DCCNAME, RMS_INSDT) VALUES (:1, :2, :3, :4, :5)", (rms_id, attribute['document_id'], attribute['document_version'], attribute['document_name'], datetime.datetime.now()))
+        cur_o.connection.commit()
+
+    # --- 3) 再寫 MySQL snapshot（meta + payload 分兩張表） ---
+    doc_row_json  = doc_info['attribute']
+    blocks_json   = doc_info['content']
+    refs_json     = doc_info['reference']
+    programs_json = list(program_codes_rows)
+
+    try:
+        doc_row_str     = jdump(doc_row_json)
+        blocks_str      = jdump(blocks_json)
+        refs_str        = jdump(refs_json)
+        programs_str    = jdump(programs_json)
+
+    except TypeError as e:
+        print("[snapshot DEBUG] json dump failed:", e)
+        raise
+
+    with db(dict_cursor=True) as (conn, cur):
+        # 3-1) 先插入輕量的 snapshots（拿到 snapshot_id）
+        cur.execute("INSERT INTO rms_document_snapshots (document_token, rms_id, document_id, document_version, document_name, created_by) VALUES (%s,%s,%s,%s,%s,%s)", (token, rms_id, attribute['document_id'], attribute['document_version'], attribute['document_name'], attribute['author_id']))
+        snapshot_id = cur.lastrowid
+
+        # 3-2) 再插入 payload（含 form_attributes：凍結彩色標題/目的樣式）
+        form_attr_str = jdump(_load_form_attributes(cur, token))
+        cur.execute("INSERT INTO rms_document_snapshot_payloads (snapshot_id, document_row, blocks_rows, references_rows, program_codes_rows, form_attributes) VALUES (%s,%s,%s,%s,%s,%s)", (snapshot_id, doc_row_str, blocks_str, refs_str, programs_str, form_attr_str))
+
+        conn.commit()
+
+@bp.post("/preview/docx_")
+def preview_docx_():
+    data = request.get_json(silent=True) or {}
+    data.setdefault("attribute", [])
+    data.setdefault("content", [])
+    data.setdefault("reference", [])
+    token = data.get("token", "")
+    doc_type = data['attribute'][0]["document_type"]
+
+    if token == "":
+        return jsonify({"ok": False, "error": "Document token is None"}), 400
+
+    # Get / Assign document_id (if attribute not include document_id that means this is a first versiond document.)
+    attributes = [data['attribute'][0]]
+    if attributes[0].get("document_id") != None:
+        payload = _build_doc_payload_from_docid(attributes[0]['document_id'])
+        attributes += payload[1:]
+        
+    payload = f"{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+
+    out_path = os.path.join(f"{BASE_DIR}", "_preview", f"{attributes[0]['document_name']}-{payload}.docx")
+    # 前端送的是 tree（[{step_type, children}]，= save 的 tree 結構）；renderer 內部仍讀 data["content"]
+    get_docx_(out_path, {"attribute": attributes, "content": data.get("tree") or [], "reference": data["reference"], "form_attribute": _resolve_form_attribute(data, token)}, f"docx-template/{'SpecificationDocument' if doc_type == 1 else 'InstructionDocument'}.docx")
+
+    return send_file(
+        out_path,
+        as_attachment=False,
+        download_name=f"{attributes[0]['document_name'] if attributes[0]['document_name'] != '' else payload}.docx",
+        mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+
+@bp.post("/generate/word_")
+def generate_word_():
+    data = request.get_json(silent=True) or {}
+    data.setdefault("attribute", [])
+    data.setdefault("content", [])
+    data.setdefault("reference", [])
+    token = data.get("token", "")
+    doc_type = data['attribute'][0]["document_type"]
+    rms_id = make_rms_id()
+
+    if token == "":
+        return jsonify({"ok": False, "error": "Document token is None"}), 400
+
+    # Get previous payload by document id
+    attributes = [data['attribute'][0]]
+    document_id = attributes[0]["document_id"]
+    document_version = attributes[0]["document_version"]
+    if document_id != "":
+        payload = _build_doc_payload_from_docid(document_id)
+        attributes += payload[1:]
+
+    # Assign document_id (if attribute not include document_id that means this is a first version document.)
+    else:
+        if doc_type == 0:
+            document_id, document_version = _process_instruction_id_ver(attributes[0]["attribute"].get("applyProject"), attributes[0]["attribute"].get("machines", []))
+        elif doc_type == 1:
+            document_id, document_version = _process_specification_id_ver(attributes[0]["attribute"].get("mpnMode"), attributes[0]["attribute"].get("styleNo"))
+        attributes[0]["document_id"] = document_id
+        attributes[0]["document_version"] = str(document_version)
+        print(f"document_id: {document_id}, document_version: {document_version}")
+
+    # Generate Word
+    payload = f"{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    out_path = os.path.join(f"{BASE_DIR}", f"{attributes[0]['document_name']}-{payload}.docx")
+    get_docx_without_framework_(out_path, {"attribute": attributes, "content": data.get("tree") or [], "reference": data["reference"], "form_attribute": _resolve_form_attribute(data, token)}, f"docx-template/{'SpecificationDocumentv6' if doc_type == 1 else 'InstructionDocumentv6'}.docx")
+
+    # Create snapshot for download content and insert information to oracle database
+    try:
+        with db() as (conn, cur):
+            # 更新 document_id，並把 status 提升為 3 (已下載)。
+            # 僅在 status 為 0 (空文件) 或 1 (草稿) 時提升；2 (已公告) 維持不變，避免覆蓋公告狀態。
+            cur.execute("UPDATE rms_document_attributes SET document_id = %s, status = CASE WHEN COALESCE(status, 0) IN (0, 1) THEN 3 ELSE status END WHERE document_token = %s", (attributes[0]["document_id"], token,))
+            conn.commit()
+
+        print(token, rms_id, attributes[0]["author_id"])
+        _create_snapshot_and_oracle_row(token = token, rms_id = rms_id, doc_info = {"attribute": attributes, "content": data.get("tree") or [], "reference": data["reference"]})
+
+    except Exception as e:
+        print("[generate_word] _create_snapshot_and_oracle_row FAILED:", e)
+        return send_response(500, False, f"EIP 建檔 / 歷史快照失敗，請聯絡系統管理員。詳細訊息：{e}")
+    
+    # Add document id and version information to frontend
+    @after_this_request
+    def add_docid_header(response):
+        if document_id:
+            response.headers["X-Document-ID"] = document_id
+            response.headers["X-Document-Version"] = document_version
+        existing = response.headers.get("Access-Control-Expose-Headers", "")
+        expose = "X-Document-ID"
+        if existing:
+            if expose not in existing:
+                response.headers["Access-Control-Expose-Headers"] = existing + "," + expose
+        else:
+            response.headers["Access-Control-Expose-Headers"] = expose
+        return response
+
+    # Send Word document
+    return send_file(
+        out_path,
+        as_attachment=True,
+        download_name=f"{attributes[0]['document_name'] if attributes[0]['document_name'] != '' else payload}.docx",
+        mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+
+
 def _build_payload_for_docx_from_snapshot(snap_row):
     token   = snap_row["document_token"]
     snap_id = snap_row["snapshot_id"]
 
-    row, info = db_data_fetch(f"SELECT document_row, blocks_rows, references_rows FROM rms_document_snapshot_payloads WHERE snapshot_id = '{snap_id}'", fetch_one = True)
+    row, info = db_data_fetch(f"SELECT document_row, blocks_rows, references_rows, form_attributes FROM rms_document_snapshot_payloads WHERE snapshot_id = '{snap_id}'", fetch_one = True)
 
     if info != "Success":
         raise RuntimeError(f"snapshot payload not found for snapshot_id={snap_id}")
-    
+
     doc_row   = _normalize_metadata(row[0]) or {}
     blocks_rs = _normalize_metadata(row[1]) or []
     refs_rs   = _normalize_metadata(row[2]) or []
+    form_attr = _normalize_metadata(row[3]) or {}   # 凍結的彩色標題/目的樣式（舊快照無此欄 → {}）
 
     # ---------- 1.1 歷史版本（已經是 yyyy/mm/dd，就保留你現在的實作） ----------
     attrs: list[dict] = []
@@ -2038,73 +2982,33 @@ def _build_payload_for_docx_from_snapshot(snap_row):
 
     attrs.append(latest_form)
 
-    # ---------- 2) blocks / params：只用 snapshot 的 blocks_rs ----------
-    by_step = {}
-    for r in blocks_rs:
-        try:
-            st = int(r.get("step_type"))
-        except (TypeError, ValueError):
-            continue
-        by_step.setdefault(st, []).append(r)
+    # ---------- 2) blocks：組回巢狀樹（spec §7.3 / §10）----------
+    # 每筆 snapshot block row 的 JSON 欄位先解析；v1(舊 tier/sub) 先轉新階層，v2 直接用
+    def _prep_block_row(r):
+        return {
+            "content_id": r.get("content_id"),
+            "step_type": r.get("step_type"),
+            "parent_id": r.get("parent_id"),
+            "sort_order": r.get("sort_order"),
+            "depth": r.get("depth"),
+            "tier_no": r.get("tier_no"),
+            "sub_no": r.get("sub_no"),
+            "content_type": r.get("content_type"),
+            "header_text": r.get("header_text"),
+            "header_json": _normalize_metadata(r.get("header_json")),
+            "content_text": _normalize_metadata(r.get("content_text")),
+            "content_json": _normalize_metadata(r.get("content_json")),
+            "table_text": _normalize_metadata(r.get("table_text")),
+            "table_json": _normalize_metadata(r.get("table_json")),
+            "files": _normalize_metadata(r.get("files")) or [],
+            "metadata": _normalize_metadata(r.get("metadata")) or {},
+        }
 
-    content_items = []
-
-    for st, rows in by_step.items():
-        if st in (2, 5):
-            # MCR 參數類...
-            merged = {}
-            for r in rows:
-                try:
-                    t = int(r.get("tier_no"))
-                    sub = int(r.get("sub_no"))
-                except (TypeError, ValueError):
-                    continue
-                merged.setdefault(t, {
-                    "jsonParameterContent": None,
-                    "arrayParameterData": [],
-                    "jsonConditionContent": None,
-                    "arrayConditionData": [],
-                    "metadata": None,
-                })
-                if sub == 0:
-                    merged[t]["arrayParameterData"]   = jload(r.get("content_text"), []) or []
-                    merged[t]["jsonParameterContent"] = _normalize_metadata(r.get("content_json"))
-                    merged[t]["metadata"]             = _normalize_metadata(r.get("metadata"))
-                elif sub == 1:
-                    merged[t]["arrayConditionData"]   = jload(r.get("content_text"), []) or []
-                    merged[t]["jsonConditionContent"] = _normalize_metadata(r.get("content_json"))
-
-            for t in sorted(merged.keys()):
-                b = merged[t]
-                content_items.append({
-                    "step_type": st,
-                    "tier_no": t,
-                    "jsonParameterContent": b["jsonParameterContent"],
-                    "arrayParameterData": b["arrayParameterData"],
-                    "jsonConditionContent": b["jsonConditionContent"],
-                    "arrayConditionData": b["arrayConditionData"],
-                    "metadata": b["metadata"],
-                })
-        else:
-            grouped = {}
-            for r in rows:
-                try:
-                    t = int(r.get("tier_no"))
-                except (TypeError, ValueError):
-                    continue
-                grouped.setdefault(t, []).append({
-                    "option": int(r.get("content_type") or 0),
-                    "jsonHeader": _normalize_metadata(r.get("header_json")),
-                    "jsonContent": _normalize_metadata(r.get("content_json")),
-                    "files": _normalize_metadata(r.get("files")) or [],
-                })
-
-            for t in sorted(grouped.keys()):
-                content_items.append({
-                    "step_type": st,
-                    "tier": t,
-                    "data": grouped[t],
-                })
+    prepared = [_prep_block_row(r) for r in blocks_rs]
+    # v1 舊快照（含 tier_no、無 parent_id）→ lazy 轉新階層；v2 直接用（spec §10.3）
+    if prepared and ("tier_no" in blocks_rs[0]) and ("parent_id" not in blocks_rs[0]):
+        prepared = normalize_legacy_blocks(prepared)
+    content_items = build_tree(prepared)   # [{step_type, children}]
 
     # ---------- 3) references：只用 snapshot 的 refs_rs ----------
     references = []
@@ -2125,6 +3029,7 @@ def _build_payload_for_docx_from_snapshot(snap_row):
         "attribute": attrs,           # 🔑 不再只有一個 form，而是 [舊版..., 最新版]
         "content": content_items,
         "reference": references,
+        "form_attribute": form_attr,  # 凍結的 form_attribute（彩色 目的/文件名/適用工程）
     }
 
 # Document preview in signed document
@@ -2174,9 +3079,9 @@ def preview_docx_from_snapshot(token):
     out_path = os.path.join(preview_dir, f"{doc_name}-{uuid.uuid4().hex[:8]}.docx")
 
     if doc_type == 1:
-        get_docx(out_path, payload, "docx-template/SpecificationDocument.docx")
+        get_docx_(out_path, payload, "docx-template/SpecificationDocument.docx")
     else:
-        get_docx(out_path, payload, "docx-template/InstructionDocument.docx")
+        get_docx_(out_path, payload, "docx-template/InstructionDocument.docx")
 
     @after_this_request
     def remove_file(response):
@@ -2206,45 +3111,64 @@ def build_prefix(spec_code: str) -> str:
 @bp.post("/program-codes/allocate")
 def allocate_program_code():
     """
-    body: { specCode, document_token }
-    回傳: { specCode, programCode, prefix, serial }
+    body: { specCode, document_token, partNo (選填) }
+    回傳: { specCode, programCode, prefix, serial, partNo }
     """
     body = request.get_json(silent=True) or {}
     spec_code = (body.get("specCode") or "").strip()
     document_token = (body.get("document_token") or "").strip()
+    part_no = (body.get("partNo") or "").strip()
 
+    # 1) 拿掉 partNo 的必填檢查，兼容舊版 (指示書呼叫時不會帶 partNo)
     if not spec_code or not document_token:
-        return send_response(400, False, "specCode & document_token 為必填", None)
+        return send_response(400, False, "specCode 與 document_token 為必填", None)
 
     prefix = build_prefix(spec_code)
 
     with db(dict_cursor=True) as (conn, cur):
-        # ❌ 不要用 conn.start_transaction()，MySQLdb 沒這個 method
-        # conn.start_transaction()
-
-        # 1) 先看有沒有舊的釋放號碼可以重用（status=9）
-        cur.execute("SELECT id, serial_no, program_code FROM rms_program_code WHERE spec_code = %s AND status = 9 ORDER BY serial_no ASC LIMIT 1 FOR UPDATE", (spec_code,))
+        # 先看有沒有舊的釋放號碼可以重用（status=9）
+        cur.execute("SELECT id, serial_no FROM rms_program_code WHERE spec_code = %s AND status = 9 ORDER BY serial_no ASC LIMIT 1 FOR UPDATE", (spec_code,))
         row = cur.fetchone()
 
         if row:
-            # 重用舊號碼，改成 reserved 狀態
-            cur.execute("UPDATE rms_program_code SET status = 0, document_token = %s WHERE id = %s", (document_token, row["id"]))
-            # 這裡可以不寫 conn.commit()，交給 db() 做
+            # 重用舊號碼
             serial = row["serial_no"]
-            program_code = row["program_code"]
+            base_program_code = f"{prefix}{serial:03d}"
+            
+            # 2) 判斷是否有 partNo，決定最終的 program_code 格式
+            full_program_code = f"{part_no}-{base_program_code}" if part_no else base_program_code
+            
+            # 更新狀態並覆寫 program_code (確保重用時格式正確)
+            cur.execute(
+                "UPDATE rms_program_code SET status = 0, document_token = %s, program_code = %s WHERE id = %s", 
+                (document_token, full_program_code, row["id"])
+            )
         else:
-            # 2) 沒有可重用 → 取最大 serial_no + 1
+            # 沒有可重用 → 取最大 serial_no + 1
             cur.execute("SELECT MAX(serial_no) AS max_serial FROM rms_program_code WHERE spec_code = %s FOR UPDATE", (spec_code,))
             r = cur.fetchone()
             max_serial = r["max_serial"] or 0
             serial = max_serial + 1
-            program_code = f"{prefix}{serial:03d}"
+            
+            base_program_code = f"{prefix}{serial:03d}"
+            
+            # 2) 判斷是否有 partNo，決定最終的 program_code 格式
+            full_program_code = f"{part_no}-{base_program_code}" if part_no else base_program_code
 
             # 寫入資料表
-            cur.execute("INSERT INTO rms_program_code (spec_code, serial_no, program_code, document_token, status) VALUES (%s, %s, %s, %s, 0)", (spec_code, serial, program_code, document_token))
-            # 一樣可以不用手動 conn.commit()
+            cur.execute(
+                "INSERT INTO rms_program_code (spec_code, serial_no, program_code, document_token, status) VALUES (%s, %s, %s, %s, 0)", 
+                (spec_code, serial, full_program_code, document_token)
+            )
 
-    data = {"specCode": spec_code, "programCode": program_code, "prefix": prefix, "serial": serial,}
+    print(f"full_program_code: {full_program_code}")
+    data = {
+        "specCode": spec_code, 
+        "partNo": part_no,
+        "programCode": full_program_code, 
+        "prefix": prefix, 
+        "serial": serial
+    }
     return send_response(200, True, "程式號碼配號成功", data)
 
 @bp.post("/program-codes/release")

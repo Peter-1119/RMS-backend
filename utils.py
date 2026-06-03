@@ -46,7 +46,7 @@ def get_spec_codes_by_project(project: str):
 
     try:
         with db(dict_cursor=True) as (_, cur):
-            sql = f"SELECT DISTINCT spec_code FROM sfdb4070.rms_spec_flat WHERE project = '{project}'"
+            sql = f"SELECT DISTINCT spec_code FROM rms_spec_flat WHERE project = '{project}'"
             cur.execute(sql)
             return [s["spec_code"] for s in cur.fetchall()], "Success"
     

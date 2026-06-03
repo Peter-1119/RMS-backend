@@ -5,12 +5,20 @@ import platform
 SECRET_KEY = os.getenv("SECRET_KEY", "default_unsafe_key_change_this_in_production")
 
 # db
+# DB = {
+#     "host": os.getenv("DB_HOST", "10.8.32.64"),
+#     "port": int(os.getenv("DB_PORT", "3306")),
+#     "user": os.getenv("DB_USER", "sfuser"),
+#     "password": os.getenv("DB_PASSWORD", "1q2w3e4R"),
+#     "name": os.getenv("DB_NAME", "sfdb4070"),
+#     "charset": "utf8mb4",
+# }
 DB = {
-    "host": os.getenv("DB_HOST", "10.8.32.64"),
+    "host": os.getenv("DB_HOST", "10.1.5.185"),
     "port": int(os.getenv("DB_PORT", "3306")),
     "user": os.getenv("DB_USER", "sfuser"),
-    "password": os.getenv("DB_PASSWORD", "1q2w3e4R"),
-    "name": os.getenv("DB_NAME", "sfdb4070"),
+    "password": os.getenv("DB_PASSWORD", "sfuser6269"),
+    "name": os.getenv("DB_NAME", "sfdb"),
     "charset": "utf8mb4",
 }
 
