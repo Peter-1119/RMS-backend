@@ -16,6 +16,11 @@ test*
 backup/
 
 
+# secrets / env（真實連線資訊；.env.example 例外保留）
+.env
+.env.*
+!.env.example
+
 # IDE / OS
 .vscode/
 .idea/

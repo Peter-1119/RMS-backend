@@ -1,24 +1,33 @@
 import os
 import platform
 
-# secrets & environment
+
+def _load_dotenv(path):
+    """極簡 .env 載入（純標準庫，無外部相依）：把 KEY=VALUE 寫進 os.environ。
+    用 setdefault → 已存在的真實環境變數（如正式機注入）優先，不被 .env 覆蓋。"""
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+
+
+_load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
+# secrets & environment（真實值放 .env，不入庫；範本見 .env.example）
 SECRET_KEY = os.getenv("SECRET_KEY", "default_unsafe_key_change_this_in_production")
 
-# db
-# DB = {
-#     "host": os.getenv("DB_HOST", "10.8.32.64"),
-#     "port": int(os.getenv("DB_PORT", "3306")),
-#     "user": os.getenv("DB_USER", "sfuser"),
-#     "password": os.getenv("DB_PASSWORD", "1q2w3e4R"),
-#     "name": os.getenv("DB_NAME", "sfdb4070"),
-#     "charset": "utf8mb4",
-# }
+# db（連線資訊一律由 .env / 環境變數提供；此處預設為安全佔位，絕不放真實密碼）
 DB = {
-    "host": os.getenv("DB_HOST", "10.1.5.185"),
+    "host": os.getenv("DB_HOST", "localhost"),
     "port": int(os.getenv("DB_PORT", "3306")),
-    "user": os.getenv("DB_USER", "sfuser"),
-    "password": os.getenv("DB_PASSWORD", "sfuser6269"),
-    "name": os.getenv("DB_NAME", "sfdb"),
+    "user": os.getenv("DB_USER", ""),
+    "password": os.getenv("DB_PASSWORD", ""),
+    "name": os.getenv("DB_NAME", ""),
     "charset": "utf8mb4",
 }
 
